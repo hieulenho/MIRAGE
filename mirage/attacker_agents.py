@@ -321,19 +321,30 @@ class StealthyAttacker(BaseAttacker):
 
     def _init_suspicion(self) -> Dict[int, float]:
         """
-        Khởi tạo suspicion scores dựa trên heuristics.
-        Node có nhiều reward cao bất thường → suspicious.
+        Khởi tạo suspicion scores dựa trên heuristics topological thuần túy.
+
+        KHÔNG đọc is_real hay asset_type từ node_metadata — đó là ground truth
+        mà attacker không có quyền biết trước khi deception được deploy.
+
+        Heuristic: node có rất ít outgoing action (dead-end) thì có khả năng
+        là endpoint (sink, decoy, hoặc terminal asset). Attacker cẩn thận sẽ
+        hơi nghi ngờ những node này, nhưng không chắc.
         """
         suspicion = {}
+        sink = self.graph.sink_state
         for s in self.graph.states:
-            meta = self.graph.node_metadata.get(s, {})
-            if not meta.get("is_real", True):
-                # Known decoy nodes → suspicion cao
-                suspicion[s] = 0.8
-            elif meta.get("asset_type") in ["decoy_db", "decoy_router"]:
-                suspicion[s] = 0.9
+            if s == sink:
+                # Sink đã biết là terminal — không đi vào đây
+                suspicion[s] = 0.95
             else:
-                suspicion[s] = 0.1  # Default: ít nghi ngờ
+                n_actions = len(self.graph.available_actions.get(s, []))
+                if n_actions <= 1:
+                    # Dead-end node: chỉ có action "end" hoặc "noop"
+                    # Có thể là decoy hoặc true goal — attacker không biết chắc
+                    suspicion[s] = 0.25
+                else:
+                    # Node có nhiều lựa chọn → ít nghi ngờ
+                    suspicion[s] = 0.05
         return suspicion
 
     def update_suspicion(self, node: int, delta: float) -> None:

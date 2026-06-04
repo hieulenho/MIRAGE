@@ -338,9 +338,13 @@ def run_full_demo():
 
     if plan:
         print(plan)
-        # Deploy the action
-        decoy = fabric.deploy_action(plan.action)
-        print(f"\n🚀 [Layer 3] Action deployed: Decoy ID={decoy.decoy_id}")
+        # Deploy toàn bộ portfolio (không chỉ primary action)
+        deployed_decoys = []
+        for action in plan.portfolio:
+            decoy = fabric.deploy_action(action)
+            deployed_decoys.append(decoy)
+        print(f"\n🚀 [Layer 3] {len(deployed_decoys)} portfolio actions deployed: "
+              + ", ".join(d.decoy_id for d in deployed_decoys))
 
     print("\n📊 [Layer 6] Running Quick Evaluation...")
     evaluator = MIRAGEEvaluator(graph, n_episodes=200, seed=42)

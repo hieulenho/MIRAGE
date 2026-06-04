@@ -48,9 +48,10 @@ class ActionPlan:
     """
     Output có cấu trúc từ Decision Engine.
     Mỗi plan bao gồm:
-    - action: Hành động được đề xuất
+    - action: Hành động được đề xuất (action quan trọng nhất trong portfolio)
+    - portfolio: Toàn bộ tập actions được chọn (có thể nhiều action)
     - giải thích chi tiết
-    - expected values
+    - expected values (tính trên toàn portfolio)
     - risk & confidence
     - rollback plan
     """
@@ -58,7 +59,7 @@ class ActionPlan:
     target_node: int
     target_node_label: str
 
-    # Giá trị kỳ vọng
+    # Giá trị kỳ vọng (tính trên TOÀN BỘ portfolio)
     optimistic_value: float
     pessimistic_value: float
     expected_value: float
@@ -75,6 +76,13 @@ class ActionPlan:
 
     # Metrics cần theo dõi sau khi triển khai
     monitoring_metrics: List[str]
+
+    # ---- Portfolio fields ----
+    # Tập toàn bộ actions được chọn (bao gồm action chính)
+    portfolio: List[DeceptionAction] = field(default_factory=list)
+    portfolio_cost: float = 0.0
+    portfolio_interventions: Dict = field(default_factory=dict)
+    per_attacker_values: Dict[str, float] = field(default_factory=dict)
 
     # Thông tin bổ sung
     timestamp: float = field(default_factory=time.time)
@@ -94,16 +102,36 @@ class ActionPlan:
             "evidence": self.evidence,
             "rollback_plan": self.rollback_plan,
             "monitoring_metrics": self.monitoring_metrics,
+            "portfolio_size": len(self.portfolio),
+            "portfolio_cost": round(self.portfolio_cost, 2),
+            "portfolio_actions": [a.action_id for a in self.portfolio],
         }
 
     def __str__(self) -> str:
         approval_str = "⚠️ REQUIRES HUMAN APPROVAL" if self.required_approval else "✅ Auto-approved"
+        portfolio_lines = ""
+        if self.portfolio:
+            portfolio_lines = "\nPortfolio:\n" + "\n".join(
+                f"  [{i+1}] {a.action_type.value:35s} → Node {a.target_node:2d} "
+                f"| cost={a.cost:.1f} | risk={a.risk_score:.2f}"
+                for i, a in enumerate(self.portfolio)
+            )
+            portfolio_lines += f"\nTotal portfolio cost: {self.portfolio_cost:.1f}\n"
+        per_att = ""
+        if self.per_attacker_values:
+            per_att = "\nPer-attacker defender values:\n" + "\n".join(
+                f"  {atype:15s}: {val:+.4f}"
+                for atype, val in sorted(self.per_attacker_values.items())
+            )
         return (
             f"\n{'='*65}\n"
-            f"🤖 MIRAGE Decision Plan\n"
+            f"🤖 MIRAGE Decision Plan (Portfolio)\n"
             f"{'='*65}\n"
-            f"Action:      {self.action.action_type.value}\n"
-            f"Target:      Node {self.target_node} — {self.target_node_label}\n"
+            f"Primary Action: {self.action.action_type.value}\n"
+            f"Target:         Node {self.target_node} — {self.target_node_label}\n"
+            f"{'─'*65}"
+            f"{portfolio_lines}"
+            f"{per_att}\n"
             f"{'─'*65}\n"
             f"Opt. Value:  {self.optimistic_value:+.4f}  (Best case for defender)\n"
             f"Pess. Value: {self.pessimistic_value:+.4f}  (Worst case — ROBUST target)\n"
@@ -285,8 +313,213 @@ class RobustDecisionEngine:
             return None
 
     def evaluate_action(self, action: DeceptionAction) -> Dict:
-        """Đánh giá một action qua simulation."""
+        """(Legacy) Đánh giá một action đơn lẻ qua simulation."""
         return self._run_attacker_simulation(action, self.n_attacker_samples)
+
+    # ---------------------------------------------------------------------------
+    # Portfolio Optimization (mới)
+    # ---------------------------------------------------------------------------
+
+    def _merge_interventions(
+        self, actions: List[DeceptionAction]
+    ) -> Dict:
+        """
+        Kết hợp reward interventions từ nhiều actions thành một dict dùng cho simulation.
+
+        Quy tắc kết hợp:
+        - DEPLOY_DECOY_*: ghi nhận (node, "end") -> reward_delta (lấy max nếu trùng node)
+        - SCATTER_HONEY_CREDENTIAL: ghi nhận cả (node, "cred_dump") và (node, "end")
+        - INCREASE_EDGE_COST: không sinh reward intervention nhưng có hiệu ứng qua
+          graph.increase_edge_cost đã được deploy_action xử lý; ở đây ta chỉ model
+          hiệu ứng "push attacker toward decoys" bằng negative bait.
+        """
+        merged: Dict = {}
+        for action in actions:
+            atype = action.action_type
+
+            if atype in (
+                DeceptionActionType.DEPLOY_DECOY_DATABASE,
+                DeceptionActionType.DEPLOY_DECOY_ROUTER,
+            ):
+                key = (action.target_node, "end")
+                # Tất cả reward cộng dồn (nhiều decoy cùng loaại tại các node khác nhau)
+                merged[key] = merged.get(key, 0.0) + action.reward_delta
+
+            elif atype == DeceptionActionType.SCATTER_HONEY_CREDENTIAL:
+                k_cred = (action.target_node, "cred_dump")
+                k_end  = (action.target_node, "end")
+                merged[k_cred] = merged.get(k_cred, 0.0) + action.reward_delta * 0.5
+                merged[k_end]  = merged.get(k_end,  0.0) + action.reward_delta * 0.3
+
+            elif atype == DeceptionActionType.INCREASE_EDGE_COST:
+                # Model hiệu ứng của việc chặn edge: attacker có ít khả năng qua đượng đó hơn.
+                # Ta không thể giảm reward tại node, nhưng có thể boost node decoy ở điểm đến
+                # cùng mức độ nhỏ hơn (edge cost được apply sọn lên graph trong deploy_action;
+                # ở đây ta model hiệu ứng bonus cho các decoy cửa đi lân cận).
+                if action.target_edge and action.target_node in self.graph.decoy_sites:
+                    k_end = (action.target_node, "end")
+                    merged[k_end] = merged.get(k_end, 0.0) + action.edge_cost_delta * 0.2
+
+        return merged
+
+    def _evaluate_portfolio(
+        self,
+        actions: List[DeceptionAction],
+        n_eps: int = 50,
+    ) -> Dict:
+        """
+        Đánh giá hiệu quả của một portfolio actions.
+
+        Simulate với tất cả 4 loại attacker dùng combined reward interventions.
+        Pessimistic value = min defender value across all attacker types.
+        """
+        from mirage.attacker_agents import run_simulation
+
+        combined = self._merge_interventions(actions)
+        attacker_types = ["random", "greedy", "shortest_path", "stealthy"]
+        defender_values: Dict[str, float] = {}
+
+        for atype in attacker_types:
+            result = run_simulation(
+                self.graph, atype,
+                n_episodes=max(n_eps, 20),
+                reward_interventions=combined,
+                seed=42,
+            )
+            d_val = (
+                result["decoy_interception_rate"] * 1.0
+                - result["hit_true_goal_rate"] * 2.0
+                + (result["avg_steps_to_terminal"] / 30.0) * 0.2
+            )
+            defender_values[atype] = d_val
+
+        total_cost = sum(a.cost for a in actions)
+        values = list(defender_values.values())
+        return {
+            "pessimistic_value": min(values),
+            "optimistic_value":  max(values),
+            "expected_value":    sum(values) / len(values),
+            "per_attacker":      defender_values,
+            "combined_interventions": combined,
+            "total_cost":        total_cost,
+        }
+
+    def optimize_portfolio(
+        self,
+        budget: float,
+        safety_filter=None,
+    ):
+        """
+        Tìm portfolio tối ưu dưới budget constraint.
+        Maximize pessimistic (worst-case) defender value.
+
+        Thuật toán 2 pha:
+          Pha 1 (Greedy): lần lượt thêm action cải thiện pessimistic_value nhiều nhất.
+          Pha 2 (Local Swap): thử hoán đổi từng action trong portfolio với action ngoài
+                              để thoát local optima.
+
+        Returns:
+            (portfolio: List[DeceptionAction], result: Dict)
+        """
+        available = self.fabric.get_available_actions(budget)
+        if not available:
+            return [], {"pessimistic_value": float("-inf"), "combined_interventions": {}}
+
+        # Độ phân giải episodes: đủ để phân biệt portfolios mà không quá chậm
+        eps_per_eval = max(40, self.n_attacker_samples // 4)
+
+        print(f"\n🔎 [Portfolio Optimizer] {len(available)} candidate actions, "
+              f"budget={budget:.1f}, {eps_per_eval} eps/eval")
+
+        # --------------- Pha 1: Greedy forward ----------------
+        # Thêm actions từng bước, mỗi bước chọn action cải thiện pessimistic_value nhất.
+        # Khác với stopping-at-first-improvement: ta thử TOÀN BỘ candidates ở mỗi bước.
+        portfolio: List[DeceptionAction] = []
+        remaining_budget = budget
+        candidates = list(available)
+        current_result: Dict = {
+            "pessimistic_value": float("-inf"),
+            "combined_interventions": {},
+            "total_cost": 0.0,
+        }
+
+        while candidates:
+            best_candidate = None
+            best_result: Dict = {"pessimistic_value": float("-inf")}
+
+            for action in candidates:
+                if action.cost > remaining_budget:
+                    continue
+                trial_result = self._evaluate_portfolio(
+                    portfolio + [action], n_eps=eps_per_eval
+                )
+                if trial_result["pessimistic_value"] > best_result["pessimistic_value"]:
+                    best_result = trial_result
+                    best_candidate = action
+
+            if best_candidate is None:
+                break  # Budget hết — không action nào fit
+
+            # Luôn thêm action tốt nhất tìm được nếu nó cải thiện so với portfolio hiện tại
+            if best_result["pessimistic_value"] > current_result["pessimistic_value"]:
+                portfolio.append(best_candidate)
+                candidates.remove(best_candidate)
+                remaining_budget -= best_candidate.cost
+                current_result = best_result
+                print(f"  + Add: {best_candidate.action_type.value} @ Node {best_candidate.target_node} "
+                      f"| pess={best_result['pessimistic_value']:+.4f} "
+                      f"| budget_left={remaining_budget:.1f}")
+            else:
+                # Thêm action này không cải thiện pessimistic_value,
+                # nhưng có thể action khác vẫn còn cải thiện được → tiếp tục
+                candidates.remove(best_candidate)
+                print(f"  ~ Skip: {best_candidate.action_type.value} @ Node {best_candidate.target_node} "
+                      f"(no pess improvement: {best_result['pessimistic_value']:+.4f})")
+
+        # --------------- Pha 2: Local swap ----------------
+        print(f"  Phase 2: Local swap on portfolio of {len(portfolio)} actions...")
+        outside = [a for a in available if a not in portfolio]
+        improved = True
+        while improved:
+            improved = False
+            for i, in_action in enumerate(portfolio):
+                for out_action in outside:
+                    # Kiểm tra budget nếu hoán đổi
+                    new_cost = current_result["total_cost"] \
+                        - in_action.cost + out_action.cost
+                    if new_cost > budget:
+                        continue
+                    trial_portfolio = portfolio[:i] + [out_action] + portfolio[i+1:]
+                    trial_result = self._evaluate_portfolio(
+                        trial_portfolio, n_eps=eps_per_eval
+                    )
+                    if trial_result["pessimistic_value"] > current_result["pessimistic_value"] + 1e-4:
+                        portfolio = trial_portfolio
+                        outside[outside.index(out_action)] = in_action
+                        current_result = trial_result
+                        improved = True
+                        print(f"  ~ Swap: {in_action.action_type.value} → "
+                              f"{out_action.action_type.value} @ Node {out_action.target_node} "
+                              f"| pess={trial_result['pessimistic_value']:+.4f}")
+                        break
+                if improved:
+                    break
+
+        # Re-evaluate portfolio cuối cùng với độ chính xác cao hơn
+        if portfolio:
+            final_result = self._evaluate_portfolio(
+                portfolio, n_eps=max(50, self.n_attacker_samples // 4)
+            )
+        else:
+            final_result = current_result
+
+        total_cost = sum(a.cost for a in portfolio)
+        print(f"  ✓ Optimal portfolio: {len(portfolio)} actions, "
+              f"cost={total_cost:.1f}/{budget:.1f}, "
+              f"pess={final_result['pessimistic_value']:+.4f}, "
+              f"opt={final_result['optimistic_value']:+.4f}")
+
+        return portfolio, final_result
 
     def decide(
         self,
@@ -296,87 +529,95 @@ class RobustDecisionEngine:
         safety_filter=None,  # Layer 5 safety gate
     ) -> Optional[ActionPlan]:
         """
-        Ra quyết định chính: chọn action tốt nhất theo pessimistic value.
-        
+        Ra quyết định chính: chọn portfolio tối ưu theo pessimistic value.
+
+        Upgraded từ: chọn 1 action tốt nhất
+        Thành:          chọn tập action tối ưu dưới budget (portfolio optimization)
+
         Args:
             belief_state: Phân phối xác suất attacker location
             stage_context: Stage information từ Layer 1
             budget_remaining: Ngân sách còn lại
             safety_filter: Layer 5 function kiểm tra an toàn
-            
-        Returns:
-            ActionPlan tốt nhất, hoặc None nếu không có action an toàn
-        """
-        print("\n🔬 [Decision Engine] Evaluating deception actions...")
-        available = self.fabric.get_available_actions(budget_remaining)
 
-        if not available:
-            print("  [!] No actions available within budget.")
+        Returns:
+            ActionPlan với portfolio đầy đủ, hoặc None nếu không có action an toàn
+        """
+        print("\n🔬 [Decision Engine] Running portfolio optimization...")
+
+        # ---- Chạy portfolio optimizer ----
+        portfolio, portfolio_result = self.optimize_portfolio(
+            budget=budget_remaining,
+            safety_filter=safety_filter,
+        )
+
+        if not portfolio:
+            print("  [!] No feasible portfolio found within budget.")
             return None
 
-        # Thử MILP optimization trước
+        # ---- Chọn primary action (action quan trọng nhất trong portfolio) ----
+        # Ƭu tiên: DEPLOY_DECOY_DATABASE > DEPLOY_DECOY_ROUTER > HONEY_CRED > EDGE_COST
+        priority_order = [
+            DeceptionActionType.DEPLOY_DECOY_DATABASE,
+            DeceptionActionType.DEPLOY_DECOY_ROUTER,
+            DeceptionActionType.SCATTER_HONEY_CREDENTIAL,
+            DeceptionActionType.INCREASE_EDGE_COST,
+        ]
+        primary_action = portfolio[0]
+        for atype in priority_order:
+            match = next((a for a in portfolio if a.action_type == atype), None)
+            if match:
+                primary_action = match
+                break
+
+        # ---- Xây dựng evidence & reasoning ----
+        evidence = self._build_evidence(belief_state, stage_context, primary_action)
         milp_result = None
-        if self.use_robust_milp:
-            print("  → Running MILP Robust Optimization...")
-            milp_result = self._run_milp_optimization(budget_remaining)
-            if milp_result:
-                print(f"  ✓ MILP solved: c*={milp_result['c_star']:.4f}, "
-                      f"v1*={milp_result['v1_star']:.4f}")
 
-        # Evaluate mỗi action qua simulation
-        print(f"  → Simulating {len(available)} candidate actions "
-              f"({self.n_attacker_samples} episodes each)...")
+        needs_approval = any(
+            a.risk_score > 0.3 or a.business_impact > 0.1
+            for a in portfolio
+        ) or portfolio_result["pessimistic_value"] < -0.5
 
-        action_results = []
-        for action in available:
-            result = self.evaluate_action(action)
-            action_results.append((action, result))
+        gap = portfolio_result["optimistic_value"] - portfolio_result["pessimistic_value"]
+        confidence = max(0.5, 1.0 - gap * 0.5)
 
-        # Sắp xếp theo pessimistic value (ROBUST criterion)
-        action_results.sort(key=lambda x: x[1]["pessimistic_value"], reverse=True)
+        plan = ActionPlan(
+            action=primary_action,
+            target_node=primary_action.target_node,
+            target_node_label=self.graph.label(primary_action.target_node),
+            optimistic_value=portfolio_result["optimistic_value"],
+            pessimistic_value=portfolio_result["pessimistic_value"],
+            expected_value=portfolio_result["expected_value"],
+            risk_score=max(a.risk_score for a in portfolio),
+            confidence=confidence,
+            required_approval=needs_approval,
+            reasoning=self._build_reasoning(
+                primary_action, portfolio_result, belief_state, milp_result,
+                portfolio_size=len(portfolio),
+            ),
+            evidence=evidence,
+            rollback_plan=" | ".join(a.rollback_plan for a in portfolio),
+            monitoring_metrics=self._build_monitoring_metrics(primary_action),
+            # Portfolio fields
+            portfolio=portfolio,
+            portfolio_cost=sum(a.cost for a in portfolio),
+            portfolio_interventions=portfolio_result["combined_interventions"],
+            per_attacker_values=portfolio_result.get("per_attacker", {}),
+        )
 
-        # Chọn action tốt nhất qua safety filter
-        for action, result in action_results:
-            # Xây dựng evidence từ belief state và stage context
-            evidence = self._build_evidence(belief_state, stage_context, action)
+        # Kiểm tra safety gate (Layer 5) trên primary action
+        if safety_filter is not None:
+            safe, warning = safety_filter(plan)
+            if not safe:
+                print(f"  ✗ Portfolio blocked by Safety Gate: {warning}")
+                return None
 
-            # Xác định cần human approval không
-            needs_approval = (
-                action.risk_score > 0.3 or
-                action.business_impact > 0.1 or
-                result["pessimistic_value"] < -0.5
-            )
-
-            plan = ActionPlan(
-                action=action,
-                target_node=action.target_node,
-                target_node_label=self.graph.label(action.target_node),
-                optimistic_value=result["optimistic_value"],
-                pessimistic_value=result["pessimistic_value"],
-                expected_value=result["expected_value"],
-                risk_score=action.risk_score,
-                confidence=max(0.5, 1.0 - abs(result["optimistic_value"] - result["pessimistic_value"])),
-                required_approval=needs_approval,
-                reasoning=self._build_reasoning(action, result, belief_state, milp_result),
-                evidence=evidence,
-                rollback_plan=action.rollback_plan,
-                monitoring_metrics=self._build_monitoring_metrics(action),
-            )
-
-            # Kiểm tra safety gate (Layer 5)
-            if safety_filter is not None:
-                safe, warning = safety_filter(plan)
-                if not safe:
-                    print(f"  ✗ Action blocked by Safety Gate: {warning}")
-                    continue
-
-            self._decision_history.append(plan)
-            print(f"  ✓ Selected: {action.action_type.value} @ Node {action.target_node} "
-                  f"| Pess.Val={result['pessimistic_value']:+.4f}")
-            return plan
-
-        print("  [!] All actions blocked by safety constraints. Entering observe-only mode.")
-        return None
+        self._decision_history.append(plan)
+        print(f"  ✓ Portfolio selected: {len(portfolio)} actions "
+              f"| total_cost={plan.portfolio_cost:.1f} "
+              f"| Pess.Val={portfolio_result['pessimistic_value']:+.4f}")
+        return plan
 
     def _build_evidence(
         self,
@@ -421,13 +662,14 @@ class RobustDecisionEngine:
         result: Dict,
         belief_state: Dict[int, float],
         milp_result: Optional[Dict],
+        portfolio_size: int = 1,
     ) -> str:
         """Xây dựng giải thích bằng tiếng Anh cho SOC analyst."""
         action_name = action.action_type.value.replace("_", " ").title()
         node_label = self.graph.label(action.target_node)
 
         reasoning = (
-            f"{action_name} at {node_label}. "
+            f"{action_name} at {node_label} (primary action in portfolio of {portfolio_size}). "
             f"Pessimistic defender value: {result['pessimistic_value']:+.4f} "
             f"(worst-case across all attacker strategies). "
         )

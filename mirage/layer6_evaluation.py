@@ -94,6 +94,45 @@ class MIRAGEEvaluator:
         os.makedirs(results_dir, exist_ok=True)
         self.results: Dict[str, MethodResult] = {}
 
+    def _build_clean_graph_no_defense(self):
+        """
+        Tạo bản sao graph loại bỏ hoàn toàn xác suất chuyển đến decoy nodes.
+
+        Mục đích: baseline no_defense phải phản ánh đúng kịch bản không có
+        deception nào được deploy — tức là decoy nodes về mặt vật lý không
+        tồn tại, attacker không có đường structural nào dẫn đến chúng.
+
+        Cách làm: với mỗi transition có xác suất đến decoy node, lấy phần
+        xác suất đó và phân phối lại theo tỷ lệ sang các real neighbors còn lại.
+        Nếu không còn real neighbor nào thì redirect về Sink.
+        """
+        import copy
+        graph_copy = copy.deepcopy(self.graph)
+        decoy_set = set(graph_copy.decoy_sites)
+
+        for src in graph_copy.states:
+            for action in graph_copy.available_actions.get(src, []):
+                trans = graph_copy.transitions[src][action]
+                decoy_prob = sum(p for ns, p in trans.items() if ns in decoy_set)
+                if decoy_prob <= 0:
+                    continue  # Không có decoy trong transition này
+
+                # Giữ lại các real neighbors
+                real_trans = {ns: p for ns, p in trans.items() if ns not in decoy_set}
+                if real_trans:
+                    # Phân phối lại decoy_prob theo tỷ lệ vào real nodes
+                    total_real = sum(real_trans.values())
+                    scale = (total_real + decoy_prob) / total_real
+                    graph_copy.transitions[src][action] = {
+                        ns: p * scale for ns, p in real_trans.items()
+                    }
+                else:
+                    # Không còn real neighbor → redirect toàn bộ về Sink
+                    graph_copy.transitions[src][action] = {
+                        graph_copy.sink_state: 1.0
+                    }
+        return graph_copy
+
     def _get_reward_interventions_for_method(self, method: str) -> Dict[Tuple, float]:
         """Tạo reward interventions theo phương pháp."""
         from mirage.layer2_attack_graph import DB_FAKE, RTR_FAKE, WS_FIN, SMB_SHARE, SVC_CRED
@@ -132,14 +171,21 @@ class MIRAGEEvaluator:
             }
 
         elif method == "robust_mirage":
-            # MIRAGE: tối ưu pessimistic value
-            # Phân tán deception để tối ưu worst-case
-            return {
-                (DB_FAKE, "end"):    0.9,   # Chính bẫy
-                (RTR_FAKE, "end"):   0.7,   # Bẫy phụ
-                (WS_FIN, "smb_move"): 0.4,  # Tăng chi phí đường ngắn
-                (SMB_SHARE, "end"):  0.5,   # Bẫy trung gian
-            }
+            # Gọi Layer 4 engine thật để tìm portfolio tối ưu
+            # Benchmark sẽ phản ánh đúng những gì hệ thống thực sự làm
+            from mirage.layer3_deception import DeceptionFabric
+            from mirage.layer4_decision_engine import RobustDecisionEngine
+
+            fabric = DeceptionFabric(self.graph)
+            engine = RobustDecisionEngine(
+                self.graph, fabric,
+                # Dùng ít episodes hơn trong optimization phase
+                # (đủ để phân biệt portfolios), evaluation phase sẽ dùng n_episodes đầy đủ
+                n_attacker_samples=max(80, self.n_episodes // 6),
+                use_robust_milp=False,
+            )
+            _, portfolio_result = engine.optimize_portfolio(budget=self.graph.budget)
+            return portfolio_result.get("combined_interventions", {})
 
         return {}
 
@@ -160,29 +206,33 @@ class MIRAGEEvaluator:
 
         eps_per_type = max(50, self.n_episodes // len(self.ATTACKER_TYPES))
 
-        # Xây dựng đồ thị biến đổi dựa trên reward interventions
-        # Phương pháp robust có nhiều intervention → thay đổi transition probabilities
-        n_interventions = len([v for v in reward_interventions.values() if v > 0])
-        # Tạo bản sao graph với modified transitions cho phương pháp này
         import copy
-        graph_copy = copy.deepcopy(self.graph)
-        # Apply interventions bằng cách tăng xác suất đi đến decoy nodes
-        for (node, action), delta in reward_interventions.items():
-            if node in graph_copy.decoy_sites and delta > 0:
-                # Tăng xác suất attacker đi đến decoy node
-                # (Decoy hấp dẫn hơn → attacker bị dụ nhiều hơn)
-                for src in graph_copy.states:
-                    for act in graph_copy.available_actions.get(src, []):
-                        if node in graph_copy.transitions[src][act]:
-                            old_p = graph_copy.transitions[src][act][node]
-                            # Tăng xác suất đến decoy theo strength của intervention
-                            boost = min(delta * 0.15, old_p * 0.4)
-                            graph_copy.transitions[src][act][node] = old_p + boost
-                            # Normalize lại
-                            total = sum(graph_copy.transitions[src][act].values())
-                            graph_copy.transitions[src][act] = {
-                                k: v/total for k, v in graph_copy.transitions[src][act].items()
-                            }
+
+        # ---- no_defense: dùng clean graph không có đường đến decoy ----
+        # Đây là baseline thực sự "không phòng thủ" — decoy chưa được deploy,
+        # nên không có xác suất structural nào dẫn attacker vào decoy nodes.
+        if method == "no_defense":
+            graph_copy = self._build_clean_graph_no_defense()
+        else:
+            # Các phương pháp có deception: dùng graph gốc + boost transitions
+            graph_copy = copy.deepcopy(self.graph)
+            # Apply interventions bằng cách tăng xác suất đi đến decoy nodes
+            for (node, action), delta in reward_interventions.items():
+                if node in graph_copy.decoy_sites and delta > 0:
+                    # Tăng xác suất attacker đi đến decoy node
+                    # (Decoy hấp dẫn hơn → attacker bị dụ nhiều hơn)
+                    for src in graph_copy.states:
+                        for act in graph_copy.available_actions.get(src, []):
+                            if node in graph_copy.transitions[src][act]:
+                                old_p = graph_copy.transitions[src][act][node]
+                                # Tăng xác suất đến decoy theo strength của intervention
+                                boost = min(delta * 0.15, old_p * 0.4)
+                                graph_copy.transitions[src][act][node] = old_p + boost
+                                # Normalize lại
+                                total = sum(graph_copy.transitions[src][act].values())
+                                graph_copy.transitions[src][act] = {
+                                    k: v/total for k, v in graph_copy.transitions[src][act].items()
+                                }
 
         for atype in self.ATTACKER_TYPES:
             result = run_simulation(
