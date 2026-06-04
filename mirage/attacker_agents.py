@@ -101,14 +101,18 @@ class BaseAttacker(ABC):
         self,
         max_steps: int = 30,
         reward_interventions: Dict[Tuple[int, str], float] = None,
+        start_distribution: Dict[int, float] = None,
     ) -> Tuple[bool, bool, int]:
         """
         Chạy một tập tấn công đến khi kết thúc hoặc hết bước.
-        
+
+        Args:
+            start_distribution: Nếu có, sample vị trí bắt đầu từ belief state này.
+
         Returns:
             (hit_true_goal, hit_decoy, steps)
         """
-        self.reset()
+        self.reset(start_distribution=start_distribution)
         for _ in range(max_steps):
             step = self.step(reward_interventions)
             if step.is_terminal:
@@ -118,9 +122,30 @@ class BaseAttacker(ABC):
                 return hit_true, hit_decoy, self.steps_taken
         return False, False, self.steps_taken
 
-    def reset(self) -> None:
-        """Reset về trạng thái ban đầu."""
-        self.current_state = list(self.graph.start_distribution.keys())[0]
+    def reset(self, start_distribution: Dict[int, float] = None) -> None:
+        """
+        Reset về trạng thái ban đầu.
+
+        Args:
+            start_distribution: Nếu được cung cấp, sample vị trí khởi đầu từ phân phối này
+                                 (tức là belief state từ Layer 1/2).
+                                 Nếu None, dùng graph.start_distribution (entry point mặc định).
+        """
+        if start_distribution:
+            # Lọc bỏ sink state và normalize
+            sink = self.graph.sink_state
+            filtered = {s: p for s, p in start_distribution.items()
+                        if s != sink and p > 0.0}
+            if filtered:
+                total = sum(filtered.values())
+                states_list = list(filtered.keys())
+                weights = [filtered[s] / total for s in states_list]
+                self.current_state = self.rng.choices(states_list, weights=weights, k=1)[0]
+            else:
+                # Fallback nếu tất cả bị lọc
+                self.current_state = list(self.graph.start_distribution.keys())[0]
+        else:
+            self.current_state = list(self.graph.start_distribution.keys())[0]
         self.trajectory = []
         self.total_reward = 0.0
         self.steps_taken = 0
@@ -446,10 +471,16 @@ def run_simulation(
     reward_interventions: Dict[Tuple[int, str], float] = None,
     seed: int = 42,
     max_steps: int = 30,
+    start_distribution: Dict[int, float] = None,
 ) -> Dict:
     """
     Chạy simulation với một loại attacker trong nhiều episode.
-    
+
+    Args:
+        start_distribution: Nếu được cung cấp, mỗi episode sẽ sample vị trí khởi đầu
+                             từ phân phối này thay vì luôn bắt đầu từ entry point.
+                             Đây là cách inject belief state (từ Layer 1/2) vào simulation.
+
     Returns:
         Dict với các metrics: hit_rate, interception_rate, avg_steps, etc.
     """
@@ -463,6 +494,7 @@ def run_simulation(
         hit_true, hit_decoy, steps = attacker.run_episode(
             max_steps=max_steps,
             reward_interventions=reward_interventions,
+            start_distribution=start_distribution,
         )
         if hit_true:
             hits_true_goal += 1
