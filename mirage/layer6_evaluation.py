@@ -566,47 +566,147 @@ class MIRAGEEvaluator:
 
     def run_ablation_study(self) -> None:
         """
-        Ablation study: bỏ từng thành phần của MIRAGE để chứng minh đóng góp.
+        Ablation study: each variant ACTUALLY disables one MIRAGE component.
+
+        Changes are made to optimize_portfolio() parameters:
+          - criterion: "pessimistic" vs "expected"  -> tests robust objective
+          - belief_state=None                        -> tests stage belief
+          - allowed_action_types filter              -> tests action diversity / edge cost
         """
         from mirage.attacker_agents import run_simulation
+        from mirage.layer3_deception import DeceptionFabric
+        from mirage.layer4_decision_engine import RobustDecisionEngine
 
         print("\n" + "=" * 70)
-        print("ABLATION STUDY — Component Contribution Analysis")
+        print("ABLATION STUDY -- Component Contribution Analysis")
         print("=" * 70)
 
-        from mirage.layer2_attack_graph import DB_FAKE, RTR_FAKE, WS_FIN, SMB_SHARE
+        # Fixed belief state: lateral movement scenario
+        ABLATION_BELIEF = {4: 0.35, 3: 0.25, 6: 0.20, 8: 0.10, 9: 0.10}
 
-        ablations = {
-            "Full MIRAGE":           {(DB_FAKE, "end"): 0.9, (RTR_FAKE, "end"): 0.7,
-                                       (WS_FIN, "smb_move"): 0.4, (SMB_SHARE, "end"): 0.5},
-            "- Robust Term":         {(DB_FAKE, "end"): 1.0, (RTR_FAKE, "end"): 1.0},  # Standard RL
-            "- Stage Modeling":      {(DB_FAKE, "end"): 0.9},  # No stage context
-            "- Deception Variety":   {(DB_FAKE, "end"): 0.9},  # Only one decoy type
-            "- Safety Cost":         {(DB_FAKE, "end"): 0.9, (RTR_FAKE, "end"): 0.7,
-                                       (WS_FIN, "smb_move"): 0.4},  # No safety constraints
-            "No Components":         {},  # Bare
+        VARIANTS = [
+            {
+                "name": "Full MIRAGE",
+                "criterion": "pessimistic",
+                "allowed_types": None,
+                "use_belief": True,
+                "desc": "All components active",
+            },
+            {
+                "name": "- No Robust Objective",
+                "criterion": "expected",
+                "allowed_types": None,
+                "use_belief": True,
+                "desc": "Avg value instead of worst-case -> no robustness guarantee",
+            },
+            {
+                "name": "- No Stage Belief",
+                "criterion": "pessimistic",
+                "allowed_types": None,
+                "use_belief": False,
+                "desc": "Simulation from entry point, ignoring attacker location",
+            },
+            {
+                "name": "- No Deception Variety",
+                "criterion": "pessimistic",
+                "allowed_types": ["deploy_decoy_database"],
+                "use_belief": True,
+                "desc": "Only Decoy DB -> no honey cred / router / edge cost",
+            },
+            {
+                "name": "- No Edge Cost",
+                "criterion": "pessimistic",
+                "allowed_types": [
+                    "deploy_decoy_database",
+                    "deploy_decoy_router",
+                    "scatter_honey_credential",
+                ],
+                "use_belief": True,
+                "desc": "Remove INCREASE_EDGE_COST -> reward-only deception (no transition boost from edge)",
+            },
+            {
+                "name": "No Components",
+                "criterion": "expected",
+                "allowed_types": ["deploy_decoy_database"],
+                "use_belief": False,
+                "desc": "No robust + no belief + no variety (degenerate baseline)",
+            },
+        ]
+
+        eps_opt  = max(60, self.n_episodes // 6)
+        eps_eval = max(80, self.n_episodes // 4)
+
+        print(
+            f"\n{'Variant':28s} | {'Pess.Val':>10s} | {'Exp.Val':>9s}"
+            f" | {'Intercept%':>11s} | {'Hit_TG%':>9s} | Portfolio"
+        )
+        print("-" * 100)
+
+        SHORT = {
+            "deploy_decoy_database":     "decoy_db",
+            "deploy_decoy_router":       "decoy_rt",
+            "scatter_honey_credential":  "honey",
+            "increase_edge_cost":        "edge",
         }
 
-        eps = max(100, self.n_episodes // 3)
-        print(f"\n{'Component':25s} | {'Pess.Val':>10s} | {'Intercept%':>12s} | {'Hit_TG%':>10s}")
-        print("-" * 65)
-        for name, interventions in ablations.items():
-            vals = []
-            intercepts = []
-            hits = []
-            for atype in self.ATTACKER_TYPES:
-                res = run_simulation(self.graph, atype, n_episodes=eps // 4,
-                                     reward_interventions=interventions, seed=self.seed)
-                d_val = (res["decoy_interception_rate"] - res["hit_true_goal_rate"] * 2.0
-                         + res["avg_steps_to_terminal"] / self.max_steps * 0.2)
-                vals.append(d_val)
-                intercepts.append(res["decoy_interception_rate"])
-                hits.append(res["hit_true_goal_rate"])
-            pess = min(vals)
-            ic = sum(intercepts)/len(intercepts)
-            ht = sum(hits)/len(hits)
-            flag = " ← FULL" if name == "Full MIRAGE" else ""
-            print(f"{name:25s} | {pess:+10.4f} | {ic:>11.1%} | {ht:>9.1%}{flag}")
+        for v in VARIANTS:
+            belief = ABLATION_BELIEF if v["use_belief"] else None
+
+            fabric = DeceptionFabric(self.graph)
+            engine = RobustDecisionEngine(
+                self.graph, fabric,
+                n_attacker_samples=eps_opt,
+                use_robust_milp=False,
+            )
+
+            portfolio, _ = engine.optimize_portfolio(
+                budget=self.graph.budget,
+                belief_state=belief,
+                criterion=v["criterion"],
+                allowed_action_types=v["allowed_types"],
+            )
+
+            if portfolio:
+                # Evaluate with neutral belief + pessimistic criterion for fair comparison
+                eval_r = engine._evaluate_portfolio(
+                    portfolio, n_eps=eps_eval,
+                    belief_state=None,
+                    criterion="pessimistic",
+                )
+                pess     = eval_r["pessimistic_value"]
+                exp_val  = eval_r["expected_value"]
+                combined = eval_r["combined_interventions"]
+
+                raw_ic, raw_ht = [], []
+                for atype in self.ATTACKER_TYPES:
+                    res = run_simulation(
+                        self.graph, atype,
+                        n_episodes=max(eps_eval // 4, 20),
+                        reward_interventions=combined,
+                        seed=self.seed,
+                    )
+                    raw_ic.append(res["decoy_interception_rate"])
+                    raw_ht.append(res["hit_true_goal_rate"])
+                ic_pct = sum(raw_ic) / len(raw_ic)
+                ht_pct = sum(raw_ht) / len(raw_ht)
+
+                port_desc = "+".join(
+                    SHORT.get(a.action_type.value, a.action_type.value[:8])
+                    for a in portfolio[:3]
+                )
+                if len(portfolio) > 3:
+                    port_desc += f"+{len(portfolio)-3}more"
+            else:
+                pess, exp_val, ic_pct, ht_pct, port_desc = -2.0, -2.0, 0.0, 1.0, "empty"
+
+            flag = " <- FULL" if v["name"] == "Full MIRAGE" else ""
+            print(
+                f"{v['name']:28s} | {pess:+10.4f} | {exp_val:+9.4f}"
+                f" | {ic_pct:>10.1%} | {ht_pct:>8.1%} | {port_desc}{flag}"
+            )
+            print(f"  +-- {v['desc']}")
+
+        print()
 
 
 if __name__ == "__main__":

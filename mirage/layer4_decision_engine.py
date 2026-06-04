@@ -367,29 +367,58 @@ class RobustDecisionEngine:
         actions: List[DeceptionAction],
         n_eps: int = 50,
         belief_state: Optional[Dict[int, float]] = None,
+        criterion: str = "pessimistic",
     ) -> Dict:
         """
         Đánh giá hiệu quả của một portfolio actions.
 
-        Simulate với tất cả 4 loại attacker dùng combined reward interventions.
-        Pessimistic value = min defender value across all attacker types.
+        Deception hoạt động qua HAI kênh đồng thời:
+          Channel 1 — Reward: reward_interventions thêm fake reward tại decoy nodes.
+            Tác dụng: attacker dạng greedy/stealthy bị thu hút.
+          Channel 2 — Transition: tăng xác suất attacker "land" tại decoy node.
+            Tác dụng: ảnh hưởng ALL attacker types, kể cả shortest_path.
 
         Args:
-            belief_state: Nếu có, mỗi simulation episode sẽ bắt đầu từ phân phối này.
-                          Điều này giúp value được tính dướng trên vị trí thực của attacker,
-                          không phải luôn từ entry point.
+            criterion: Tiêu chí chọn portfolio:
+              "pessimistic" — min value (full MIRAGE, worst-case robust)
+              "expected"    — avg value (standard RL, không có robust term)
+              "optimistic"  — max value (best-case)
         """
+        import copy
         from mirage.attacker_agents import run_simulation
 
         combined = self._merge_interventions(actions)
+
+        # ---- Channel 2: Transition boost ----
+        # Tạo graph_copy với xác suất đi đến decoy nodes được tăng lên.
+        # Phản ánh thực tế: decoy trông giống tài sản thật → attacker có xác suất
+        # cao hơn khi navigate mạng. Ảnh hưởng ALL attacker types.
+        graph_copy = copy.deepcopy(self.graph)
+        decoy_set = set(graph_copy.decoy_sites)
+        for (node, _), delta in combined.items():
+            if node in decoy_set and delta > 0:
+                for src in graph_copy.states:
+                    for act in graph_copy.available_actions.get(src, []):
+                        if node in graph_copy.transitions[src][act]:
+                            old_p = graph_copy.transitions[src][act][node]
+                            # Boost proportional to deception strength, capped
+                            boost = min(delta * 0.12, old_p * 0.40)
+                            graph_copy.transitions[src][act][node] = old_p + boost
+                            # Normalize để đảm bảo tổng = 1
+                            total = sum(graph_copy.transitions[src][act].values())
+                            graph_copy.transitions[src][act] = {
+                                k: v / total
+                                for k, v in graph_copy.transitions[src][act].items()
+                            }
+
         attacker_types = ["random", "greedy", "shortest_path", "stealthy"]
         defender_values: Dict[str, float] = {}
 
         for atype in attacker_types:
             result = run_simulation(
-                self.graph, atype,
+                graph_copy, atype,          # Dùng graph đã modified (cả 2 kênh)
                 n_episodes=max(n_eps, 20),
-                reward_interventions=combined,
+                reward_interventions=combined,  # Channel 1: reward bait
                 seed=42,
                 start_distribution=belief_state,
             )
@@ -402,10 +431,20 @@ class RobustDecisionEngine:
 
         total_cost = sum(a.cost for a in actions)
         values = list(defender_values.values())
+
+        # Tiêu chí chọn portfolio (dùng trong greedy comparison)
+        if criterion == "pessimistic":
+            selection_value = min(values)
+        elif criterion == "optimistic":
+            selection_value = max(values)
+        else:  # "expected" — standard RL
+            selection_value = sum(values) / len(values)
+
         return {
             "pessimistic_value": min(values),
             "optimistic_value":  max(values),
             "expected_value":    sum(values) / len(values),
+            "selection_value":   selection_value,   # Dùng để chọn portfolio
             "per_attacker":      defender_values,
             "combined_interventions": combined,
             "total_cost":        total_cost,
@@ -416,45 +455,59 @@ class RobustDecisionEngine:
         budget: float,
         safety_filter=None,
         belief_state: Optional[Dict[int, float]] = None,
+        criterion: str = "pessimistic",
+        allowed_action_types: Optional[List[str]] = None,
     ):
         """
         Tìm portfolio tối ưu dưới budget constraint.
-        Maximize pessimistic (worst-case) defender value.
 
         Args:
+            criterion: Tiêu chí chọn portfolio:
+              "pessimistic" — maximize worst-case value (full MIRAGE robust)
+              "expected"    — maximize average value (no robust term, standard RL)
+              "optimistic"  — maximize best-case value
+            allowed_action_types: Nếu có, chỉ cho phép các loại action này.
+              Dùng cho ablation study để thử vực action catalog.
             belief_state: Phân phối xác suất attacker location từ Layer 1/2.
-                          Nếu có, simulation sẽ bắt đầu từ đây thay vì entry point.
-                          Điều này làm cho value của từng portfolio action phụ thuộc
-                          vào thông tin thực về vị trí attacker — đúng theo POMDP.
 
         Algorithms: Greedy forward + Local swap.
         """
         available = self.fabric.get_available_actions(budget)
+
+        # Lọc theo loại action (cho ablation study)
+        if allowed_action_types:
+            available = [
+                a for a in available
+                if a.action_type.value in allowed_action_types
+            ]
+
         if not available:
-            return [], {"pessimistic_value": float("-inf"), "combined_interventions": {}}
+            return [], {"pessimistic_value": float("-inf"), "selection_value": float("-inf"),
+                        "combined_interventions": {}, "total_cost": 0.0}
 
         # Độ phân giải episodes: đủ để phân biệt portfolios mà không quá chậm
         eps_per_eval = max(40, self.n_attacker_samples // 4)
 
         print(f"\n\U0001f50e [Portfolio Optimizer] {len(available)} candidate actions, "
-              f"budget={budget:.1f}, {eps_per_eval} eps/eval"
+              f"budget={budget:.1f}, {eps_per_eval} eps/eval, criterion={criterion}"
               + (" | belief-conditioned" if belief_state else " | from entry point"))
 
         # --------------- Pha 1: Greedy forward ----------------
-        # Thêm actions từng bước, mỗi bước chọn action cải thiện pessimistic_value nhất.
-        # Khác với stopping-at-first-improvement: ta thử TOÀN BỘ candidates ở mỗi bước.
         portfolio: List[DeceptionAction] = []
         remaining_budget = budget
         candidates = list(available)
         current_result: Dict = {
             "pessimistic_value": float("-inf"),
+            "selection_value":   float("-inf"),
             "combined_interventions": {},
             "total_cost": 0.0,
         }
 
         while candidates:
             best_candidate = None
-            best_result: Dict = {"pessimistic_value": float("-inf")}
+            best_sel_val = float("-inf")
+            best_result: Dict = {"pessimistic_value": float("-inf"),
+                                  "selection_value":  float("-inf")}
 
             for action in candidates:
                 if action.cost > remaining_budget:
@@ -462,32 +515,33 @@ class RobustDecisionEngine:
                 trial_result = self._evaluate_portfolio(
                     portfolio + [action], n_eps=eps_per_eval,
                     belief_state=belief_state,
+                    criterion=criterion,
                 )
-                if trial_result["pessimistic_value"] > best_result["pessimistic_value"]:
+                if trial_result["selection_value"] > best_sel_val:
+                    best_sel_val = trial_result["selection_value"]
                     best_result = trial_result
                     best_candidate = action
 
             if best_candidate is None:
-                break  # Budget hết — không action nào fit
+                break
 
-            # Luôn thêm action tốt nhất tìm được nếu nó cải thiện so với portfolio hiện tại
-            if best_result["pessimistic_value"] > current_result["pessimistic_value"]:
+            if best_result["selection_value"] > current_result["selection_value"]:
                 portfolio.append(best_candidate)
                 candidates.remove(best_candidate)
                 remaining_budget -= best_candidate.cost
                 current_result = best_result
                 print(f"  + Add: {best_candidate.action_type.value} @ Node {best_candidate.target_node} "
+                      f"| sel={best_result['selection_value']:+.4f} "
                       f"| pess={best_result['pessimistic_value']:+.4f} "
                       f"| budget_left={remaining_budget:.1f}")
             else:
-                # Thêm action này không cải thiện pessimistic_value,
-                # nhưng có thể action khác vẫn còn cải thiện được → tiếp tục
                 candidates.remove(best_candidate)
                 print(f"  ~ Skip: {best_candidate.action_type.value} @ Node {best_candidate.target_node} "
-                      f"(no pess improvement: {best_result['pessimistic_value']:+.4f})")
+                      f"(sel={best_result['selection_value']:+.4f} ≤ current {current_result['selection_value']:+.4f})")
 
         # --------------- Pha 2: Local swap ----------------
-        print(f"  Phase 2: Local swap on portfolio of {len(portfolio)} actions...")
+        print(f"  Phase 2: Local swap on portfolio of {len(portfolio)} actions "
+              f"(criterion={criterion})...")
         outside = [a for a in available if a not in portfolio]
         improved = True
         while improved:
@@ -503,8 +557,9 @@ class RobustDecisionEngine:
                     trial_result = self._evaluate_portfolio(
                         trial_portfolio, n_eps=eps_per_eval,
                         belief_state=belief_state,
+                        criterion=criterion,
                     )
-                    if trial_result["pessimistic_value"] > current_result["pessimistic_value"] + 1e-4:
+                    if trial_result["selection_value"] > current_result["selection_value"] + 1e-4:
                         portfolio = trial_portfolio
                         outside[outside.index(out_action)] = in_action
                         current_result = trial_result
@@ -522,6 +577,7 @@ class RobustDecisionEngine:
                 portfolio,
                 n_eps=max(50, self.n_attacker_samples // 4),
                 belief_state=belief_state,
+                criterion=criterion,
             )
         else:
             final_result = current_result
