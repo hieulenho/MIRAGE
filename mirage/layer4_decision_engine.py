@@ -37,6 +37,7 @@ if os.path.exists(_ROBUST_RL_PATH):
 
 from mirage.layer2_attack_graph import MIRAGEAttackGraph
 from mirage.layer3_deception import DeceptionAction, DeceptionFabric, DeceptionActionType
+from mirage.mdp_solver import MDPSolver, compute_composite_cost, CompositeActionCost
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +64,7 @@ class ActionPlan:
     optimistic_value: float
     pessimistic_value: float
     expected_value: float
+    margin_guarantee: float  # c* từ Paper
 
     # Rủi ro & Độ tin cậy
     risk_score: float
@@ -95,6 +97,7 @@ class ActionPlan:
             "optimistic_value": round(self.optimistic_value, 4),
             "pessimistic_value": round(self.pessimistic_value, 4),
             "expected_value": round(self.expected_value, 4),
+            "margin_guarantee": round(self.margin_guarantee, 4),
             "risk_score": round(self.risk_score, 3),
             "confidence": round(self.confidence, 3),
             "required_approval": self.required_approval,
@@ -113,7 +116,7 @@ class ActionPlan:
         if self.portfolio:
             portfolio_lines = "\nPortfolio:\n" + "\n".join(
                 f"  [{i+1}] {a.action_type.value:35s} → Node {a.target_node:2d} "
-                f"| cost={a.cost:.1f} | risk={a.risk_score:.2f}"
+                f"| cost={compute_composite_cost(a).total:.1f} | risk={a.risk_score:.2f}"
                 for i, a in enumerate(self.portfolio)
             )
             portfolio_lines += f"\nTotal portfolio cost: {self.portfolio_cost:.1f}\n"
@@ -136,6 +139,7 @@ class ActionPlan:
             f"Opt. Value:  {self.optimistic_value:+.4f}  (Best case for defender)\n"
             f"Pess. Value: {self.pessimistic_value:+.4f}  (Worst case — ROBUST target)\n"
             f"Exp. Value:  {self.expected_value:+.4f}  (Average case)\n"
+            f"Margin (c*): {self.margin_guarantee:+.4f}  (Provable improvement over no-defense)\n"
             f"{'─'*65}\n"
             f"Risk:        {self.risk_score:.2f} / 1.0\n"
             f"Confidence:  {self.confidence:.1%}\n"
@@ -180,6 +184,9 @@ class RobustDecisionEngine:
         self.use_robust_milp = use_robust_milp
         self.seed = seed
         self._decision_history: List[ActionPlan] = []
+        
+        # Exact MDP Math Solver
+        self.mdp_solver = MDPSolver(graph)
 
         # Thử import robust MILP solver từ codebase cũ
         self._milp_available = self._check_milp_available()
@@ -326,7 +333,8 @@ class RobustDecisionEngine:
     # ---------------------------------------------------------------------------
 
     def _merge_interventions(
-        self, actions: List[DeceptionAction]
+        self, actions: List[DeceptionAction],
+        belief_state: Optional[Dict[int, float]] = None
     ) -> Dict:
         """
         Kết hợp reward interventions từ nhiều actions thành một dict dùng cho simulation.
@@ -364,7 +372,11 @@ class RobustDecisionEngine:
                     src, dst = action.target_edge
                     self._edge_cost_edits.append((src, dst, action.edge_cost_delta))
 
-        return merged
+        # Scale by occupancy measure (Robust Reward Design paper)
+        return self.mdp_solver.allocate_reward_by_occupancy(
+            raw_interventions=merged,
+            start_distribution=belief_state
+        )
 
     def _evaluate_portfolio(
         self,
@@ -473,22 +485,46 @@ class RobustDecisionEngine:
             )
             defender_values[atype] = d_val
 
-        total_cost = sum(a.cost for a in actions)
-        values = list(defender_values.values())
+        # ---- Exact MDP Evaluation (Robust Reward Design Paper) ----
+        # Giải bài toán bằng toán học chính xác thay vì chỉ mô phỏng
+        exact_results = self.mdp_solver.evaluate_defense_exact(
+            reward_interventions=combined,
+            start_distribution=belief_state,
+        )
+        
+        mdp_pess = exact_results["V_robust"]
+        mdp_exp = exact_results["V_uniform"]
+        mdp_opt = exact_results["V_greedy"]
+        margin_guarantee = exact_results["margin_guarantee"]
 
-        # Tiêu chí chọn portfolio (dùng trong greedy comparison)
+        # ---- Hybrid Evaluation (60% Exact MDP, 40% Simulation) ----
+        # Lấy lợi thế cả về toán học (robust guarantee) và thực tiễn (edge dynamics)
+        sim_values = list(defender_values.values())
+        sim_pess = min(sim_values)
+        sim_opt = max(sim_values)
+        sim_exp = sum(sim_values) / len(sim_values)
+
+        hybrid_pess = 0.6 * mdp_pess + 0.4 * sim_pess
+        hybrid_exp = 0.6 * mdp_exp + 0.4 * sim_exp
+        hybrid_opt = 0.6 * mdp_opt + 0.4 * sim_opt
+
+        # Tính tổng composite cost cho portfolio
+        total_cost = sum(compute_composite_cost(a).total for a in actions)
+
+        # Tiêu chí chọn portfolio
         if criterion == "pessimistic":
-            selection_value = min(values)
+            selection_value = hybrid_pess
         elif criterion == "optimistic":
-            selection_value = max(values)
+            selection_value = hybrid_opt
         else:  # "expected" — standard RL
-            selection_value = sum(values) / len(values)
+            selection_value = hybrid_exp
 
         return {
-            "pessimistic_value": min(values),
-            "optimistic_value":  max(values),
-            "expected_value":    sum(values) / len(values),
-            "selection_value":   selection_value,   # Dùng để chọn portfolio
+            "pessimistic_value": hybrid_pess,
+            "optimistic_value":  hybrid_opt,
+            "expected_value":    hybrid_exp,
+            "selection_value":   selection_value,
+            "margin_guarantee":  margin_guarantee,
             "per_attacker":      defender_values,
             "combined_interventions": combined,
             "edge_cost_edits":   self._edge_cost_edits.copy(),
@@ -519,6 +555,12 @@ class RobustDecisionEngine:
         """
         available = self.fabric.get_available_actions(budget)
 
+        # Scale-aware Pruning: Nếu đồ thị lớn, chỉ xét các action ở belief hotspots
+        if len(self.graph.states) > 30:
+            from mirage.mdp_solver import prune_action_space
+            hotspots = set(prune_action_space(self.graph, belief_state, top_k_states=20))
+            available = [a for a in available if a.target_node in hotspots or a.target_edge and (a.target_edge[0] in hotspots or a.target_edge[1] in hotspots)]
+
         # Lọc theo loại action (cho ablation study)
         if allowed_action_types:
             available = [
@@ -534,7 +576,7 @@ class RobustDecisionEngine:
         # Với 5 attacker types cần nhiều episodes hơn để có signal đủ mạnh
         eps_per_eval = max(60, self.n_attacker_samples // 2)
 
-        print(f"\n\U0001f50e [Portfolio Optimizer] {len(available)} candidate actions, "
+        print(f"\n[INFO] [Portfolio Optimizer] {len(available)} candidate actions, "
               f"budget={budget:.1f}, {eps_per_eval} eps/eval, criterion={criterion}"
               + (" | belief-conditioned" if belief_state else " | from entry point"))
 
@@ -629,7 +671,7 @@ class RobustDecisionEngine:
             final_result = current_result
 
         total_cost = sum(a.cost for a in portfolio)
-        print(f"  ✓ Optimal portfolio: {len(portfolio)} actions, "
+        print(f"  [OK] Optimal portfolio: {len(portfolio)} actions, "
               f"cost={total_cost:.1f}/{budget:.1f}, "
               f"pess={final_result['pessimistic_value']:+.4f}, "
               f"opt={final_result['optimistic_value']:+.4f}")
@@ -658,7 +700,7 @@ class RobustDecisionEngine:
         Returns:
             ActionPlan với portfolio đầy đủ, hoặc None nếu không có action an toàn
         """
-        print("\n🔬 [Decision Engine] Running portfolio optimization...")
+        print("\n[*] [Decision Engine] Running portfolio optimization...")
 
         # Log belief state nếu có — cho thấy thông tin đã được dùng
         if belief_state:
@@ -667,7 +709,7 @@ class RobustDecisionEngine:
                 f"Node{s}({self.graph.label(s)})={p:.1%}"
                 for s, p in top_nodes if p > 0.01
             )
-            print(f"  📍 Belief state (top nodes): {belief_summary}")
+            print(f"  [>] Belief state (top nodes): {belief_summary}")
 
         # ---- Chạy portfolio optimizer với belief_state ----
         # belief_state được dùng làm start_distribution trong simulation:
@@ -717,6 +759,7 @@ class RobustDecisionEngine:
             optimistic_value=portfolio_result["optimistic_value"],
             pessimistic_value=portfolio_result["pessimistic_value"],
             expected_value=portfolio_result["expected_value"],
+            margin_guarantee=portfolio_result.get("margin_guarantee", 0.0),
             risk_score=max(a.risk_score for a in portfolio),
             confidence=confidence,
             required_approval=needs_approval,
@@ -742,7 +785,7 @@ class RobustDecisionEngine:
                 return None
 
         self._decision_history.append(plan)
-        print(f"  ✓ Portfolio selected: {len(portfolio)} actions "
+        print(f"  [OK] Portfolio selected: {len(portfolio)} actions "
               f"| total_cost={plan.portfolio_cost:.1f} "
               f"| Pess.Val={portfolio_result['pessimistic_value']:+.4f}")
         return plan
