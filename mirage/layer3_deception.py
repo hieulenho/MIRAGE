@@ -121,7 +121,7 @@ def get_action_catalog(graph) -> List[DeceptionAction]:
     from mirage.layer2_attack_graph import (
         DB_FAKE, RTR_FAKE, WS_FIN, WS_ENG, WS_IT,
         SMB_SHARE, SVC_CRED, ADMIN_CRED, DNS_INT,
-        WEB_DMZ, MAIL_DMZ
+        WEB_DMZ, MAIL_DMZ, DC_NODE, DB_REAL
     )
     actions = []
 
@@ -187,33 +187,36 @@ def get_action_catalog(graph) -> List[DeceptionAction]:
         ))
 
     # ---- 4. INCREASE EDGE COST ----
-    # Tăng chi phí di chuyển trên các edge quan trọng
-    # Đây là action "vô hình" — không tạo asset mới mà làm khó attacker
+    # Tăng chi phí di chuyển trên các CẠNH THẬT dẫn đến DB_REAL.
+    # Mục đích: chặn/làm khó attacker trên đường tấn công thực sự,
+    # không phải chỉ hướng họ sang decoy.
+    # Khi apply: giảm xác suất đi qua edge → phân phối lại sang decoy/sink.
     critical_edges = [
-        (WS_FIN, DB_FAKE),     # Đường Finance WS → DB (có cả thật và giả)
-        (SMB_SHARE, DB_FAKE),  # Đường SMB → DB
-        (SVC_CRED, DB_FAKE),   # Đường Credential → DB
-        (WS_IT, RTR_FAKE),     # Đường IT WS → Router giả
-        (DNS_INT, RTR_FAKE),   # Đường DNS → Router giả
-        (WEB_DMZ, RTR_FAKE),   # Đường WebDMZ → Router giả
+        (WS_FIN,    SVC_CRED),   # Finance WS → ServiceAcct Credential (đường ngắn nhất qua Finance)
+        (SVC_CRED,  DB_REAL),    # ServiceAcct Cred → DB thật (junction cuối cùng)
+        (WS_ENG,    ADMIN_CRED), # Engineering WS → Admin Credential
+        (ADMIN_CRED, DC_NODE),   # Admin Cred → Domain Controller
+        (DC_NODE,   DB_REAL),    # Domain Controller → DB thật (đường DC attack)
+        (SMB_SHARE, SVC_CRED),   # SMB FileShare → ServiceAcct Cred
     ]
     for src, dst in critical_edges:
         actions.append(DeceptionAction(
             action_type=DeceptionActionType.INCREASE_EDGE_COST,
             target_node=dst,
             target_edge=(src, dst),
-            risk_score=0.03,
-            realism_score=1.0,  # Vô hình với attacker
-            business_impact=0.01,
+            risk_score=0.05,
+            realism_score=1.0,  # Vô hình với attacker (firewall rule)
+            business_impact=0.03,
             cost=0.5,
             description=(
-                f"Increase movement cost on edge {graph.label(src)} → {graph.label(dst)}. "
-                "Configure firewall/SDN rules to throttle this path. "
-                "Attacker experiences higher latency/resistance on this route."
+                f"Increase movement cost on critical real path: "
+                f"{graph.label(src)} → {graph.label(dst)}. "
+                "Configure firewall/SDN/MFA to throttle this high-risk lateral path. "
+                "Reduces transition probability; redistributes toward decoys or sink."
             ),
             rollback_plan="Remove throttle rule from firewall/SDN",
             reward_delta=0.0,
-            edge_cost_delta=0.4,
+            edge_cost_delta=0.5,  # Cao hơn trước (0.4→0.5) để có tác động rõ ràng
         ))
 
     return actions

@@ -8,16 +8,19 @@ MIRAGE - Layer 6: Evaluation, Benchmarks & Visualization
   2. random_deception  — Đặt decoy ngẫu nhiên
   3. static_honeypot   — Honeypot cố định (kinh nghiệm)
   4. greedy_top_k      — Đặt decoy ở node có value cao nhất
-  5. standard_rl       — Tối ưu optimistic value (standard RL)
-  6. robust_mirage     — MIRAGE: tối ưu pessimistic/robust value
+  5. standard_rl       — Tối ưu expected value (criterion="expected") dùng cùng engine
+  6. robust_mirage     — MIRAGE: tối ưu pessimistic/robust value (criterion="pessimistic")
+
+Benchmark A: Attacker bắt đầu từ Internet/Entry — đo năng lực phòng thủ tổng thể.
+Benchmark B: Attacker đã bị nghi ở vị trí giữa mạng — đo năng lực phản ứng theo telemetry.
 
 Metrics đo lường:
   - interception_rate     : Tỷ lệ attacker bị dẫn vào decoy
   - time_to_compromise    : Số bước trung bình đến True Goal
   - false_positive_cost   : Chi phí rủi ro vận hành
-  - pessimistic_value     : Worst-case defender value
+  - pessimistic_value     : Worst-case defender value (ROBUST metric chính)
   - optimistic_value      : Best-case defender value
-  - robustness_gap        : optimistic - pessimistic (nhỏ hơn = tốt hơn)
+  - robustness_gap        : optimistic - pessimistic (nhỏ hơn = robust hơn)
 """
 
 from __future__ import annotations
@@ -76,7 +79,17 @@ class MIRAGEEvaluator:
         "robust_mirage",
     ]
 
-    ATTACKER_TYPES = ["random", "greedy", "shortest_path", "stealthy"]
+    # 5 loại attacker (thêm deception_aware)
+    ATTACKER_TYPES = ["random", "greedy", "shortest_path", "stealthy", "deception_aware"]
+
+    # Belief state cố định cho Benchmark B (mid-network intrusion scenario)
+    BENCHMARK_B_BELIEF = {
+        4: 0.35,   # WS_Finance — most likely (lateral movement hướng vào finance)
+        6: 0.25,   # SMB_FileShare
+        9: 0.20,   # ServiceAcct_Credential
+        8: 0.10,   # Admin_Credential
+        3: 0.10,   # WS_Engineering
+    }
 
     def __init__(
         self,
@@ -133,66 +146,95 @@ class MIRAGEEvaluator:
                     }
         return graph_copy
 
-    def _get_reward_interventions_for_method(self, method: str) -> Dict[Tuple, float]:
-        """Tạo reward interventions theo phương pháp."""
+    def _get_reward_interventions_for_method(
+        self,
+        method: str,
+        start_distribution=None,
+    ) -> Tuple[Dict[Tuple, str], List[Tuple[int, int, float]]]:
+        """
+        Tạo reward interventions theo phương pháp.
+
+        Args:
+            start_distribution: Nếu có (Benchmark B), pass vào engine để
+                                 optimize_portfolio() dùng belief state —
+                                 giúp so sánh standard_rl vs robust_mirage công bằng
+                                 vì cả hai đều optimize dưới cùng belief.
+        """
         from mirage.layer2_attack_graph import DB_FAKE, RTR_FAKE, WS_FIN, SMB_SHARE, SVC_CRED
         rng = random.Random(self.seed)
 
         if method == "no_defense":
-            return {}
+            return {}, []
 
         elif method == "random_deception":
             # Đặt decoy ngẫu nhiên
             possible_nodes = [DB_FAKE, RTR_FAKE, WS_FIN, SMB_SHARE, SVC_CRED]
             chosen = rng.choice(possible_nodes)
-            return {(chosen, "end"): rng.uniform(0.3, 0.9)}
+            return {(chosen, "end"): rng.uniform(0.3, 0.9)}, []
 
         elif method == "static_honeypot":
             # Honeypot cố định tại decoy nodes đã biết
             return {
                 (DB_FAKE, "end"):  0.7,
                 (RTR_FAKE, "end"): 0.5,
-            }
+            }, []
 
         elif method == "greedy_top_k":
             # Đặt decoy ở node có reward potential cao nhất gần True Goal
             return {
                 (DB_FAKE, "end"):  0.85,  # Gần True Goal nhất
                 (SVC_CRED, "end"): 0.60,  # Credential node có giá trị cao
-            }
+            }, []
 
         elif method == "standard_rl":
-            # Standard RL: tối ưu expected value (không quan tâm worst-case)
-            # Thường đặt decoy với reward cao nhất có thể
-            return {
-                (DB_FAKE, "end"):  1.0,   # Maximize expected
-                (RTR_FAKE, "end"): 0.8,
-                (WS_FIN, "db_access"): 0.5,
-            }
-
-        elif method == "robust_mirage":
-            # Gọi Layer 4 engine thật để tìm portfolio tối ưu
-            # Benchmark sẽ phản ánh đúng những gì hệ thống thực sự làm
+            # Standard RL: dùng CÙNG engine, tối ưu EXPECTED value (criterion="expected").
+            # Khi Benchmark B: truyền belief_state để optimize dưới belief điều kiện
+            # → so sánh với robust_mirage trở nên công bằng (same engine, same belief).
             from mirage.layer3_deception import DeceptionFabric
             from mirage.layer4_decision_engine import RobustDecisionEngine
 
             fabric = DeceptionFabric(self.graph)
             engine = RobustDecisionEngine(
                 self.graph, fabric,
-                # Dùng ít episodes hơn trong optimization phase
-                # (đủ để phân biệt portfolios), evaluation phase sẽ dùng n_episodes đầy đủ
-                n_attacker_samples=max(80, self.n_episodes // 6),
+                n_attacker_samples=max(100, self.n_episodes // 3),
                 use_robust_milp=False,
+                seed=self.seed,
             )
-            _, portfolio_result = engine.optimize_portfolio(budget=self.graph.budget)
-            return portfolio_result.get("combined_interventions", {})
+            _, portfolio_result = engine.optimize_portfolio(
+                budget=self.graph.budget,
+                criterion="expected",          # <-- Maximize AVERAGE value
+                belief_state=start_distribution, # <-- Same belief as robust_mirage
+            )
+            return portfolio_result.get("combined_interventions", {}), portfolio_result.get("edge_cost_edits", [])
 
-        return {}
+        elif method == "robust_mirage":
+            # Robust MIRAGE: dùng CÙNG engine, tối ưu PESSIMISTIC value (criterion="pessimistic").
+            # Khi Benchmark B: truyền belief_state để optimize dưới belief điều kiện.
+            from mirage.layer3_deception import DeceptionFabric
+            from mirage.layer4_decision_engine import RobustDecisionEngine
+
+            fabric = DeceptionFabric(self.graph)
+            engine = RobustDecisionEngine(
+                self.graph, fabric,
+                n_attacker_samples=max(100, self.n_episodes // 3),
+                use_robust_milp=False,
+                seed=self.seed,
+            )
+            _, portfolio_result = engine.optimize_portfolio(
+                budget=self.graph.budget,
+                criterion="pessimistic",        # <-- Maximize WORST-CASE value (robust)
+                belief_state=start_distribution, # <-- Same belief as standard_rl
+            )
+            return portfolio_result.get("combined_interventions", {}), portfolio_result.get("edge_cost_edits", [])
+
+        return {}, []
 
     def _compute_metrics_for_method(
         self,
         method: str,
         reward_interventions: Dict,
+        edge_cost_edits: List[Tuple[int, int, float]],
+        start_distribution: Optional[Dict[int, float]] = None,
     ) -> MethodResult:
         """Tính tất cả metrics cho một phương pháp."""
         from mirage.attacker_agents import run_simulation
@@ -209,8 +251,6 @@ class MIRAGEEvaluator:
         import copy
 
         # ---- no_defense: dùng clean graph không có đường đến decoy ----
-        # Đây là baseline thực sự "không phòng thủ" — decoy chưa được deploy,
-        # nên không có xác suất structural nào dẫn attacker vào decoy nodes.
         if method == "no_defense":
             graph_copy = self._build_clean_graph_no_defense()
         else:
@@ -220,7 +260,6 @@ class MIRAGEEvaluator:
             for (node, action), delta in reward_interventions.items():
                 if node in graph_copy.decoy_sites and delta > 0:
                     # Tăng xác suất attacker đi đến decoy node
-                    # (Decoy hấp dẫn hơn → attacker bị dụ nhiều hơn)
                     for src in graph_copy.states:
                         for act in graph_copy.available_actions.get(src, []):
                             if node in graph_copy.transitions[src][act]:
@@ -233,6 +272,47 @@ class MIRAGEEvaluator:
                                 graph_copy.transitions[src][act] = {
                                     k: v/total for k, v in graph_copy.transitions[src][act].items()
                                 }
+            
+            # Apply edge_cost_edits: giảm xác suất đi qua real critical edge,
+            # phân phối lại sang decoy neighbors ưu tiên, rồi đến sink an toàn,
+            # CUỐI CÙNG mới xét các real nodes khác (để tránh vô tình boost đường tấn công).
+            decoy_set = set(self.graph.decoy_sites)
+            sink = self.graph.sink_state
+            for src, dst, delta in edge_cost_edits:
+                for act in graph_copy.available_actions.get(src, []):
+                    if dst in graph_copy.transitions[src][act]:
+                        trans = graph_copy.transitions[src][act]
+                        # Giảm xác suất tối đa 50% (tăng từ 45% để edge cost có tác động rõ hơn)
+                        penalty = min(delta * 0.10, trans[dst] * 0.50)
+                        new_p_dst = max(0.05, trans[dst] - penalty)
+                        freed = trans[dst] - new_p_dst
+
+                        new_trans = {n: p for n, p in trans.items()}
+                        new_trans[dst] = new_p_dst
+
+                        other_nodes = [n for n in trans if n != dst]
+                        decoy_neighbors = [n for n in other_nodes if n in decoy_set]
+                        sink_neighbors  = [n for n in other_nodes if n == sink]
+
+                        if decoy_neighbors:
+                            # Ưu tiên 1: boost decoy neighbors → attacker bị hút vào bẫy
+                            boost_per = freed / len(decoy_neighbors)
+                            for dn in decoy_neighbors:
+                                new_trans[dn] = new_trans[dn] + boost_per
+                        elif sink_neighbors:
+                            # Ưu tiên 2: redirect sang sink an toàn
+                            new_trans[sink] = new_trans.get(sink, 0.0) + freed
+                        else:
+                            # Fallback: phân phối đều sang các nodes còn lại
+                            # (tránh boost ngược về nodes trên đường tấn công)
+                            if other_nodes:
+                                boost_per = freed / len(other_nodes)
+                                for on in other_nodes:
+                                    new_trans[on] = new_trans[on] + boost_per
+
+                        # Normalize lại
+                        total = sum(new_trans.values())
+                        graph_copy.transitions[src][act] = {k: v / total for k, v in new_trans.items()}
 
         for atype in self.ATTACKER_TYPES:
             result = run_simulation(
@@ -241,6 +321,7 @@ class MIRAGEEvaluator:
                 reward_interventions=reward_interventions,
                 seed=self.seed,
                 max_steps=self.max_steps,
+                start_distribution=start_distribution,
             )
             interception_rates.append(result["decoy_interception_rate"])
             hit_rates.append(result["hit_true_goal_rate"])
@@ -261,7 +342,7 @@ class MIRAGEEvaluator:
         time_to_compromise = sum(avg_steps_list) / len(avg_steps_list)
 
         # False positive cost: ước lượng dựa trên số action + chi phí vận hành
-        n_actions = len([v for v in reward_interventions.values() if v > 0])
+        n_actions = len([v for v in reward_interventions.values() if v > 0]) + len(edge_cost_edits)
         false_positive_cost = n_actions * 0.05 + hit_true_goal_rate * 0.1
 
         # Pessimistic = min defender value (worst-case attacker)
@@ -289,13 +370,28 @@ class MIRAGEEvaluator:
             runtime_seconds=runtime,
         )
 
-    def run_full_benchmark(self, verbose: bool = True) -> Dict[str, MethodResult]:
+    def run_full_benchmark(
+        self,
+        verbose: bool = True,
+        start_distribution: Optional[Dict[int, float]] = None,
+        benchmark_label: str = "A",
+    ) -> Dict[str, MethodResult]:
         """
         Chạy benchmark đầy đủ cho tất cả 6 phương pháp.
+
+        Args:
+            start_distribution: Nếu có, attacker bắt đầu từ phân phối này (Benchmark B).
+                                 Nếu None, bắt đầu từ Internet entry point (Benchmark A).
+            benchmark_label: "A" hoặc "B" — dùng để label output.
         """
         if verbose:
             print("=" * 70)
-            print("MIRAGE Layer 6 — Full Benchmark")
+            if benchmark_label == "B":
+                print("MIRAGE Layer 6 — Benchmark B (Belief-Conditioned Response)")
+                print("  Attacker starts at mid-network position (post-intrusion)")
+            else:
+                print("MIRAGE Layer 6 — Benchmark A (Entry-Point Attack)")
+                print("  Attacker starts at Internet/Entry (Node 0)")
             print(f"  Episodes per method: {self.n_episodes}")
             print(f"  Attacker types: {self.ATTACKER_TYPES}")
             print("=" * 70)
@@ -303,8 +399,16 @@ class MIRAGEEvaluator:
         for method in self.METHODS:
             if verbose:
                 print(f"\n[{method}] Running...")
-            interventions = self._get_reward_interventions_for_method(method)
-            result = self._compute_metrics_for_method(method, interventions)
+            # Truyền start_distribution vào _get_reward_interventions_for_method
+            # để standard_rl và robust_mirage đều optimize dưới cùng belief (Benchmark B).
+            interventions, edge_edits = self._get_reward_interventions_for_method(
+                method, start_distribution=start_distribution
+            )
+            result = self._compute_metrics_for_method(
+                method, interventions,
+                edge_cost_edits=edge_edits,
+                start_distribution=start_distribution,
+            )
             self.results[method] = result
             if verbose:
                 print(f"  Interception Rate: {result.interception_rate:.1%}")
@@ -313,6 +417,38 @@ class MIRAGEEvaluator:
                 print(f"  Robustness Gap:    {result.robustness_gap:.4f}")
 
         return self.results
+
+    def run_benchmark_a(self, verbose: bool = True) -> Dict[str, MethodResult]:
+        """
+        Benchmark A — Entry-point attack.
+
+        Attacker luôn bắt đầu từ Internet (Node 0).
+        Đo năng lực phòng thủ tổng thể từ ngoài vào.
+        Không có prior knowledge về vị trí attacker.
+        """
+        self.results = {}  # Reset
+        return self.run_full_benchmark(
+            verbose=verbose,
+            start_distribution=None,
+            benchmark_label="A",
+        )
+
+    def run_benchmark_b(self, verbose: bool = True) -> Dict[str, MethodResult]:
+        """
+        Benchmark B — Belief-conditioned response.
+
+        Attacker đã bị nghi ở vị trí giữa mạng nội bộ (post-intrusion).
+        Belief state: WS_Finance, SMB, ServiceAcct Cred, Admin Cred, WS_Eng.
+
+        Đo năng lực phản ứng của defender khi đã có telemetry.
+        Đây là kịch bản realistic nhất cho MIRAGE.
+        """
+        self.results = {}  # Reset
+        return self.run_full_benchmark(
+            verbose=verbose,
+            start_distribution=self.BENCHMARK_B_BELIEF,
+            benchmark_label="B",
+        )
 
     def print_comparison_table(self) -> None:
         """In bảng so sánh chuẩn."""
@@ -543,9 +679,9 @@ class MIRAGEEvaluator:
             print(f"\n✅ Plot saved to: {path}")
         plt.close()
 
-    def save_results_json(self) -> None:
+    def save_results_json(self, filename: str = "mirage_benchmark_results.json") -> None:
         """Lưu kết quả ra file JSON."""
-        path = os.path.join(self.results_dir, "mirage_benchmark_results.json")
+        path = os.path.join(self.results_dir, filename)
         data = {}
         for method, result in self.results.items():
             data[method] = {
@@ -563,6 +699,142 @@ class MIRAGEEvaluator:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         print(f"✅ Results saved to: {path}")
+
+    def run_multi_seed_benchmark(
+        self,
+        seeds: Optional[List[int]] = None,
+        n_episodes: int = 500,
+        benchmark_type: str = "a",
+        verbose: bool = True,
+    ) -> Dict[str, Dict]:
+        """
+        Chạy benchmark với nhiều seed để có confidence intervals.
+
+        Args:
+            seeds: Danh sách seed (mặc định [0..4] = 5 seeds)
+            n_episodes: Số episodes mỗi method mỗi seed
+            benchmark_type: "a" (entry-point) hoặc "b" (belief-conditioned)
+            verbose: In progress
+
+        Returns:
+            Dict: {method: {"mean": {...}, "std": {...}, "per_seed": [...]}}
+        """
+        import numpy as np
+
+        if seeds is None:
+            seeds = list(range(10))  # 10 seeds mặc định cho confidence intervals tốt hơn
+
+        label = benchmark_type.upper()
+        if verbose:
+            print("=" * 70)
+            print(f"MIRAGE Multi-Seed Benchmark {label} ({len(seeds)} seeds × {n_episodes} eps)")
+            print(f"  Seeds: {seeds}")
+            print(f"  Benchmark type: {'Entry-Point (A)' if benchmark_type == 'a' else 'Belief-Conditioned (B)'}")
+            print("=" * 70)
+
+        # Dữ liệu tích lũy theo method
+        seed_results: Dict[str, List[Dict]] = {m: [] for m in self.METHODS}
+
+        original_seed = self.seed
+        original_n = self.n_episodes
+
+        for i, seed in enumerate(seeds):
+            if verbose:
+                print(f"\n  Seed {seed} ({i+1}/{len(seeds)})...")
+
+            # Tạo evaluator tạm thời với seed này
+            self.seed = seed
+            self.n_episodes = n_episodes
+            self.results = {}
+
+            if benchmark_type == "a":
+                self.run_benchmark_a(verbose=False)
+            else:
+                self.run_benchmark_b(verbose=False)
+
+            for method, result in self.results.items():
+                seed_results[method].append({
+                    "interception_rate": result.interception_rate,
+                    "hit_true_goal_rate": result.hit_true_goal_rate,
+                    "time_to_compromise": result.time_to_compromise,
+                    "pessimistic_value": result.pessimistic_value,
+                    "optimistic_value": result.optimistic_value,
+                    "robustness_gap": result.robustness_gap,
+                })
+
+            if verbose:
+                for m in self.METHODS:
+                    r = self.results.get(m)
+                    if r:
+                        print(f"    {m:22s}: intercept={r.interception_rate:.1%}"
+                              f"  pess={r.pessimistic_value:+.4f}"
+                              f"  gap={r.robustness_gap:.4f}")
+
+        # Restore original
+        self.seed = original_seed
+        self.n_episodes = original_n
+
+        # Tính mean ± std cho mỗi method
+        metrics = [
+            "interception_rate", "hit_true_goal_rate", "time_to_compromise",
+            "pessimistic_value", "optimistic_value", "robustness_gap",
+        ]
+        aggregated: Dict[str, Dict] = {}
+        for method, runs in seed_results.items():
+            if not runs:
+                continue
+            mean_vals = {}
+            std_vals = {}
+            for metric in metrics:
+                vals = [r[metric] for r in runs]
+                mean_vals[metric] = float(np.mean(vals))
+                std_vals[metric] = float(np.std(vals))
+            aggregated[method] = {
+                "mean": mean_vals,
+                "std": std_vals,
+                "per_seed": runs,
+                "n_seeds": len(runs),
+            }
+
+        # In bảng tổng hợp
+        if verbose:
+            print(f"\n{'='*70}")
+            print(f"MULTI-SEED RESULTS — Benchmark {label} (mean ± std over {len(seeds)} seeds)")
+            print(f"{'='*70}")
+            print(
+                f"  {'Method':22s} | {'Intercept%':>15s} | {'Pess.Val':>15s} | {'Gap':>12s}"
+            )
+            print("  " + "-" * 70)
+            for method in self.METHODS:
+                if method not in aggregated:
+                    continue
+                d = aggregated[method]
+                ir = f"{d['mean']['interception_rate']:.1%}±{d['std']['interception_rate']:.1%}"
+                pv = f"{d['mean']['pessimistic_value']:+.4f}±{d['std']['pessimistic_value']:.4f}"
+                rg = f"{d['mean']['robustness_gap']:.4f}±{d['std']['robustness_gap']:.4f}"
+                flag = " ← MIRAGE" if method == "robust_mirage" else ""
+                flag += " ← RL" if method == "standard_rl" else ""
+                print(f"  {method:22s} | {ir:>15s} | {pv:>15s} | {rg:>12s}{flag}")
+
+        # Lưu kết quả
+        out_file = f"multi_seed_benchmark_{label.lower()}_results.json"
+        out_path = os.path.join(self.results_dir, out_file)
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "benchmark_type": benchmark_type,
+                    "seeds": seeds,
+                    "n_episodes": n_episodes,
+                    "n_attacker_types": len(self.ATTACKER_TYPES),
+                    "attacker_types": self.ATTACKER_TYPES,
+                    "results": aggregated,
+                }, f, indent=2)
+            if verbose:
+                print(f"\n✅ Multi-seed results saved to: {out_path}")
+        except Exception as e:
+            print(f"⚠️  Could not save JSON: {e}")
+
+        return aggregated
 
     def run_ablation_study(self) -> None:
         """
@@ -622,7 +894,7 @@ class MIRAGEEvaluator:
                     "scatter_honey_credential",
                 ],
                 "use_belief": True,
-                "desc": "Remove INCREASE_EDGE_COST -> reward-only deception (no transition boost from edge)",
+                "desc": "Remove INCREASE_EDGE_COST -> reward-only deception (no real path blocking)",
             },
             {
                 "name": "No Components",
@@ -657,6 +929,7 @@ class MIRAGEEvaluator:
                 self.graph, fabric,
                 n_attacker_samples=eps_opt,
                 use_robust_milp=False,
+                seed=self.seed,
             )
 
             portfolio, _ = engine.optimize_portfolio(

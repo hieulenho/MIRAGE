@@ -1,5 +1,5 @@
 """
-MIRAGE - Attacker Agents (4 loại)
+MIRAGE - Attacker Agents (5 loại)
 ====================================
 Giả lập các tác nhân tấn công với chiến thuật khác nhau,
 dùng để test tính robustness của policy phòng thủ.
@@ -9,6 +9,8 @@ Agent types:
   2. GreedyAttacker    — Chọn node có reward cao nhất tức thì
   3. ShortestPathAttacker — Luôn tìm đường ngắn nhất đến True Goal
   4. StealthyAttacker  — Né decoy, chọn đường ít bị phát hiện nhất
+  5. DeceptionAwareAttacker — Biết nghi ngờ decoy dựa trên giá trị node
+                              và bất thường trong reward structure
 
 Các agent được dùng trong:
   - Lớp 4: Training robust policy (worst-case attacker)
@@ -448,16 +450,201 @@ class StealthyAttacker(BaseAttacker):
 
 
 # ============================================================
+# ATTACKER 5: DECEPTION AWARE
+# ============================================================
+
+class DeceptionAwareAttacker(BaseAttacker):
+    """
+    Attacker thông minh nhất — biết nghi ngờ decoy dựa trên nhiều tín hiệu
+    kết hợp: node value, topology structure, và reward anomaly.
+
+    Chiến lược nâng cao so with StealthyAttacker:
+      1. Node value heuristic: node với attacker_reward = 0.0 tại "end"
+         nhưng lại là terminal (dead-end) → rất có thể là decoy
+      2. Label-based suspicion: node label chứa "FAKE", "Backup", "Gateway"
+         → attacker đọc được banner và nghi ngờ
+      3. Reward anomaly: reward intervention cao bất thường (> threshold)
+         → cảnh báo đây là bẫy, xác suất né cao hơn Stealthy
+      4. Episode-level learning: tích lũy suspicion trong episode
+
+    Kết quả:
+      - Khó bị dụ hơn StealthyAttacker (~60-70% thời gian né được decoy)
+      - Nhưng không immune: nếu realism_score cao (decoy trông như thật)
+        → vẫn bị lừa khoảng 30-40% trường hợp
+      - Đây là "hard test" cho MIRAGE: nếu pessimistic value vẫn tốt
+        trước attacker này → luận điểm robust mạnh hơn nhiều
+    """
+
+    # Từ khóa trong label gây nghi ngờ (attacker đọc network banner)
+    SUSPICIOUS_LABEL_KEYWORDS = ["fake", "backup", "gateway", "decoy", "honey"]
+
+    def __init__(
+        self,
+        graph,
+        seed: int = 42,
+        suspicion_threshold: float = 0.45,       # Thấp hơn Stealthy → nghi ngờ sớm hơn
+        reward_anomaly_threshold: float = 0.55,  # Reward intervention nào > này là bẫy
+        label_awareness: bool = True,            # Có đọc label để nghi ngờ không
+    ):
+        super().__init__(graph, seed)
+        self.suspicion_threshold = suspicion_threshold
+        self.reward_anomaly_threshold = reward_anomaly_threshold
+        self.label_awareness = label_awareness
+
+        # Cache suspicion scores (cập nhật động trong episode)
+        self._base_suspicion: Dict[int, float] = self._compute_base_suspicion()
+        self._episode_suspicion: Dict[int, float] = {}  # Reset mỗi episode
+
+    def _compute_base_suspicion(self) -> Dict[int, float]:
+        """
+        Tính base suspicion cho mỗi node dựa trên:
+          1. Structural: dead-end topology
+          2. Value: attacker reward = 0.0 tại terminal node
+          3. Label: keyword trong tên node (nếu label_awareness=True)
+
+        Đây là prior knowledge attacker có trước khi bắt đầu tấn công.
+        """
+        suspicion: Dict[int, float] = {}
+        sink = self.graph.sink_state
+
+        for s in self.graph.states:
+            if s == sink:
+                suspicion[s] = 1.0  # Sink hoàn toàn vô dụng
+                continue
+
+            score = 0.0
+
+            # --- Heuristic 1: Dead-end topology ---
+            n_actions = len(self.graph.available_actions.get(s, []))
+            if n_actions <= 1:
+                score += 0.30  # Terminal node → có thể là decoy hoặc true goal
+
+            # --- Heuristic 2: Attacker reward = 0.0 tại dead-end ---
+            end_reward = self.graph.attacker_reward.get((s, "end"), None)
+            if end_reward is not None and end_reward == 0.0 and n_actions <= 1:
+                # Terminal node với reward = 0 → rất có thể là decoy
+                score += 0.40
+
+            # --- Heuristic 3: Label keyword matching ---
+            if self.label_awareness:
+                label = self.graph.label(s).lower()
+                for kw in self.SUSPICIOUS_LABEL_KEYWORDS:
+                    if kw in label:
+                        score += 0.35
+                        break  # Chỉ cộng một lần dù match nhiều keyword
+
+            suspicion[s] = min(1.0, score)
+
+        return suspicion
+
+    def reset(self, start_distribution: Dict[int, float] = None) -> None:
+        """Reset episode-level suspicion mỗi khi bắt đầu episode mới."""
+        super().reset(start_distribution=start_distribution)
+        # Khởi tạo episode suspicion từ base suspicion
+        self._episode_suspicion = dict(self._base_suspicion)
+
+    def _get_current_suspicion(self, node: int) -> float:
+        """Lấy suspicion hiện tại (base + episode updates)."""
+        return self._episode_suspicion.get(node, self._base_suspicion.get(node, 0.05))
+
+    def _update_suspicion(self, node: int, delta: float) -> None:
+        """Cập nhật suspicion trong episode (không ảnh hưởng base)."""
+        current = self._get_current_suspicion(node)
+        self._episode_suspicion[node] = min(1.0, max(0.0, current + delta))
+
+    def _estimate_action_danger(
+        self,
+        state: int,
+        action: str,
+        reward_interventions: Optional[Dict[Tuple[int, str], float]],
+    ) -> Tuple[float, float]:
+        """
+        Ước tính (expected_value, danger_score) cho một action.
+
+        expected_value: giá trị kỳ vọng theo base attacker reward (không tính bait)
+        danger_score: mức độ nguy hiểm / nghi ngờ là bẫy
+
+        Returns: (expected_value, danger_score)
+        """
+        trans = self.graph.transitions[state][action]
+        exp_value = 0.0
+        max_danger = 0.0
+
+        for ns, prob in trans.items():
+            # Giá trị base (không bị ảnh hưởng bởi bait)
+            base_reward = self.graph.attacker_reward.get((ns, "end"), 0.0)
+            exp_value += prob * base_reward
+
+            # Tính danger từ nhiều nguồn
+            node_suspicion = self._get_current_suspicion(ns)
+            danger = node_suspicion
+
+            # Reward anomaly detection: bait quá cao so với base reward → bẫy
+            if reward_interventions:
+                bait = reward_interventions.get((ns, "end"), 0.0)
+                if bait > self.reward_anomaly_threshold:
+                    # Reward bất thường cao → nghi ngờ mạnh
+                    anomaly_danger = min(1.0, (bait - self.reward_anomaly_threshold) * 2.0 + 0.4)
+                    danger = max(danger, anomaly_danger)
+
+            max_danger = max(max_danger, danger * prob)
+
+        return exp_value, max_danger
+
+    def choose_action(
+        self,
+        state: int,
+        reward_interventions: Dict[Tuple[int, str], float] = None,
+    ) -> str:
+        actions = self.graph.available_actions[state]
+        if len(actions) == 1:
+            return actions[0]
+
+        # Tính (value, danger) cho mỗi action
+        action_evals: List[Tuple[str, float, float]] = []
+        for action in actions:
+            val, danger = self._estimate_action_danger(state, action, reward_interventions)
+            action_evals.append((action, val, danger))
+
+        # Lọc: nếu action nguy hiểm (danger > threshold) → giảm điểm mạnh
+        action_scores = []
+        for action, val, danger in action_evals:
+            if danger > self.suspicion_threshold:
+                # Né mạnh: score âm, tỷ lệ thuận với mức nghi ngờ
+                score = -danger * 2.0
+            else:
+                # Score = value - penalty nhỏ cho mức nghi ngờ
+                score = val - danger * 0.3
+            action_scores.append(score)
+
+        # Dùng softmax với temperature thấp hơn Stealthy → quyết đoán hơn
+        tau = 0.25  # Temperature thấp = quyết đoán hơn Stealthy (0.3)
+        max_score = max(action_scores)
+        weights = [math.exp((s - max_score) / tau) for s in action_scores]
+        chosen = self.rng.choices(actions, weights=weights, k=1)[0]
+
+        # Cập nhật suspicion cho các node bị né (reinforcement của prior)
+        for i, (action, val, danger) in enumerate(action_evals):
+            if action_scores[i] < 0:
+                trans = self.graph.transitions[state][action]
+                for ns in trans:
+                    self._update_suspicion(ns, 0.08)  # Mạnh hơn Stealthy (0.05)
+
+        return chosen
+
+
+# ============================================================
 # AGENT FACTORY
 # ============================================================
 
 def create_attacker(attacker_type: str, graph, seed: int = 42) -> BaseAttacker:
     """Factory function tạo attacker theo loại."""
     types = {
-        "random":        RandomAttacker,
-        "greedy":        GreedyAttacker,
-        "shortest_path": ShortestPathAttacker,
-        "stealthy":      StealthyAttacker,
+        "random":           RandomAttacker,
+        "greedy":           GreedyAttacker,
+        "shortest_path":    ShortestPathAttacker,
+        "stealthy":         StealthyAttacker,
+        "deception_aware":  DeceptionAwareAttacker,
     }
     if attacker_type not in types:
         raise ValueError(f"Unknown attacker type: {attacker_type}. Choose from {list(types.keys())}")
@@ -520,7 +707,7 @@ if __name__ == "__main__":
 
     print("Testing all attacker types (no defense)...")
     print("=" * 70)
-    for atype in ["random", "greedy", "shortest_path", "stealthy"]:
+    for atype in ["random", "greedy", "shortest_path", "stealthy", "deception_aware"]:
         result = run_simulation(graph, atype, n_episodes=200, seed=42)
         print(f"\n{result['attacker_type']:20s}:")
         print(f"  True Goal Hit Rate:      {result['hit_true_goal_rate']:.1%}")
@@ -531,7 +718,7 @@ if __name__ == "__main__":
     print("\nTesting with deception (fake DB reward=0.9 planted)...")
     print("=" * 70)
     fake_interventions = {(11, "end"): 0.9}  # DB_FAKE node 11
-    for atype in ["random", "greedy", "shortest_path", "stealthy"]:
+    for atype in ["random", "greedy", "shortest_path", "stealthy", "deception_aware"]:
         result = run_simulation(graph, atype, n_episodes=200,
                                 reward_interventions=fake_interventions, seed=42)
         print(f"\n{result['attacker_type']:20s} (with deception):")

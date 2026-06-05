@@ -158,10 +158,13 @@ class RobustDecisionEngine:
     Lớp 4: Bộ não ra quyết định Robust.
     
     Tối ưu pessimistic defender value bằng cách:
-    1. Đánh giá mỗi DeceptionAction qua nhiều loại attacker
+    1. Đánh giá mỗi DeceptionAction qua nhiều loại attacker (5 loại, kể cả deception_aware)
     2. Chọn action có pessimistic_value cao nhất (robust to worst-case)
     3. Ánh xạ kết quả toán học → ActionPlan có thể thực thi
     """
+
+    # Tất cả 5 loại attacker — dùng chung cho cả optimization lẫn evaluation
+    ALL_ATTACKER_TYPES = ["random", "greedy", "shortest_path", "stealthy", "deception_aware"]
 
     def __init__(
         self,
@@ -169,11 +172,13 @@ class RobustDecisionEngine:
         fabric: DeceptionFabric,
         n_attacker_samples: int = 200,
         use_robust_milp: bool = True,
+        seed: int = 42,
     ):
         self.graph = graph
         self.fabric = fabric
         self.n_attacker_samples = n_attacker_samples
         self.use_robust_milp = use_robust_milp
+        self.seed = seed
         self._decision_history: List[ActionPlan] = []
 
         # Thử import robust MILP solver từ codebase cũ
@@ -220,7 +225,7 @@ class RobustDecisionEngine:
 
         # Defender value function:
         # +1 nếu attacker đến decoy, -2 nếu attacker đến true goal
-        attacker_types = ["random", "greedy", "shortest_path", "stealthy"]
+        attacker_types = self.ALL_ATTACKER_TYPES
         defender_values = []
 
         for atype in attacker_types:
@@ -228,7 +233,7 @@ class RobustDecisionEngine:
                 self.graph, atype,
                 n_episodes=n_episodes // len(attacker_types),
                 reward_interventions=reward_interventions,
-                seed=42,
+                seed=self.seed,
             )
             # Tính defender value từ kết quả
             decoy_rate = result["decoy_interception_rate"]
@@ -329,11 +334,13 @@ class RobustDecisionEngine:
         Quy tắc kết hợp:
         - DEPLOY_DECOY_*: ghi nhận (node, "end") -> reward_delta (lấy max nếu trùng node)
         - SCATTER_HONEY_CREDENTIAL: ghi nhận cả (node, "cred_dump") và (node, "end")
-        - INCREASE_EDGE_COST: không sinh reward intervention nhưng có hiệu ứng qua
-          graph.increase_edge_cost đã được deploy_action xử lý; ở đây ta chỉ model
-          hiệu ứng "push attacker toward decoys" bằng negative bait.
+        - INCREASE_EDGE_COST trên đường thật: ghi nhận vào edge_cost_edits để
+          _evaluate_portfolio áp dụng lên graph_copy transitions.
+          Không còn model bằng reward nhỏ nữa — tác động trực tiếp lên xác suất.
         """
         merged: Dict = {}
+        self._edge_cost_edits: List[Tuple] = []  # [(src, dst, delta), ...]
+
         for action in actions:
             atype = action.action_type
 
@@ -342,7 +349,7 @@ class RobustDecisionEngine:
                 DeceptionActionType.DEPLOY_DECOY_ROUTER,
             ):
                 key = (action.target_node, "end")
-                # Tất cả reward cộng dồn (nhiều decoy cùng loaại tại các node khác nhau)
+                # Tất cả reward cộng dồn (nhiều decoy cùng loại tại các node khác nhau)
                 merged[key] = merged.get(key, 0.0) + action.reward_delta
 
             elif atype == DeceptionActionType.SCATTER_HONEY_CREDENTIAL:
@@ -352,13 +359,10 @@ class RobustDecisionEngine:
                 merged[k_end]  = merged.get(k_end,  0.0) + action.reward_delta * 0.3
 
             elif atype == DeceptionActionType.INCREASE_EDGE_COST:
-                # Model hiệu ứng của việc chặn edge: attacker có ít khả năng qua đượng đó hơn.
-                # Ta không thể giảm reward tại node, nhưng có thể boost node decoy ở điểm đến
-                # cùng mức độ nhỏ hơn (edge cost được apply sọn lên graph trong deploy_action;
-                # ở đây ta model hiệu ứng bonus cho các decoy cửa đi lân cận).
-                if action.target_edge and action.target_node in self.graph.decoy_sites:
-                    k_end = (action.target_node, "end")
-                    merged[k_end] = merged.get(k_end, 0.0) + action.edge_cost_delta * 0.2
+                # Ghi nhận cảnh cần giảm xác suất — sẽ được apply trong _evaluate_portfolio
+                if action.target_edge:
+                    src, dst = action.target_edge
+                    self._edge_cost_edits.append((src, dst, action.edge_cost_delta))
 
         return merged
 
@@ -388,13 +392,16 @@ class RobustDecisionEngine:
         from mirage.attacker_agents import run_simulation
 
         combined = self._merge_interventions(actions)
+        edge_cost_edits = getattr(self, "_edge_cost_edits", [])
 
-        # ---- Channel 2: Transition boost ----
+        # ---- Channel 2: Transition boost (decoy attraction) ----
         # Tạo graph_copy với xác suất đi đến decoy nodes được tăng lên.
         # Phản ánh thực tế: decoy trông giống tài sản thật → attacker có xác suất
         # cao hơn khi navigate mạng. Ảnh hưởng ALL attacker types.
         graph_copy = copy.deepcopy(self.graph)
         decoy_set = set(graph_copy.decoy_sites)
+
+        # 2a. Boost decoy attraction (reward channel)
         for (node, _), delta in combined.items():
             if node in decoy_set and delta > 0:
                 for src in graph_copy.states:
@@ -411,7 +418,44 @@ class RobustDecisionEngine:
                                 for k, v in graph_copy.transitions[src][act].items()
                             }
 
-        attacker_types = ["random", "greedy", "shortest_path", "stealthy"]
+        # 2b. Apply edge cost edits (real path blocking channel)
+        # Giảm xác suất đi theo cạnh bị tăng cost, phân phối lại sang các neighbors khác
+        for (src, dst, cost_delta) in edge_cost_edits:
+            if src not in graph_copy.transitions:
+                continue
+            for act in graph_copy.available_actions.get(src, []):
+                trans = graph_copy.transitions[src][act]
+                if dst not in trans or len(trans) <= 1:
+                    continue
+                # Giảm xác suất đến dst (max giảm 45%)
+                penalty = min(cost_delta * 0.08, trans[dst] * 0.45)
+                new_p_dst = max(0.05, trans[dst] - penalty)
+                freed = trans[dst] - new_p_dst
+
+                # Phân phối freed probability sang decoy neighbors ưu tiên,
+                # nếu không có thì sang các real neighbors khác
+                other_nodes = [n for n in trans if n != dst]
+                decoy_neighbors = [n for n in other_nodes if n in decoy_set]
+                if decoy_neighbors:
+                    # Ưu tiên boost decoy
+                    boost_per = freed / len(decoy_neighbors)
+                    new_trans = {n: p for n, p in trans.items()}
+                    new_trans[dst] = new_p_dst
+                    for dn in decoy_neighbors:
+                        new_trans[dn] = new_trans[dn] + boost_per
+                else:
+                    # Phân phối đều sang real neighbors
+                    boost_per = freed / len(other_nodes) if other_nodes else 0
+                    new_trans = {n: p for n, p in trans.items()}
+                    new_trans[dst] = new_p_dst
+                    for on in other_nodes:
+                        new_trans[on] = new_trans[on] + boost_per
+
+                # Normalize lại
+                total = sum(new_trans.values())
+                graph_copy.transitions[src][act] = {k: v / total for k, v in new_trans.items()}
+
+        attacker_types = self.ALL_ATTACKER_TYPES
         defender_values: Dict[str, float] = {}
 
         for atype in attacker_types:
@@ -419,7 +463,7 @@ class RobustDecisionEngine:
                 graph_copy, atype,          # Dùng graph đã modified (cả 2 kênh)
                 n_episodes=max(n_eps, 20),
                 reward_interventions=combined,  # Channel 1: reward bait
-                seed=42,
+                seed=self.seed,
                 start_distribution=belief_state,
             )
             d_val = (
@@ -447,6 +491,7 @@ class RobustDecisionEngine:
             "selection_value":   selection_value,   # Dùng để chọn portfolio
             "per_attacker":      defender_values,
             "combined_interventions": combined,
+            "edge_cost_edits":   self._edge_cost_edits.copy(),
             "total_cost":        total_cost,
         }
 
@@ -486,7 +531,8 @@ class RobustDecisionEngine:
                         "combined_interventions": {}, "total_cost": 0.0}
 
         # Độ phân giải episodes: đủ để phân biệt portfolios mà không quá chậm
-        eps_per_eval = max(40, self.n_attacker_samples // 4)
+        # Với 5 attacker types cần nhiều episodes hơn để có signal đủ mạnh
+        eps_per_eval = max(60, self.n_attacker_samples // 2)
 
         print(f"\n\U0001f50e [Portfolio Optimizer] {len(available)} candidate actions, "
               f"budget={budget:.1f}, {eps_per_eval} eps/eval, criterion={criterion}"

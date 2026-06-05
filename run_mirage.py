@@ -8,6 +8,9 @@ Usage:
   python run_mirage.py                    # Chạy demo đầy đủ end-to-end
   python run_mirage.py --mode demo        # Demo end-to-end nhanh
   python run_mirage.py --mode benchmark   # Benchmark đầy đủ 6 phương pháp
+  python run_mirage.py --mode benchmark_a # Benchmark A: Entry-point attack (Internet → DB)
+  python run_mirage.py --mode benchmark_b # Benchmark B: Belief-conditioned response (mid-network)
+  python run_mirage.py --mode multi_seed  # Multi-seed Benchmark A+B với confidence intervals
   python run_mirage.py --mode step1       # Bước 1: MVP (Layer 2+4)
   python run_mirage.py --mode step2       # Bước 2: Đắp thịt (Layer 3+6+Attackers)
   python run_mirage.py --mode step3       # Bước 3: Gắn mắt phanh (Layer 1+5)
@@ -150,7 +153,7 @@ def run_step2_full_layers():
     # Tạo reward interventions từ fabric
     reward_interventions = dict(fabric.reward_interventions)
 
-    for atype in ["random", "greedy", "shortest_path", "stealthy"]:
+    for atype in ["random", "greedy", "shortest_path", "stealthy", "deception_aware"]:
         result = run_simulation(
             graph, atype,
             n_episodes=100,
@@ -167,10 +170,13 @@ def run_step2_full_layers():
     from mirage.layer6_evaluation import MIRAGEEvaluator
     evaluator = MIRAGEEvaluator(graph, n_episodes=150, seed=42)
 
-    # Chỉ chạy 3 phương pháp để demo nhanh
+    # Chạy 3 phương pháp để demo nhanh; _get_reward_interventions_for_method
+    # trả về tuple (interventions_dict, edge_edits_list) — phải unpack đúng.
     for method in ["no_defense", "static_honeypot", "robust_mirage"]:
-        interventions = evaluator._get_reward_interventions_for_method(method)
-        result = evaluator._compute_metrics_for_method(method, interventions)
+        interventions, edge_edits = evaluator._get_reward_interventions_for_method(method)
+        result = evaluator._compute_metrics_for_method(
+            method, interventions, edge_cost_edits=edge_edits
+        )
         evaluator.results[method] = result
 
     print("\nQuick Comparison (3 methods):")
@@ -381,6 +387,74 @@ def run_full_benchmark():
     print("\n✅ Full benchmark complete!")
 
 
+def run_benchmark_a():
+    """Chạy Benchmark A: Attacker bắt đầu từ Internet/Entry Point."""
+    from mirage.layer2_attack_graph import build_enterprise_attack_graph
+    from mirage.layer6_evaluation import MIRAGEEvaluator
+
+    graph = build_enterprise_attack_graph()
+    evaluator = MIRAGEEvaluator(graph, n_episodes=500, seed=42, results_dir="results")
+
+    print("\n[Benchmark A] Entry-point attack — Attacker starts at Internet (Node 0)")
+    evaluator.run_benchmark_a(verbose=True)
+
+    print("\n[Benchmark A] Results:")
+    evaluator.print_comparison_table()
+    evaluator.per_attacker_breakdown()
+    evaluator.save_results_json(filename="benchmark_a_results.json")
+    evaluator.plot_results(save=True)
+
+    print("\n✅ Benchmark A complete!")
+
+
+def run_benchmark_b():
+    """Chạy Benchmark B: Attacker đã bị nghi ở mid-network (post-intrusion)."""
+    from mirage.layer2_attack_graph import build_enterprise_attack_graph
+    from mirage.layer6_evaluation import MIRAGEEvaluator
+
+    graph = build_enterprise_attack_graph()
+    evaluator = MIRAGEEvaluator(graph, n_episodes=500, seed=42, results_dir="results")
+
+    print("\n[Benchmark B] Belief-conditioned response")
+    print("  Belief: WS_Finance(35%), SMB(25%), SVC_Cred(20%), Admin_Cred(10%), WS_Eng(10%)")
+    evaluator.run_benchmark_b(verbose=True)
+
+    print("\n[Benchmark B] Results:")
+    evaluator.print_comparison_table()
+    evaluator.per_attacker_breakdown()
+    evaluator.save_results_json(filename="benchmark_b_results.json")
+    evaluator.plot_results(save=True)
+
+    print("\n✅ Benchmark B complete!")
+
+
+def run_multi_seed():
+    """Chạy Multi-Seed Benchmark để lấy mean ± std."""
+    from mirage.layer2_attack_graph import build_enterprise_attack_graph
+    from mirage.layer6_evaluation import MIRAGEEvaluator
+
+    graph = build_enterprise_attack_graph()
+    evaluator = MIRAGEEvaluator(graph, n_episodes=300, seed=42, results_dir="results")
+
+    print("\n[Multi-Seed] Running Benchmark A across 10 seeds...")
+    aggregated_a = evaluator.run_multi_seed_benchmark(
+        seeds=list(range(10)),
+        n_episodes=500,
+        benchmark_type="a",
+        verbose=True,
+    )
+
+    print("\n[Multi-Seed] Running Benchmark B across 10 seeds...")
+    aggregated_b = evaluator.run_multi_seed_benchmark(
+        seeds=list(range(10)),
+        n_episodes=500,
+        benchmark_type="b",
+        verbose=True,
+    )
+
+    print("\n✅ Multi-seed benchmark complete! Results saved to results/")
+
+
 def show_graph_info():
     """Hiển thị thông tin đồ thị."""
     from mirage.layer2_attack_graph import build_enterprise_attack_graph, print_graph_summary
@@ -396,7 +470,10 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["demo", "benchmark", "step1", "step2", "step3", "ablation", "graph"],
+        choices=[
+            "demo", "benchmark", "benchmark_a", "benchmark_b",
+            "multi_seed", "step1", "step2", "step3", "ablation", "graph",
+        ],
         default="demo",
         help="Chế độ chạy",
     )
@@ -418,6 +495,12 @@ def main():
         run_step3_safety()
     elif args.mode == "benchmark":
         run_full_benchmark()
+    elif args.mode == "benchmark_a":
+        run_benchmark_a()
+    elif args.mode == "benchmark_b":
+        run_benchmark_b()
+    elif args.mode == "multi_seed":
+        run_multi_seed()
     elif args.mode == "ablation":
         from mirage.layer2_attack_graph import build_enterprise_attack_graph
         from mirage.layer6_evaluation import MIRAGEEvaluator
