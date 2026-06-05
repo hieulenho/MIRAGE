@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import sys
 import os
+import random
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -416,6 +417,240 @@ def build_enterprise_attack_graph(
     n_active = len(states) - 1
     graph.belief_state = {s: 1.0/n_active for s in states if s != SINK}
 
+    return graph
+
+
+def build_synthetic_enterprise_graph(
+    n_nodes: int = 100,
+    budget: float = 12.0,
+    discount: float = 0.95,
+    seed: int = 42,
+    decoy_fraction: float = 0.03,
+) -> MIRAGEAttackGraph:
+    """
+    Build a scalable synthetic enterprise attack graph.
+
+    This is intentionally metadata-rich so the decision engine can test
+    100/500/1000-node behavior without exploding the action catalog.
+    """
+    if n_nodes < 30:
+        raise ValueError("n_nodes must be >= 30 for the synthetic scaling graph")
+
+    rng = random.Random(seed)
+    states = list(range(n_nodes))
+    sink = n_nodes - 1
+    true_goal = n_nodes - 2
+    n_decoys = max(2, min(60, int(n_nodes * decoy_fraction)))
+    decoy_sites = list(range(n_nodes - 2 - n_decoys, n_nodes - 2))
+
+    real_nodes = [s for s in states if s not in set(decoy_sites + [sink, true_goal])]
+    tier_names = ["external", "dmz", "internal", "services", "credentials", "critical", "data"]
+    tier_asset = {
+        "external": "entry",
+        "dmz": "web_server",
+        "internal": "workstation",
+        "services": "file_share",
+        "credentials": "credential",
+        "critical": "dc",
+        "data": "database",
+    }
+
+    tiers: Dict[str, List[int]] = {name: [] for name in tier_names}
+    for i, node in enumerate(real_nodes):
+        if node == 0:
+            tier = "external"
+        else:
+            frac = i / max(1, len(real_nodes) - 1)
+            tier = tier_names[min(len(tier_names) - 1, int(frac * len(tier_names)))]
+        tiers[tier].append(node)
+
+    state_labels: Dict[int, str] = {}
+    node_metadata: Dict[int, Dict] = {}
+
+    for tier_idx, tier in enumerate(tier_names):
+        for node in tiers[tier]:
+            asset_type = tier_asset[tier]
+            value = min(1.0, 0.08 + tier_idx * 0.13 + rng.random() * 0.08)
+            service_count = {
+                "entry": 1,
+                "web_server": rng.randint(2, 6),
+                "workstation": 1,
+                "file_share": rng.randint(4, 9),
+                "credential": rng.randint(1, 4),
+                "dc": rng.randint(10, 18),
+                "database": rng.randint(8, 16),
+            }.get(asset_type, 1)
+            user_count = {
+                "entry": 0,
+                "web_server": rng.randint(120, 450),
+                "workstation": rng.randint(5, 60),
+                "file_share": rng.randint(250, 900),
+                "credential": rng.randint(50, 350),
+                "dc": rng.randint(700, 2200),
+                "database": rng.randint(400, 1800),
+            }.get(asset_type, 10)
+            state_labels[node] = f"{tier.title()}_{node}"
+            node_metadata[node] = {
+                "label": state_labels[node],
+                "layer": tier,
+                "asset_type": asset_type,
+                "is_real": True,
+                "value": value,
+                "business_criticality": min(1.0, value + rng.random() * 0.12),
+                "service_count": service_count,
+                "user_count": user_count,
+            }
+
+    state_labels[true_goal] = "Synthetic_DB_REAL"
+    node_metadata[true_goal] = {
+        "label": state_labels[true_goal],
+        "layer": "data",
+        "asset_type": "database",
+        "is_real": True,
+        "value": 1.0,
+        "business_criticality": 1.0,
+        "service_count": 20,
+        "user_count": 2500,
+    }
+    for idx, node in enumerate(decoy_sites):
+        asset_type = "decoy_db" if idx % 2 == 0 else "decoy_router"
+        state_labels[node] = f"Synthetic_Decoy_{idx}_{node}"
+        node_metadata[node] = {
+            "label": state_labels[node],
+            "layer": "data" if asset_type == "decoy_db" else "services",
+            "asset_type": asset_type,
+            "is_real": False,
+            "value": 0.0,
+            "business_criticality": 0.03,
+            "service_count": 1 if asset_type == "decoy_db" else 3,
+            "user_count": 5 if asset_type == "decoy_db" else 40,
+        }
+    state_labels[sink] = "Sink"
+    node_metadata[sink] = {
+        "label": "Sink",
+        "layer": "sink",
+        "asset_type": "sink",
+        "is_real": True,
+        "value": 0.0,
+        "business_criticality": 0.0,
+        "service_count": 0,
+        "user_count": 0,
+    }
+
+    def action_set(asset_type: str) -> List[str]:
+        if asset_type == "entry":
+            return ["exploit_web", "phish_email", "dns_recon"]
+        if asset_type in {"web_server", "mail_server"}:
+            return ["smb_move", "rdp_move", "dns_recon", "end"]
+        if asset_type == "workstation":
+            return ["cred_dump", "smb_move", "rdp_move", "end"]
+        if asset_type in {"file_share", "dns_server"}:
+            return ["cred_dump", "smb_move", "dns_recon", "end"]
+        if asset_type == "credential":
+            return ["db_access", "dc_attack", "smb_move", "end"]
+        if asset_type == "dc":
+            return ["db_access", "end"]
+        if asset_type == "database":
+            return ["end"]
+        if asset_type.startswith("decoy"):
+            return ["end"]
+        return ["smb_move", "end"]
+
+    available_actions: Dict[int, List[str]] = {}
+    transitions: Dict[int, Dict[str, Dict[int, float]]] = {}
+
+    tier_index = {tier: idx for idx, tier in enumerate(tier_names)}
+    nodes_by_tier = [tiers[t] for t in tier_names]
+
+    def later_targets(node: int, count: int) -> List[int]:
+        meta = node_metadata[node]
+        current_tier = meta["layer"]
+        start_idx = tier_index.get(current_tier, 0)
+        pool: List[int] = []
+        for idx in range(start_idx, min(len(nodes_by_tier), start_idx + 3)):
+            pool.extend(nodes_by_tier[idx])
+        pool = [p for p in pool if p != node]
+        if start_idx >= len(tier_names) - 2 or rng.random() < 0.18:
+            pool.append(true_goal)
+        if rng.random() < 0.28:
+            pool.extend(rng.sample(decoy_sites, k=min(len(decoy_sites), max(1, count // 2))))
+        if not pool:
+            pool = [true_goal]
+        rng.shuffle(pool)
+        return list(dict.fromkeys(pool[:count]))
+
+    for node in states:
+        meta = node_metadata[node]
+        asset_type = meta["asset_type"]
+        available_actions[node] = action_set(asset_type)
+        transitions[node] = {}
+
+        if node == sink:
+            transitions[node]["noop"] = {sink: 1.0}
+            available_actions[node] = ["noop"]
+            continue
+        if node == true_goal or node in decoy_sites:
+            transitions[node]["end"] = {sink: 1.0}
+            available_actions[node] = ["end"]
+            continue
+
+        for action in available_actions[node]:
+            if action == "end":
+                transitions[node][action] = {sink: 1.0}
+                continue
+            count = rng.randint(2, 5)
+            targets = later_targets(node, count)
+            weights = [rng.uniform(0.2, 1.0) for _ in targets]
+            total = sum(weights)
+            transitions[node][action] = {
+                target: weight / total
+                for target, weight in zip(targets, weights)
+            }
+
+    # Ensure at least one clear path from entry to the true goal.
+    spine = [0]
+    for tier in ["dmz", "internal", "services", "credentials", "critical"]:
+        if tiers[tier]:
+            spine.append(tiers[tier][0])
+    spine.append(true_goal)
+    for src, dst in zip(spine, spine[1:]):
+        action = available_actions[src][0]
+        trans = transitions[src].setdefault(action, {})
+        trans[dst] = max(trans.get(dst, 0.0), 0.45)
+        total = sum(trans.values())
+        transitions[src][action] = {k: v / total for k, v in trans.items()}
+
+    attacker_reward: Dict[Tuple[int, str], float] = {
+        (true_goal, "end"): 1.0,
+    }
+    defender_reward: Dict[Tuple[int, str], float] = {
+        (true_goal, "end"): -2.0,
+    }
+    for decoy in decoy_sites:
+        attacker_reward[(decoy, "end")] = 0.0
+        defender_reward[(decoy, "end")] = 1.0
+    for node in tiers.get("critical", [])[: max(1, len(tiers.get("critical", [])) // 12)]:
+        attacker_reward[(node, "end")] = 0.8
+        defender_reward[(node, "end")] = -1.4
+
+    graph = MIRAGEAttackGraph(
+        states=states,
+        actions=ACTIONS,
+        available_actions=available_actions,
+        transitions=transitions,
+        start_distribution={0: 1.0},
+        discount=discount,
+        budget=budget,
+        true_goals=[true_goal],
+        decoy_sites=decoy_sites,
+        sink_state=sink,
+        state_labels=state_labels,
+        attacker_reward=attacker_reward,
+        defender_reward=defender_reward,
+        node_metadata=node_metadata,
+    )
+    n_active = len(states) - 1
+    graph.belief_state = {s: 1.0 / n_active for s in states if s != sink}
     return graph
 
 

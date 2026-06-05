@@ -179,6 +179,21 @@ class SafetyGate:
         warnings = []
         allowed = True
         requires_human = False
+        from mirage.mdp_solver import compute_portfolio_cost
+
+        plan_actions = getattr(plan, "portfolio", None) or [plan.action]
+        cost_report = compute_portfolio_cost(plan_actions, graph)
+        request_cost = float(getattr(plan, "portfolio_cost", 0.0) or cost_report["total"])
+        risk_rank = {
+            RiskLevel.LOW: 0,
+            RiskLevel.MEDIUM: 1,
+            RiskLevel.HIGH: 2,
+            RiskLevel.CRITICAL: 3,
+        }
+        for action in plan_actions:
+            action_risk = self.classify_risk(action, graph)
+            if risk_rank[action_risk] > risk_rank[risk_level]:
+                risk_level = action_risk
 
         # ---- GUARDRAIL 1: Fail-safe mode ----
         if self.fail_safe_mode:
@@ -202,10 +217,10 @@ class SafetyGate:
             )
 
         # ---- GUARDRAIL 3: Budget check ----
-        if self.budget_spent + plan.action.cost > self.budget_limit:
+        if self.budget_spent + request_cost > self.budget_limit:
             budget_warning = (
                 f"Budget exceeded: spent={self.budget_spent:.1f}, "
-                f"request={plan.action.cost:.1f}, limit={self.budget_limit:.1f}"
+                f"request={request_cost:.1f}, limit={self.budget_limit:.1f}"
             )
             audit_notes.append(budget_warning)
             return False, SafetyDecision(
@@ -301,7 +316,7 @@ class SafetyGate:
 
         # Cập nhật budget nếu được phép
         if allowed:
-            self.budget_spent += plan.action.cost
+            self.budget_spent += request_cost
 
         decision = SafetyDecision(
             allowed=allowed,

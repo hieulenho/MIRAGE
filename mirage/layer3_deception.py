@@ -62,6 +62,11 @@ class DeceptionAction:
     realism_score: float     = 0.8      # 0=dễ phát hiện, 1=rất giống thật
     business_impact: float   = 0.0      # 0=không ảnh hưởng, 1=ảnh hưởng lớn
     cost: float              = 1.0      # Chi phí ngân sách
+    affected_services: int   = 0
+    affected_users: int      = 0
+    duration_hours: float    = 1.0
+    rollback_complexity: Optional[float] = None
+    false_positive_likelihood: Optional[float] = None
 
     # Metadata
     description: str         = ""
@@ -73,6 +78,9 @@ class DeceptionAction:
 
     @property
     def action_id(self) -> str:
+        if self.target_edge:
+            src, dst = self.target_edge
+            return f"{self.action_type.value}@edge{src}->{dst}"
         return f"{self.action_type.value}@node{self.target_node}"
 
     def __repr__(self) -> str:
@@ -113,11 +121,213 @@ class ActiveDecoy:
 # DECEPTION ACTION CATALOG
 # ============================================================
 
-def get_action_catalog(graph) -> List[DeceptionAction]:
+def _operational_fields(graph, node: int, action_type: DeceptionActionType) -> Dict:
+    """Build practical cost metadata for an action target."""
+    meta = getattr(graph, "node_metadata", {}).get(node, {}) or {}
+    asset_type = meta.get("asset_type", "")
+    value = float(meta.get("value", 0.0) or 0.0)
+    criticality = float(meta.get("business_criticality", value) or 0.0)
+
+    default_services = {
+        "web_server": 4,
+        "mail_server": 5,
+        "workstation": 1,
+        "file_share": 6,
+        "dns_server": 8,
+        "credential": 2,
+        "database": 10,
+        "dc": 15,
+        "decoy_db": 1,
+        "decoy_router": 3,
+    }
+    default_users = {
+        "web_server": 250,
+        "mail_server": 800,
+        "workstation": 25,
+        "file_share": 500,
+        "dns_server": 1200,
+        "credential": 150,
+        "database": 900,
+        "dc": 1500,
+        "decoy_db": 5,
+        "decoy_router": 50,
+    }
+
+    services = int(meta.get("service_count", default_services.get(asset_type, 1)))
+    users = int(meta.get("user_count", default_users.get(asset_type, 10)))
+
+    if action_type == DeceptionActionType.SCATTER_HONEY_CREDENTIAL:
+        duration = 4.0
+        rollback = 0.15
+        fp = 0.20
+    elif action_type == DeceptionActionType.INCREASE_EDGE_COST:
+        duration = 0.5
+        rollback = 0.35
+        fp = 0.12
+    elif action_type == DeceptionActionType.DEPLOY_DECOY_ROUTER:
+        duration = 8.0
+        rollback = 0.45
+        fp = 0.16
+    else:
+        duration = 8.0
+        rollback = 0.25
+        fp = 0.06
+
+    return {
+        "affected_services": services,
+        "affected_users": users,
+        "duration_hours": duration,
+        "rollback_complexity": rollback,
+        "false_positive_likelihood": fp,
+        "business_impact": min(1.0, max(0.0, 0.05 + 0.20 * criticality)),
+    }
+
+
+def _top_nodes(graph, predicate, limit: int) -> List[int]:
+    """Return top nodes by business value/criticality that match predicate."""
+    candidates = []
+    for node in graph.states:
+        if node == graph.sink_state or node in graph.true_goals:
+            continue
+        meta = getattr(graph, "node_metadata", {}).get(node, {}) or {}
+        if predicate(node, meta):
+            value = float(meta.get("value", 0.0) or 0.0)
+            criticality = float(meta.get("business_criticality", value) or 0.0)
+            candidates.append((max(value, criticality), node))
+    candidates.sort(reverse=True)
+    return [node for _, node in candidates[:limit]]
+
+
+def _build_generic_action_catalog(
+    graph,
+    max_actions_per_type: int = 40,
+) -> List[DeceptionAction]:
+    """
+    Build a bounded action catalog for large/static or synthetic graphs.
+
+    The 15-node demo uses the hand-tuned catalog below. Larger graphs need a
+    metadata/topology driven catalog; otherwise action space grows with every
+    node and edge.
+    """
+    actions: List[DeceptionAction] = []
+    decoys = [d for d in graph.decoy_sites if d in graph.states and d != graph.sink_state]
+
+    db_nodes = list(dict.fromkeys(
+        decoys
+        + _top_nodes(
+            graph,
+            lambda _n, m: m.get("asset_type") in {"database", "file_share", "workstation", "decoy_db"},
+            max_actions_per_type,
+        )
+    ))[:max_actions_per_type]
+    for node in db_nodes:
+        fields = _operational_fields(graph, node, DeceptionActionType.DEPLOY_DECOY_DATABASE)
+        actions.append(DeceptionAction(
+            action_type=DeceptionActionType.DEPLOY_DECOY_DATABASE,
+            target_node=node,
+            risk_score=min(0.45, 0.08 + fields["business_impact"] * 0.45),
+            realism_score=0.82,
+            cost=1.5,
+            description=f"Deploy synthetic database lure near Node {node} ({graph.label(node)}).",
+            rollback_plan="Stop decoy database workload and remove route/DNS exposure",
+            reward_delta=0.85,
+            **fields,
+        ))
+
+    router_nodes = list(dict.fromkeys(
+        decoys
+        + _top_nodes(
+            graph,
+            lambda _n, m: m.get("asset_type") in {"dns_server", "web_server", "mail_server", "decoy_router"},
+            max_actions_per_type,
+        )
+    ))[:max_actions_per_type]
+    for node in router_nodes:
+        fields = _operational_fields(graph, node, DeceptionActionType.DEPLOY_DECOY_ROUTER)
+        actions.append(DeceptionAction(
+            action_type=DeceptionActionType.DEPLOY_DECOY_ROUTER,
+            target_node=node,
+            risk_score=min(0.55, 0.12 + fields["business_impact"] * 0.50),
+            realism_score=0.76,
+            cost=1.2,
+            description=f"Deploy fake routing/service waypoint near Node {node} ({graph.label(node)}).",
+            rollback_plan="Remove virtual route, DNS advertisement, and monitoring hooks",
+            reward_delta=0.70,
+            edge_cost_delta=0.30,
+            **fields,
+        ))
+
+    cred_nodes = _top_nodes(
+        graph,
+        lambda _n, m: m.get("asset_type") in {"credential", "workstation", "file_share"},
+        max_actions_per_type,
+    )
+    for node in cred_nodes:
+        fields = _operational_fields(graph, node, DeceptionActionType.SCATTER_HONEY_CREDENTIAL)
+        actions.append(DeceptionAction(
+            action_type=DeceptionActionType.SCATTER_HONEY_CREDENTIAL,
+            target_node=node,
+            risk_score=min(0.35, 0.05 + fields["business_impact"] * 0.35),
+            realism_score=0.90,
+            cost=0.8,
+            description=f"Plant honey credential material at Node {node} ({graph.label(node)}).",
+            rollback_plan="Disable honey identity and remove seeded credential material",
+            reward_delta=0.50,
+            **fields,
+        ))
+
+    edge_candidates = []
+    true_goals = set(graph.true_goals)
+    for src in graph.states:
+        if src == graph.sink_state:
+            continue
+        src_meta = getattr(graph, "node_metadata", {}).get(src, {}) or {}
+        src_value = float(src_meta.get("value", 0.0) or 0.0)
+        for act in graph.available_actions.get(src, []):
+            for dst, prob in graph.transitions.get(src, {}).get(act, {}).items():
+                if dst == graph.sink_state or dst in graph.decoy_sites or dst == src:
+                    continue
+                dst_meta = getattr(graph, "node_metadata", {}).get(dst, {}) or {}
+                dst_value = float(dst_meta.get("value", 0.0) or 0.0)
+                dst_crit = float(dst_meta.get("business_criticality", dst_value) or 0.0)
+                score = prob + 0.7 * dst_value + 0.5 * dst_crit + 0.2 * src_value
+                if dst in true_goals:
+                    score += 1.0
+                edge_candidates.append((score, src, dst))
+    edge_candidates.sort(reverse=True)
+
+    seen_edges = set()
+    for _score, src, dst in edge_candidates:
+        if len(seen_edges) >= max_actions_per_type:
+            break
+        if (src, dst) in seen_edges:
+            continue
+        seen_edges.add((src, dst))
+        fields = _operational_fields(graph, dst, DeceptionActionType.INCREASE_EDGE_COST)
+        actions.append(DeceptionAction(
+            action_type=DeceptionActionType.INCREASE_EDGE_COST,
+            target_node=dst,
+            target_edge=(src, dst),
+            risk_score=min(0.45, 0.04 + fields["business_impact"] * 0.45),
+            realism_score=1.0,
+            cost=0.5,
+            description=f"Throttle high-risk movement edge {graph.label(src)} -> {graph.label(dst)}.",
+            rollback_plan="Remove throttle/MFA/firewall rule for this edge",
+            edge_cost_delta=0.5,
+            **fields,
+        ))
+
+    return actions
+
+
+def get_action_catalog(graph, max_actions_per_type: int = 40) -> List[DeceptionAction]:
     """
     Trả về danh sách đầy đủ các hành động deception khả dụng.
     Tương thích với đồ thị tấn công doanh nghiệp 15 node.
     """
+    if len(graph.states) > 30:
+        return _build_generic_action_catalog(graph, max_actions_per_type=max_actions_per_type)
+
     from mirage.layer2_attack_graph import (
         DB_FAKE, RTR_FAKE, WS_FIN, WS_ENG, WS_IT,
         SMB_SHARE, SVC_CRED, ADMIN_CRED, DNS_INT,
@@ -237,10 +447,10 @@ class DeceptionFabric:
     4. Thu thập intelligence
     """
 
-    def __init__(self, graph):
+    def __init__(self, graph, max_actions_per_type: int = 40):
         self.graph = graph
         self.active_decoys: Dict[str, ActiveDecoy] = {}
-        self.action_catalog = get_action_catalog(graph)
+        self.action_catalog = get_action_catalog(graph, max_actions_per_type=max_actions_per_type)
         self.engagement_log: List[Dict] = []
         self.total_cost_spent: float = 0.0
 
@@ -249,7 +459,11 @@ class DeceptionFabric:
 
     def get_available_actions(self, budget_remaining: float) -> List[DeceptionAction]:
         """Lọc các action khả dụng theo ngân sách."""
-        return [a for a in self.action_catalog if a.cost <= budget_remaining]
+        from mirage.mdp_solver import compute_composite_cost
+        return [
+            a for a in self.action_catalog
+            if compute_composite_cost(a, self.graph).total <= budget_remaining
+        ]
 
     def deploy_action(self, action: DeceptionAction) -> ActiveDecoy:
         """
@@ -281,7 +495,8 @@ class DeceptionFabric:
             deployed_at=time.time(),
         )
         self.active_decoys[decoy_id] = decoy
-        self.total_cost_spent += action.cost
+        from mirage.mdp_solver import compute_composite_cost
+        self.total_cost_spent += compute_composite_cost(action, self.graph).total
 
         return decoy
 

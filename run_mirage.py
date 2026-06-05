@@ -11,6 +11,7 @@ Usage:
   python run_mirage.py --mode benchmark_a # Benchmark A: Entry-point attack (Internet → DB)
   python run_mirage.py --mode benchmark_b # Benchmark B: Belief-conditioned response (mid-network)
   python run_mirage.py --mode multi_seed  # Multi-seed Benchmark A+B với confidence intervals
+  python run_mirage.py --mode scaling     # Scaling benchmark trên synthetic graph 100/500/1000 node
   python run_mirage.py --mode step1       # Bước 1: MVP (Layer 2+4)
   python run_mirage.py --mode step2       # Bước 2: Đắp thịt (Layer 3+6+Attackers)
   python run_mirage.py --mode step3       # Bước 3: Gắn mắt phanh (Layer 1+5)
@@ -455,6 +456,21 @@ def run_multi_seed():
     print("\n✅ Multi-seed benchmark complete! Results saved to results/")
 
 
+def run_scaling_benchmark():
+    """Run scaling benchmark on synthetic 100/500/1000-node graphs."""
+    from mirage.layer2_attack_graph import build_enterprise_attack_graph
+    from mirage.layer6_evaluation import MIRAGEEvaluator
+
+    graph = build_enterprise_attack_graph()
+    evaluator = MIRAGEEvaluator(graph, n_episodes=120, seed=42, results_dir="results")
+    evaluator.run_scaling_benchmark(
+        node_sizes=[100, 500, 1000],
+        max_candidates=30,
+        n_attacker_samples=60,
+        verbose=True,
+    )
+
+
 def show_graph_info():
     """Hiển thị thông tin đồ thị."""
     from mirage.layer2_attack_graph import build_enterprise_attack_graph, print_graph_summary
@@ -472,7 +488,7 @@ def main():
         "--mode",
         choices=[
             "demo", "benchmark", "benchmark_a", "benchmark_b",
-            "multi_seed", "step1", "step2", "step3", "ablation", "graph",
+            "multi_seed", "scaling", "step1", "step2", "step3", "ablation", "graph",
         ],
         default="demo",
         help="Chế độ chạy",
@@ -501,6 +517,8 @@ def main():
         run_benchmark_b()
     elif args.mode == "multi_seed":
         run_multi_seed()
+    elif args.mode == "scaling":
+        run_scaling_benchmark()
     elif args.mode == "ablation":
         from mirage.layer2_attack_graph import build_enterprise_attack_graph
         from mirage.layer6_evaluation import MIRAGEEvaluator

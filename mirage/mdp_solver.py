@@ -62,25 +62,51 @@ class CompositeActionCost:
     w_biz: float = 2.0
     w_risk: float = 1.5
     w_svc: float = 0.1
+    w_user: float = 0.002
     w_fp: float = 1.0
     w_rollback: float = 0.5
+    w_duration: float = 0.08
 
     @property
     def total(self) -> float:
         """Tổng chi phí composite."""
+        duration_factor = max(0.25, self.duration_hours / 8.0)
         return (
             self.base_cost
             + self.business_impact * self.w_biz
             + self.risk_score * self.w_risk
             + self.affected_services * self.w_svc
+            + self.affected_users * self.w_user
             + self.fp_likelihood * self.w_fp
             + self.rollback_complexity * self.w_rollback
+            + duration_factor * self.w_duration
         )
 
     @property
     def fp_cost(self) -> float:
         """Chi phí riêng do false positive."""
-        return self.fp_likelihood * self.w_fp * (1.0 + self.affected_users * 0.01)
+        exposure = (
+            1.0
+            + self.affected_services * 0.05
+            + self.affected_users * 0.002
+            + max(0.0, self.duration_hours - 1.0) * 0.03
+        )
+        return self.fp_likelihood * self.w_fp * exposure
+
+    def to_dict(self) -> Dict[str, float]:
+        """Return a serializable cost breakdown for reports and benchmarks."""
+        return {
+            "total": self.total,
+            "base_cost": self.base_cost,
+            "business_impact": self.business_impact,
+            "risk_score": self.risk_score,
+            "affected_services": float(self.affected_services),
+            "affected_users": float(self.affected_users),
+            "false_positive_cost": self.fp_cost,
+            "fp_likelihood": self.fp_likelihood,
+            "rollback_complexity": self.rollback_complexity,
+            "duration_hours": self.duration_hours,
+        }
 
     def __repr__(self) -> str:
         return (f"CompositeActionCost(total={self.total:.2f}, "
@@ -88,7 +114,59 @@ class CompositeActionCost:
                 f"risk={self.risk_score:.2f}, fp={self.fp_likelihood:.2f})")
 
 
-def compute_composite_cost(action) -> CompositeActionCost:
+def _node_operational_profile(graph, node: int) -> Dict[str, float]:
+    """Estimate operational blast radius from graph metadata when present."""
+    if graph is None or node is None:
+        return {}
+
+    meta = getattr(graph, "node_metadata", {}).get(node, {}) or {}
+    asset_type = meta.get("asset_type", "")
+    layer = meta.get("layer", "")
+    value = float(meta.get("value", 0.0) or 0.0)
+
+    default_services = {
+        "entry": 1,
+        "web_server": 4,
+        "mail_server": 5,
+        "workstation": 1,
+        "file_share": 6,
+        "dns_server": 8,
+        "credential": 2,
+        "database": 10,
+        "dc": 15,
+        "decoy_db": 1,
+        "decoy_router": 3,
+        "sink": 0,
+    }
+    default_users = {
+        "entry": 0,
+        "web_server": 250,
+        "mail_server": 800,
+        "workstation": 25,
+        "file_share": 500,
+        "dns_server": 1200,
+        "credential": 150,
+        "database": 900,
+        "dc": 1500,
+        "decoy_db": 5,
+        "decoy_router": 50,
+        "sink": 0,
+    }
+
+    services = int(meta.get("service_count", default_services.get(asset_type, 1)))
+    users = int(meta.get("user_count", default_users.get(asset_type, 10)))
+    criticality = float(meta.get("business_criticality", value))
+    if layer in {"critical", "data"}:
+        criticality = max(criticality, min(1.0, value + 0.1))
+
+    return {
+        "affected_services": services,
+        "affected_users": users,
+        "business_criticality": max(0.0, min(1.0, criticality)),
+    }
+
+
+def compute_composite_cost(action, graph=None) -> CompositeActionCost:
     """
     Tính composite cost từ một DeceptionAction.
     Map các thuộc tính của action sang multi-factor cost.
@@ -129,16 +207,52 @@ def compute_composite_cost(action) -> CompositeActionCost:
         DeceptionActionType.INCREASE_EDGE_COST:       0.3,
     }
 
+    profile = _node_operational_profile(graph, getattr(action, "target_node", None))
+    action_services = int(getattr(action, "affected_services", 0) or 0)
+    action_users = int(getattr(action, "affected_users", 0) or 0)
+    services = action_services or int(profile.get("affected_services", svc_map.get(atype, 0)))
+    users = action_users or int(profile.get("affected_users", 0))
+
+    action_fp = getattr(action, "false_positive_likelihood", None)
+    if action_fp is None:
+        action_fp = getattr(action, "fp_likelihood", None)
+    fp_likelihood = fp_map.get(atype, 0.1) if action_fp is None else float(action_fp)
+
+    action_rollback = getattr(action, "rollback_complexity", None)
+    rollback_complexity = (
+        rollback_map.get(atype, 0.2)
+        if action_rollback is None
+        else float(action_rollback)
+    )
+
+    duration_hours = float(getattr(action, "duration_hours", 1.0) or 1.0)
+    business_impact = float(getattr(action, "business_impact", 0.0) or 0.0)
+    business_impact = max(
+        business_impact,
+        0.25 * float(profile.get("business_criticality", 0.0)),
+    )
+
     return CompositeActionCost(
         base_cost=base_map.get(atype, 1.0),
-        business_impact=action.business_impact,
-        risk_score=action.risk_score,
-        affected_services=svc_map.get(atype, 0),
-        affected_users=0,
-        fp_likelihood=fp_map.get(atype, 0.1),
-        rollback_complexity=rollback_map.get(atype, 0.2),
-        duration_hours=1.0,
+        business_impact=business_impact,
+        risk_score=float(getattr(action, "risk_score", 0.0) or 0.0),
+        affected_services=services,
+        affected_users=users,
+        fp_likelihood=fp_likelihood,
+        rollback_complexity=rollback_complexity,
+        duration_hours=duration_hours,
     )
+
+
+def compute_portfolio_cost(actions, graph=None) -> Dict[str, object]:
+    """Aggregate composite cost for a portfolio of deception actions."""
+    action_costs = [compute_composite_cost(a, graph) for a in actions]
+    return {
+        "total": sum(c.total for c in action_costs),
+        "false_positive_cost": sum(c.fp_cost for c in action_costs),
+        "action_count": len(action_costs),
+        "per_action": [c.to_dict() for c in action_costs],
+    }
 
 
 # ============================================================
@@ -622,6 +736,12 @@ def prune_action_space(
     sorted_states = sorted(belief_state.items(), key=lambda x: -x[1])
     hotspots = set()
 
+    predecessors: Dict[int, List[int]] = {s: [] for s in graph.states}
+    for s_pred in graph.states:
+        for a_pred in graph.available_actions.get(s_pred, []):
+            for s_next in graph.transitions.get(s_pred, {}).get(a_pred, {}):
+                predecessors.setdefault(s_next, []).append(s_pred)
+
     for s, p in sorted_states[:top_k_states]:
         hotspots.add(s)
         # Add 1-hop neighbors (states reachable from s)
@@ -630,11 +750,8 @@ def prune_action_space(
             for s_next in trans:
                 hotspots.add(s_next)
         # Add states that can reach s (1-hop predecessors)
-        for s_pred in graph.states:
-            for a_pred in graph.available_actions.get(s_pred, []):
-                trans_pred = graph.transitions.get(s_pred, {}).get(a_pred, {})
-                if s in trans_pred:
-                    hotspots.add(s_pred)
+        for s_pred in predecessors.get(s, []):
+            hotspots.add(s_pred)
 
     # Always include true goals and decoy sites
     for tg in graph.true_goals:
@@ -643,6 +760,69 @@ def prune_action_space(
         hotspots.add(ds)
 
     return sorted(hotspots)
+
+
+def rank_action_candidates(
+    actions,
+    graph: "MIRAGEAttackGraph",
+    belief_state: Optional[Dict[int, float]] = None,
+    limit: Optional[int] = None,
+) -> List:
+    """
+    Rank candidate actions by practical value before expensive simulation.
+
+    This is a scale guardrail, not the final optimizer. It keeps the action
+    catalog bounded on 100-1000 node graphs by preferring actions near belief
+    mass, high-value assets, true goals, decoys, and critical transitions while
+    penalizing operational cost.
+    """
+    if belief_state is None:
+        belief_state = getattr(graph, "belief_state", None) or graph.start_distribution
+
+    true_goals = set(graph.true_goals)
+    decoys = set(graph.decoy_sites)
+    high_risk_nodes = set()
+    for path in getattr(graph, "get_high_risk_paths", lambda: [])():
+        high_risk_nodes.update(path)
+
+    def node_value(node: int) -> float:
+        meta = getattr(graph, "node_metadata", {}).get(node, {}) or {}
+        value = float(meta.get("value", 0.0) or 0.0)
+        criticality = float(meta.get("business_criticality", value) or 0.0)
+        return max(value, criticality)
+
+    def action_score(action) -> float:
+        target = getattr(action, "target_node", None)
+        score = 0.0
+        if target is not None:
+            score += 3.0 * float(belief_state.get(target, 0.0))
+            score += 1.2 * node_value(target)
+            if target in decoys:
+                score += 0.6
+            if target in true_goals:
+                score += 0.4
+            if target in high_risk_nodes:
+                score += 0.5
+
+        edge = getattr(action, "target_edge", None)
+        if edge:
+            src, dst = edge
+            score += 2.0 * float(belief_state.get(src, 0.0))
+            score += 1.4 * node_value(dst)
+            if dst in true_goals or dst in high_risk_nodes:
+                score += 0.8
+
+        score += 0.5 * float(getattr(action, "realism_score", 0.0) or 0.0)
+        score += 0.4 * float(getattr(action, "reward_delta", 0.0) or 0.0)
+        score += 0.2 * float(getattr(action, "edge_cost_delta", 0.0) or 0.0)
+        score -= 0.18 * compute_composite_cost(action, graph).total
+        score -= 0.35 * float(getattr(action, "risk_score", 0.0) or 0.0)
+        return score
+
+    ranked = sorted(actions, key=action_score, reverse=True)
+    if limit is not None and limit > 0:
+        return ranked[:limit]
+    return ranked
 
 
 def build_hierarchical_subgraph(

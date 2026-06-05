@@ -202,8 +202,14 @@ python run_mirage.py [--mode <mode>]
 | `python run_mirage.py --mode step2` | Bước 2: Đắp thịt (Layer 3+6+Attackers) | ~15 giây |
 | `python run_mirage.py --mode step3` | Bước 3: Gắn mắt phanh (Layer 1+5) | ~5 giây |
 | `python run_mirage.py --mode benchmark` | Benchmark đầy đủ 6 phương pháp | ~2-3 phút |
+| `python run_mirage.py --mode benchmark_a` | Benchmark A: attacker bắt đầu từ Internet/Entry Point | ~1-2 phút |
+| `python run_mirage.py --mode benchmark_b` | Benchmark B: belief-conditioned response, attacker đã ở giữa mạng | ~1-2 phút |
+| `python run_mirage.py --mode multi_seed` | Benchmark A+B qua nhiều seed để lấy mean/std và confidence interval | ~20-40 phút |
+| `python run_mirage.py --mode scaling` | Scaling benchmark trên synthetic graph 100/500/1000 node | ~3-10 phút |
 | `python run_mirage.py --mode ablation` | Ablation study phân tích đóng góp từng component | ~1 phút |
 | `python run_mirage.py --mode graph` | Hiển thị thông tin đồ thị tấn công | < 1 giây |
+
+> Thời gian chạy là ước tính trên máy phát triển thông thường. Các mode `multi_seed` và `scaling` có thể lâu hơn nếu CPU chậm hoặc số episode/candidate được tăng lên.
 
 ### Ví dụ output — `--mode step2`
 
@@ -232,6 +238,11 @@ Quick Comparison (3 methods):
 |------|----------|
 | `mirage_benchmark.png` | Biểu đồ so sánh 6 phương pháp phòng thủ |
 | `mirage_benchmark_results.json` | Kết quả benchmark dạng JSON |
+| `benchmark_a_results.json` | Kết quả Benchmark A: entry-point attack |
+| `benchmark_b_results.json` | Kết quả Benchmark B: belief-conditioned response |
+| `multi_seed_benchmark_a_results.json` | Kết quả multi-seed cho Benchmark A |
+| `multi_seed_benchmark_b_results.json` | Kết quả multi-seed cho Benchmark B |
+| `scaling_benchmark_results.json` | Kết quả scaling benchmark trên graph 100/500/1000 node |
 | `mirage_audit_log.jsonl` | Nhật ký kiểm toán (audit log) từ Safety Gate |
 
 ---

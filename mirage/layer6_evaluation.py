@@ -46,6 +46,7 @@ class MethodResult:
     robustness_gap: float             # optimistic - pessimistic (nhỏ hơn = tốt hơn)
     total_cost: float                 # Chi phí triển khai
     per_attacker_type: Dict[str, float] = field(default_factory=dict)
+    cost_model: Dict = field(default_factory=dict)
     runtime_seconds: float = 0.0
 
     def to_row(self) -> List:
@@ -146,11 +147,38 @@ class MIRAGEEvaluator:
                     }
         return graph_copy
 
+    def _empty_cost_model(self) -> Dict:
+        return {
+            "total": 0.0,
+            "false_positive_cost": 0.0,
+            "action_count": 0,
+            "per_action": [],
+        }
+
+    def _cost_model_for_actions(self, actions: List) -> Dict:
+        from mirage.mdp_solver import compute_portfolio_cost
+
+        if not actions:
+            return self._empty_cost_model()
+        return compute_portfolio_cost(actions, self.graph)
+
+    def _catalog_action(self, action_type: str, target_node: int):
+        from mirage.layer3_deception import DeceptionFabric
+
+        fabric = DeceptionFabric(self.graph)
+        for action in fabric.action_catalog:
+            if action.action_type.value == action_type and action.target_node == target_node:
+                return action
+        for action in fabric.action_catalog:
+            if action.target_node == target_node:
+                return action
+        return None
+
     def _get_reward_interventions_for_method(
         self,
         method: str,
         start_distribution=None,
-    ) -> Tuple[Dict[Tuple, str], List[Tuple[int, int, float]]]:
+    ) -> Tuple[Dict[Tuple, float], List[Tuple[int, int, float]], Dict]:
         """
         Tạo reward interventions theo phương pháp.
 
@@ -164,27 +192,43 @@ class MIRAGEEvaluator:
         rng = random.Random(self.seed)
 
         if method == "no_defense":
-            return {}, []
+            return {}, [], self._empty_cost_model()
 
         elif method == "random_deception":
             # Đặt decoy ngẫu nhiên
             possible_nodes = [DB_FAKE, RTR_FAKE, WS_FIN, SMB_SHARE, SVC_CRED]
             chosen = rng.choice(possible_nodes)
-            return {(chosen, "end"): rng.uniform(0.3, 0.9)}, []
+            action = (
+                self._catalog_action("deploy_decoy_database", chosen)
+                or self._catalog_action("scatter_honey_credential", chosen)
+                or self._catalog_action("deploy_decoy_router", chosen)
+            )
+            actions = [action] if action else []
+            return {(chosen, "end"): rng.uniform(0.3, 0.9)}, [], self._cost_model_for_actions(actions)
 
         elif method == "static_honeypot":
             # Honeypot cố định tại decoy nodes đã biết
             return {
                 (DB_FAKE, "end"):  0.7,
                 (RTR_FAKE, "end"): 0.5,
-            }, []
+            }, [], self._cost_model_for_actions([
+                a for a in [
+                    self._catalog_action("deploy_decoy_database", DB_FAKE),
+                    self._catalog_action("deploy_decoy_router", RTR_FAKE),
+                ] if a
+            ])
 
         elif method == "greedy_top_k":
             # Đặt decoy ở node có reward potential cao nhất gần True Goal
             return {
                 (DB_FAKE, "end"):  0.85,  # Gần True Goal nhất
                 (SVC_CRED, "end"): 0.60,  # Credential node có giá trị cao
-            }, []
+            }, [], self._cost_model_for_actions([
+                a for a in [
+                    self._catalog_action("deploy_decoy_database", DB_FAKE),
+                    self._catalog_action("scatter_honey_credential", SVC_CRED),
+                ] if a
+            ])
 
         elif method == "standard_rl":
             # Standard RL: dùng CÙNG engine, tối ưu EXPECTED value (criterion="expected").
@@ -205,7 +249,11 @@ class MIRAGEEvaluator:
                 criterion="expected",          # <-- Maximize AVERAGE value
                 belief_state=start_distribution, # <-- Same belief as robust_mirage
             )
-            return portfolio_result.get("combined_interventions", {}), portfolio_result.get("edge_cost_edits", [])
+            return (
+                portfolio_result.get("combined_interventions", {}),
+                portfolio_result.get("edge_cost_edits", []),
+                portfolio_result.get("cost_breakdown", self._empty_cost_model()),
+            )
 
         elif method == "robust_mirage":
             # Robust MIRAGE: dùng CÙNG engine, tối ưu PESSIMISTIC value (criterion="pessimistic").
@@ -225,15 +273,20 @@ class MIRAGEEvaluator:
                 criterion="pessimistic",        # <-- Maximize WORST-CASE value (robust)
                 belief_state=start_distribution, # <-- Same belief as standard_rl
             )
-            return portfolio_result.get("combined_interventions", {}), portfolio_result.get("edge_cost_edits", [])
+            return (
+                portfolio_result.get("combined_interventions", {}),
+                portfolio_result.get("edge_cost_edits", []),
+                portfolio_result.get("cost_breakdown", self._empty_cost_model()),
+            )
 
-        return {}, []
+        return {}, [], self._empty_cost_model()
 
     def _compute_metrics_for_method(
         self,
         method: str,
         reward_interventions: Dict,
         edge_cost_edits: List[Tuple[int, int, float]],
+        cost_model: Optional[Dict] = None,
         start_distribution: Optional[Dict[int, float]] = None,
     ) -> MethodResult:
         """Tính tất cả metrics cho một phương pháp."""
@@ -341,9 +394,10 @@ class MIRAGEEvaluator:
         hit_true_goal_rate = sum(hit_rates) / len(hit_rates)
         time_to_compromise = sum(avg_steps_list) / len(avg_steps_list)
 
-        # False positive cost: ước lượng dựa trên số action + chi phí vận hành
-        n_actions = len([v for v in reward_interventions.values() if v > 0]) + len(edge_cost_edits)
-        false_positive_cost = n_actions * 0.05 + hit_true_goal_rate * 0.1
+        # Operational cost comes from the same composite model used by Layer 4.
+        if cost_model is None:
+            cost_model = self._empty_cost_model()
+        false_positive_cost = float(cost_model.get("false_positive_cost", 0.0))
 
         # Pessimistic = min defender value (worst-case attacker)
         pessimistic_value = min(all_defender_values)
@@ -352,7 +406,7 @@ class MIRAGEEvaluator:
         robustness_gap = optimistic_value - pessimistic_value
 
         # Chi phí tổng
-        total_cost = n_actions * 1.0  # Simplified cost model
+        total_cost = float(cost_model.get("total", 0.0))
 
         runtime = time.time() - t0
 
@@ -367,6 +421,7 @@ class MIRAGEEvaluator:
             robustness_gap=robustness_gap,
             total_cost=total_cost,
             per_attacker_type=per_attacker,
+            cost_model=cost_model,
             runtime_seconds=runtime,
         )
 
@@ -401,12 +456,13 @@ class MIRAGEEvaluator:
                 print(f"\n[{method}] Running...")
             # Truyền start_distribution vào _get_reward_interventions_for_method
             # để standard_rl và robust_mirage đều optimize dưới cùng belief (Benchmark B).
-            interventions, edge_edits = self._get_reward_interventions_for_method(
+            interventions, edge_edits, cost_model = self._get_reward_interventions_for_method(
                 method, start_distribution=start_distribution
             )
             result = self._compute_metrics_for_method(
                 method, interventions,
                 edge_cost_edits=edge_edits,
+                cost_model=cost_model,
                 start_distribution=start_distribution,
             )
             self.results[method] = result
@@ -449,6 +505,128 @@ class MIRAGEEvaluator:
             start_distribution=self.BENCHMARK_B_BELIEF,
             benchmark_label="B",
         )
+
+    def run_scaling_benchmark(
+        self,
+        node_sizes: Optional[List[int]] = None,
+        max_candidates: int = 30,
+        n_attacker_samples: int = 60,
+        verbose: bool = True,
+    ) -> Dict[int, Dict]:
+        """
+        Measure optimizer scaling on synthetic 100/500/1000-node graphs.
+
+        This benchmark focuses on tractability: catalog size, pruned candidate
+        count, selected portfolio size, cost, robust value, and runtime.
+        """
+        from mirage.layer2_attack_graph import build_synthetic_enterprise_graph
+        from mirage.layer3_deception import DeceptionFabric
+        from mirage.layer4_decision_engine import RobustDecisionEngine
+        from mirage.mdp_solver import prune_action_space, rank_action_candidates
+
+        if node_sizes is None:
+            node_sizes = [100, 500, 1000]
+
+        results: Dict[int, Dict] = {}
+        if verbose:
+            print("\n" + "=" * 70)
+            print("MIRAGE Scaling Benchmark -- candidate pruning on large graphs")
+            print("=" * 70)
+            print(
+                f"  {'Nodes':>7s} | {'Catalog':>7s} | {'Pruned':>7s} | "
+                f"{'Ranked':>7s} | {'Portfolio':>9s} | {'Cost':>7s} | {'Runtime':>8s}"
+            )
+            print("  " + "-" * 68)
+
+        for n_nodes in node_sizes:
+            graph = build_synthetic_enterprise_graph(
+                n_nodes=n_nodes,
+                budget=12.0,
+                seed=self.seed,
+            )
+            belief_nodes = [
+                s for s, meta in graph.node_metadata.items()
+                if meta.get("layer") in {"internal", "services", "credentials"}
+                and s != graph.sink_state
+            ][:8]
+            belief = {
+                node: 1.0 / max(1, len(belief_nodes))
+                for node in belief_nodes
+            } or graph.start_distribution
+
+            t0 = time.time()
+            fabric = DeceptionFabric(graph, max_actions_per_type=50)
+            catalog_size = len(fabric.action_catalog)
+            available = fabric.get_available_actions(graph.budget)
+            focus = set(prune_action_space(
+                graph,
+                belief,
+                top_k_states=min(80, max(20, int(n_nodes ** 0.5) * 2)),
+            ))
+            pruned = [
+                action for action in available
+                if (
+                    action.target_node in focus
+                    or (
+                        action.target_edge
+                        and (action.target_edge[0] in focus or action.target_edge[1] in focus)
+                    )
+                )
+            ]
+            ranked = rank_action_candidates(
+                pruned,
+                graph,
+                belief_state=belief,
+                limit=max_candidates,
+            )
+
+            engine = RobustDecisionEngine(
+                graph,
+                fabric,
+                n_attacker_samples=n_attacker_samples,
+                use_robust_milp=False,
+                seed=self.seed,
+            )
+            portfolio, result = engine.optimize_portfolio(
+                budget=graph.budget,
+                belief_state=belief,
+                criterion="pessimistic",
+                max_candidates=max_candidates,
+            )
+            runtime = time.time() - t0
+
+            row = {
+                "nodes": n_nodes,
+                "catalog_actions": catalog_size,
+                "budget_feasible_actions": len(available),
+                "pruned_actions": len(pruned),
+                "ranked_actions": len(ranked),
+                "portfolio_size": len(portfolio),
+                "portfolio_cost": result.get("total_cost", 0.0),
+                "false_positive_cost": result.get("false_positive_cost", 0.0),
+                "pessimistic_value": result.get("pessimistic_value", 0.0),
+                "selection_value": result.get("selection_value", 0.0),
+                "runtime_seconds": runtime,
+            }
+            results[n_nodes] = row
+
+            if verbose:
+                print(
+                    f"  {n_nodes:7d} | {catalog_size:7d} | {len(pruned):7d} | "
+                    f"{len(ranked):7d} | {len(portfolio):9d} | "
+                    f"{row['portfolio_cost']:7.2f} | {runtime:7.2f}s"
+                )
+
+        out_path = os.path.join(self.results_dir, "scaling_benchmark_results.json")
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(results, f, indent=2)
+            if verbose:
+                print(f"\nScaling results saved to: {out_path}")
+        except Exception as e:
+            print(f"Could not save scaling results: {e}")
+
+        return results
 
     def print_comparison_table(self) -> None:
         """In bảng so sánh chuẩn."""
@@ -693,6 +871,8 @@ class MIRAGEEvaluator:
                 "pessimistic_value": result.pessimistic_value,
                 "optimistic_value": result.optimistic_value,
                 "robustness_gap": result.robustness_gap,
+                "total_cost": result.total_cost,
+                "cost_model": result.cost_model,
                 "per_attacker_type": result.per_attacker_type,
                 "runtime_seconds": result.runtime_seconds,
             }
