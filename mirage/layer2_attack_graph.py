@@ -34,6 +34,7 @@ from __future__ import annotations
 import sys
 import os
 import random
+import copy
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -69,6 +70,16 @@ NODE_DEFINITIONS = {
     # ---- SINK ----
     14: {"label": "Sink",                  "layer": "sink",       "asset_type": "sink",        "is_real": True,  "value": 0.0},
 }
+
+for _node_id, _metadata in NODE_DEFINITIONS.items():
+    _internal = _metadata["label"]
+    _metadata["internal_label"] = _internal
+    _metadata["attacker_visible_label"] = {
+        11: "FinanceDB_Replica",
+        12: "CoreService_Gateway",
+    }.get(_node_id, _internal)
+    _metadata["service_banner"] = _metadata["attacker_visible_label"]
+    _metadata["realism_score"] = 0.8 if _node_id in {11, 12} else 1.0
 
 # Node IDs
 INTERNET   = 0
@@ -135,6 +146,8 @@ class MIRAGEAttackGraph:
     node_metadata: Dict[int, Dict] = field(default_factory=dict)
     edge_costs: Dict[Tuple[int, int], float] = field(default_factory=dict)  # (src, dst) → cost
     belief_state: Dict[int, float] = field(default_factory=dict)  # P(attacker at node s)
+    active_decoy_sites: List[int] = field(default_factory=list)
+    decoy_transition_templates: Dict[Tuple[int, str], Dict[int, float]] = field(default_factory=dict)
 
     @property
     def name(self) -> str:
@@ -146,8 +159,12 @@ class MIRAGEAttackGraph:
     def get_node_info(self, state: int) -> Dict:
         return self.node_metadata.get(state, {})
 
+    def attacker_label(self, state: int) -> str:
+        meta = self.node_metadata.get(state, {})
+        return meta.get("attacker_visible_label", meta.get("label", self.label(state)))
+
     def is_decoy(self, state: int) -> bool:
-        return state in self.decoy_sites
+        return state in self.active_decoy_sites
 
     def is_true_goal(self, state: int) -> bool:
         return state in self.true_goals
@@ -223,6 +240,151 @@ class MIRAGEAttackGraph:
                 for d in self.decoy_sites
             ],
         }
+
+
+def _normalize_distribution(
+    distribution: Dict[int, float],
+    sink_state: int,
+) -> Dict[int, float]:
+    positive = {
+        state: max(0.0, float(prob))
+        for state, prob in distribution.items()
+        if prob > 0
+    }
+    total = sum(positive.values())
+    if total <= 0:
+        return {sink_state: 1.0}
+    return {state: prob / total for state, prob in positive.items()}
+
+
+def initialize_decoy_slots(graph: MIRAGEAttackGraph) -> MIRAGEAttackGraph:
+    """
+    Store incoming decoy routes as templates and return a clean live graph.
+
+    ``decoy_sites`` are potential slots. A slot is not reachable and is not a
+    decoy outcome until a matching deploy action activates it.
+    """
+    potential = set(graph.decoy_sites)
+    graph.active_decoy_sites = []
+    graph.decoy_transition_templates = {}
+
+    for src in graph.states:
+        for action in graph.available_actions.get(src, []):
+            distribution = graph.transitions.get(src, {}).get(action, {})
+            if not distribution or not any(dst in potential for dst in distribution):
+                continue
+            graph.decoy_transition_templates[(src, action)] = copy.deepcopy(distribution)
+            clean = {
+                dst: prob
+                for dst, prob in distribution.items()
+                if dst not in potential
+            }
+            graph.transitions[src][action] = _normalize_distribution(
+                clean,
+                graph.sink_state,
+            )
+    return graph
+
+
+def build_runtime_graph(
+    graph: MIRAGEAttackGraph,
+    actions: Optional[List[object]] = None,
+    edge_cost_edits: Optional[List[Tuple[int, int, float]]] = None,
+) -> MIRAGEAttackGraph:
+    """
+    Build the graph shared by simulation and exact MDP evaluation.
+
+    Deploy actions activate decoy slots. Edge-cost actions alter transition
+    probabilities. Reward interventions are deliberately excluded because
+    they only change the attacker's perceived reward.
+    """
+    runtime = copy.deepcopy(graph)
+    actions = list(actions or [])
+    deploy_types = {"deploy_decoy_database", "deploy_decoy_router"}
+
+    active = set()
+    inferred_edge_edits: List[Tuple[int, int, float]] = []
+    action_by_node: Dict[int, object] = {}
+    for action in actions:
+        action_type = getattr(getattr(action, "action_type", None), "value", "")
+        if action_type in deploy_types:
+            node = int(getattr(action, "target_node"))
+            active.add(node)
+            action_by_node[node] = action
+        target_edge = getattr(action, "target_edge", None)
+        edge_delta = float(getattr(action, "edge_cost_delta", 0.0) or 0.0)
+        if action_type == "increase_edge_cost" and target_edge and edge_delta > 0:
+            inferred_edge_edits.append((target_edge[0], target_edge[1], edge_delta))
+
+    runtime.active_decoy_sites = sorted(active)
+    inactive_slots = set(runtime.decoy_sites) - active
+
+    for (src, action), template in runtime.decoy_transition_templates.items():
+        if src not in runtime.transitions or action not in runtime.transitions[src]:
+            continue
+        enabled = {
+            dst: prob
+            for dst, prob in template.items()
+            if dst not in inactive_slots
+        }
+        runtime.transitions[src][action] = _normalize_distribution(
+            enabled,
+            runtime.sink_state,
+        )
+
+    for node in active:
+        metadata = runtime.node_metadata.setdefault(node, {})
+        deploy_action = action_by_node.get(node)
+        realism = float(getattr(deploy_action, "realism_score", 0.8) or 0.8)
+        metadata["realism_score"] = realism
+        metadata["behavioral_signal"] = max(0.0, 1.0 - realism)
+        metadata.setdefault(
+            "service_banner",
+            metadata.get("attacker_visible_label", runtime.label(node)),
+        )
+        runtime.defender_reward[(node, "end")] = max(
+            1.0,
+            runtime.defender_reward.get((node, "end"), 0.0),
+        )
+
+    all_edge_edits = list(edge_cost_edits or inferred_edge_edits)
+    for src, dst, delta in all_edge_edits:
+        if src not in runtime.transitions:
+            continue
+        runtime.edge_costs[(src, dst)] = runtime.edge_costs.get((src, dst), 0.0) + delta
+        for action in runtime.available_actions.get(src, []):
+            distribution = runtime.transitions[src].get(action, {})
+            if dst not in distribution or distribution[dst] <= 0:
+                continue
+            old_probability = distribution[dst]
+            reduction = min(old_probability * 0.65, max(0.0, delta) * 0.12)
+            if reduction <= 0:
+                continue
+            updated = dict(distribution)
+            updated[dst] = max(0.0, old_probability - reduction)
+            updated[runtime.sink_state] = (
+                updated.get(runtime.sink_state, 0.0) + reduction
+            )
+            runtime.transitions[src][action] = _normalize_distribution(
+                updated,
+                runtime.sink_state,
+            )
+
+    return runtime
+
+
+def apply_runtime_graph_in_place(
+    graph: MIRAGEAttackGraph,
+    actions: Optional[List[object]] = None,
+    edge_cost_edits: Optional[List[Tuple[int, int, float]]] = None,
+) -> MIRAGEAttackGraph:
+    runtime = build_runtime_graph(graph, actions=actions, edge_cost_edits=edge_cost_edits)
+    graph.transitions = runtime.transitions
+    graph.active_decoy_sites = runtime.active_decoy_sites
+    graph.edge_costs = runtime.edge_costs
+    graph.node_metadata = runtime.node_metadata
+    graph.defender_reward = runtime.defender_reward
+    return graph
 
 
 def build_enterprise_attack_graph(
@@ -393,7 +555,11 @@ def build_enterprise_attack_graph(
     }
 
     # ---- STATE LABELS ----
-    state_labels = {k: v["label"] for k, v in NODE_DEFINITIONS.items()}
+    node_metadata = copy.deepcopy(NODE_DEFINITIONS)
+    for slot in DECOY_SITES:
+        node_metadata[slot]["realism_score"] = decoy_realism
+        node_metadata[slot]["behavioral_signal"] = max(0.0, 1.0 - decoy_realism)
+    state_labels = {k: v["label"] for k, v in node_metadata.items()}
 
     # ---- BUILD GRAPH ----
     graph = MIRAGEAttackGraph(
@@ -410,10 +576,11 @@ def build_enterprise_attack_graph(
         state_labels=state_labels,
         attacker_reward=attacker_reward,
         defender_reward=defender_reward,
-        node_metadata=NODE_DEFINITIONS,
+        node_metadata=node_metadata,
     )
 
     # Khởi tạo belief state uniform
+    initialize_decoy_slots(graph)
     n_active = len(states) - 1
     graph.belief_state = {s: 1.0/n_active for s in states if s != SINK}
 
@@ -633,6 +800,22 @@ def build_synthetic_enterprise_graph(
         attacker_reward[(node, "end")] = 0.8
         defender_reward[(node, "end")] = -1.4
 
+    for node, metadata in node_metadata.items():
+        internal_label = metadata.get("label", state_labels.get(node, str(node)))
+        metadata["internal_label"] = internal_label
+        if node in decoy_sites:
+            visible = (
+                f"DataReplica_{node}"
+                if metadata.get("asset_type") == "decoy_db"
+                else f"ServiceGateway_{node}"
+            )
+            metadata["realism_score"] = 0.8
+        else:
+            visible = internal_label
+            metadata["realism_score"] = 1.0
+        metadata["attacker_visible_label"] = visible
+        metadata["service_banner"] = visible
+
     graph = MIRAGEAttackGraph(
         states=states,
         actions=ACTIONS,
@@ -649,6 +832,7 @@ def build_synthetic_enterprise_graph(
         defender_reward=defender_reward,
         node_metadata=node_metadata,
     )
+    initialize_decoy_slots(graph)
     n_active = len(states) - 1
     graph.belief_state = {s: 1.0 / n_active for s in states if s != sink}
     return graph

@@ -120,7 +120,7 @@ class BaseAttacker(ABC):
             if step.is_terminal:
                 # Kiểm tra kết thúc tại đâu
                 hit_true = step.state in self.graph.true_goals
-                hit_decoy = step.state in self.graph.decoy_sites
+                hit_decoy = self.graph.is_decoy(step.state)
                 return hit_true, hit_decoy, self.steps_taken
         return False, False, self.steps_taken
 
@@ -519,19 +519,20 @@ class DeceptionAwareAttacker(BaseAttacker):
             if n_actions <= 1:
                 score += 0.30  # Terminal node → có thể là decoy hoặc true goal
 
-            # --- Heuristic 2: Attacker reward = 0.0 tại dead-end ---
-            end_reward = self.graph.attacker_reward.get((s, "end"), None)
-            if end_reward is not None and end_reward == 0.0 and n_actions <= 1:
-                # Terminal node với reward = 0 → rất có thể là decoy
-                score += 0.40
+            metadata = self.graph.get_node_info(s)
+            realism = float(metadata.get("realism_score", 1.0) or 1.0)
+            behavioral_signal = float(metadata.get("behavioral_signal", 0.0) or 0.0)
+            score += max(0.0, 1.0 - realism) * 0.35
+            score += min(1.0, behavioral_signal) * 0.35
 
-            # --- Heuristic 3: Label keyword matching ---
+            # --- Heuristic 2: attacker-visible label/banner matching ---
             if self.label_awareness:
-                label = self.graph.label(s).lower()
+                label = self.graph.attacker_label(s).lower()
+                banner = str(metadata.get("service_banner", "")).lower()
                 for kw in self.SUSPICIOUS_LABEL_KEYWORDS:
-                    if kw in label:
+                    if kw in label or kw in banner:
                         score += 0.35
-                        break  # Chỉ cộng một lần dù match nhiều keyword
+                        break
 
             suspicion[s] = min(1.0, score)
 

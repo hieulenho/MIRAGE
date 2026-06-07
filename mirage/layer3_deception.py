@@ -450,6 +450,7 @@ class DeceptionFabric:
     def __init__(self, graph, max_actions_per_type: int = 40):
         self.graph = graph
         self.active_decoys: Dict[str, ActiveDecoy] = {}
+        self.deployed_actions: List[DeceptionAction] = []
         self.action_catalog = get_action_catalog(graph, max_actions_per_type=max_actions_per_type)
         self.engagement_log: List[Dict] = []
         self.total_cost_spent: float = 0.0
@@ -488,6 +489,10 @@ class DeceptionFabric:
             self._increase_edge_cost(action)
 
         # Tạo ActiveDecoy record
+        self.deployed_actions.append(action)
+        from mirage.layer2_attack_graph import apply_runtime_graph_in_place
+        apply_runtime_graph_in_place(self.graph, actions=self.deployed_actions)
+
         decoy = ActiveDecoy(
             decoy_id=decoy_id,
             action=action,
@@ -506,9 +511,7 @@ class DeceptionFabric:
         # Tăng reward tại decoy node để kéo attacker
         self.reward_interventions[(node, "end")] = action.reward_delta
         # Đảm bảo node là decoy site nếu chưa phải
-        if node not in self.graph.decoy_sites:
-            self.graph.decoy_sites.append(node)
-        print(f"  [🪤 Deception] Fake Database deployed at Node {node} "
+        print(f"  [Deception] Fake Database deployed at Node {node} "
               f"({self.graph.label(node)}) | Reward bait: +{action.reward_delta:.1f}")
 
     def _deploy_decoy_router(self, action: DeceptionAction) -> None:
@@ -518,10 +521,7 @@ class DeceptionFabric:
         # Tăng edge cost đến router giả (attacker bị giữ lại lâu hơn)
         if action.edge_cost_delta > 0 and action.target_edge:
             src, dst = action.target_edge
-            self.graph.increase_edge_cost(src, dst, action.edge_cost_delta)
-        if node not in self.graph.decoy_sites:
-            self.graph.decoy_sites.append(node)
-        print(f"  [🪤 Deception] Fake Router deployed at Node {node} "
+        print(f"  [Deception] Fake Router deployed at Node {node} "
               f"({self.graph.label(node)}) | Edge cost +{action.edge_cost_delta:.1f}")
 
     def _scatter_honey_credential(self, action: DeceptionAction) -> None:
@@ -529,15 +529,14 @@ class DeceptionFabric:
         node = action.target_node
         self.reward_interventions[(node, "cred_dump")] = action.reward_delta * 0.5
         self.reward_interventions[(node, "end")] = action.reward_delta * 0.3
-        print(f"  [🍯 Honey] Honey Credential planted at Node {node} "
+        print(f"  [Honey] Honey Credential planted at Node {node} "
               f"({self.graph.label(node)}) | Trigger reward: +{action.reward_delta:.1f}")
 
     def _increase_edge_cost(self, action: DeceptionAction) -> None:
         """Tăng cost edge — làm khó attacker trên con đường cụ thể."""
         if action.target_edge:
             src, dst = action.target_edge
-            self.graph.increase_edge_cost(src, dst, action.edge_cost_delta)
-            print(f"  [🚧 Cost↑] Edge cost increased: Node {src} → Node {dst} "
+            print(f"  [Edge Cost] Edge cost increased: Node {src} -> Node {dst} "
                   f"| Delta: +{action.edge_cost_delta:.2f}")
 
     def record_engagement(self, decoy_id: str, attacker_info: str = "") -> Dict:
@@ -564,13 +563,25 @@ class DeceptionFabric:
     def retire_expired_decoys(self) -> List[str]:
         """Thu hồi các decoy đã hết hạn."""
         retired = []
+        retired_actions = []
         for did, decoy in list(self.active_decoys.items()):
             if decoy.should_retire():
                 decoy.status = DecoyStatus.RETIRED
-                # Xóa reward intervention
-                key = (decoy.action.target_node, "end")
-                self.reward_interventions.pop(key, None)
+                action = decoy.action
+                self.reward_interventions.pop((action.target_node, "end"), None)
+                self.reward_interventions.pop((action.target_node, "cred_dump"), None)
+                retired_actions.append(action)
+                self.active_decoys.pop(did, None)
                 retired.append(did)
+        if retired_actions:
+            retired_ids = {id(action) for action in retired_actions}
+            self.deployed_actions = [
+                action
+                for action in self.deployed_actions
+                if id(action) not in retired_ids
+            ]
+            from mirage.layer2_attack_graph import apply_runtime_graph_in_place
+            apply_runtime_graph_in_place(self.graph, actions=self.deployed_actions)
         return retired
 
     def get_interception_rate(self) -> float:
@@ -580,11 +591,21 @@ class DeceptionFabric:
 
     def summary(self) -> str:
         """In tóm tắt trạng thái Deception Fabric."""
+        deploy_types = {
+            DeceptionActionType.DEPLOY_DECOY_DATABASE,
+            DeceptionActionType.DEPLOY_DECOY_ROUTER,
+        }
+        active_assets = sum(
+            1
+            for deployment in self.active_decoys.values()
+            if deployment.action.action_type in deploy_types
+        )
         lines = [
             "=" * 60,
             "MIRAGE Layer 3 — Deception Fabric Status",
             "=" * 60,
-            f"Active Decoys:    {len(self.active_decoys)}",
+            f"Active Actions:   {len(self.active_decoys)}",
+            f"Active Decoys:    {active_assets}",
             f"Total Cost Spent: {self.total_cost_spent:.1f}",
             f"Total Engagements:{sum(d.engagement_count for d in self.active_decoys.values())}",
             "",
@@ -593,13 +614,13 @@ class DeceptionFabric:
         for did, decoy in self.active_decoys.items():
             lines.append(
                 f"  [{did}] {decoy.action.action_type.value:30s} "
-                f"→ Node {decoy.action.target_node} ({self.graph.label(decoy.action.target_node)}) "
+                f"-> Node {decoy.action.target_node} ({self.graph.label(decoy.action.target_node)}) "
                 f"| Status: {decoy.status.value} | Engaged: {decoy.engagement_count}x"
             )
         lines.append("")
         lines.append("Reward Interventions:")
         for (node, act), delta in self.reward_interventions.items():
-            lines.append(f"  Node {node} ({self.graph.label(node)}) | action={act} → delta={delta:.2f}")
+            lines.append(f"  Node {node} ({self.graph.label(node)}) | action={act} -> delta={delta:.2f}")
         return "\n".join(lines)
 
 

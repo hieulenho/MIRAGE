@@ -9,7 +9,7 @@ MIRAGE - Layer 6: Evaluation, Benchmarks & Visualization
   3. static_honeypot   — Honeypot cố định (kinh nghiệm)
   4. greedy_top_k      — Đặt decoy ở node có value cao nhất
   5. standard_rl       — Tối ưu expected value (criterion="expected") dùng cùng engine
-  6. robust_mirage     — MIRAGE: tối ưu pessimistic/robust value (criterion="pessimistic")
+  6. robust_mirage     — MIRAGE: tối ưu cost-aware robust objective
 
 Benchmark A: Attacker bắt đầu từ Internet/Entry — đo năng lực phòng thủ tổng thể.
 Benchmark B: Attacker đã bị nghi ở vị trí giữa mạng — đo năng lực phản ứng theo telemetry.
@@ -31,6 +31,7 @@ import random
 import time
 import os
 import json
+import csv
 
 
 @dataclass
@@ -45,6 +46,8 @@ class MethodResult:
     optimistic_value: float           # Reference
     robustness_gap: float             # optimistic - pessimistic (nhỏ hơn = tốt hơn)
     total_cost: float                 # Chi phí triển khai
+    security_loss: float = 0.0
+    portfolio_actions: List[str] = field(default_factory=list)
     per_attacker_type: Dict[str, float] = field(default_factory=dict)
     cost_model: Dict = field(default_factory=dict)
     runtime_seconds: float = 0.0
@@ -120,32 +123,8 @@ class MIRAGEEvaluator:
         xác suất đó và phân phối lại theo tỷ lệ sang các real neighbors còn lại.
         Nếu không còn real neighbor nào thì redirect về Sink.
         """
-        import copy
-        graph_copy = copy.deepcopy(self.graph)
-        decoy_set = set(graph_copy.decoy_sites)
-
-        for src in graph_copy.states:
-            for action in graph_copy.available_actions.get(src, []):
-                trans = graph_copy.transitions[src][action]
-                decoy_prob = sum(p for ns, p in trans.items() if ns in decoy_set)
-                if decoy_prob <= 0:
-                    continue  # Không có decoy trong transition này
-
-                # Giữ lại các real neighbors
-                real_trans = {ns: p for ns, p in trans.items() if ns not in decoy_set}
-                if real_trans:
-                    # Phân phối lại decoy_prob theo tỷ lệ vào real nodes
-                    total_real = sum(real_trans.values())
-                    scale = (total_real + decoy_prob) / total_real
-                    graph_copy.transitions[src][action] = {
-                        ns: p * scale for ns, p in real_trans.items()
-                    }
-                else:
-                    # Không còn real neighbor → redirect toàn bộ về Sink
-                    graph_copy.transitions[src][action] = {
-                        graph_copy.sink_state: 1.0
-                    }
-        return graph_copy
+        from mirage.layer2_attack_graph import build_runtime_graph
+        return build_runtime_graph(self.graph, actions=[])
 
     def _empty_cost_model(self) -> Dict:
         return {
@@ -174,11 +153,39 @@ class MIRAGEEvaluator:
                 return action
         return None
 
+    def _effects_for_actions(self, actions: List) -> Tuple[Dict, List[Tuple[int, int, float]]]:
+        from mirage.layer3_deception import DeceptionActionType
+
+        rewards: Dict = {}
+        edge_edits: List[Tuple[int, int, float]] = []
+        for action in actions:
+            if action.action_type in {
+                DeceptionActionType.DEPLOY_DECOY_DATABASE,
+                DeceptionActionType.DEPLOY_DECOY_ROUTER,
+            }:
+                key = (action.target_node, "end")
+                rewards[key] = rewards.get(key, 0.0) + action.reward_delta
+            elif action.action_type == DeceptionActionType.SCATTER_HONEY_CREDENTIAL:
+                cred_key = (action.target_node, "cred_dump")
+                end_key = (action.target_node, "end")
+                rewards[cred_key] = rewards.get(cred_key, 0.0) + action.reward_delta * 0.5
+                rewards[end_key] = rewards.get(end_key, 0.0) + action.reward_delta * 0.3
+            elif action.action_type == DeceptionActionType.INCREASE_EDGE_COST:
+                if action.target_edge:
+                    edge_edits.append(
+                        (
+                            action.target_edge[0],
+                            action.target_edge[1],
+                            action.edge_cost_delta,
+                        )
+                    )
+        return rewards, edge_edits
+
     def _get_reward_interventions_for_method(
         self,
         method: str,
         start_distribution=None,
-    ) -> Tuple[Dict[Tuple, float], List[Tuple[int, int, float]], Dict]:
+    ) -> Tuple[Dict[Tuple, float], List[Tuple[int, int, float]], Dict, List]:
         """
         Tạo reward interventions theo phương pháp.
 
@@ -192,7 +199,7 @@ class MIRAGEEvaluator:
         rng = random.Random(self.seed)
 
         if method == "no_defense":
-            return {}, [], self._empty_cost_model()
+            return {}, [], self._empty_cost_model(), []
 
         elif method == "random_deception":
             # Đặt decoy ngẫu nhiên
@@ -204,31 +211,28 @@ class MIRAGEEvaluator:
                 or self._catalog_action("deploy_decoy_router", chosen)
             )
             actions = [action] if action else []
-            return {(chosen, "end"): rng.uniform(0.3, 0.9)}, [], self._cost_model_for_actions(actions)
+            rewards, edge_edits = self._effects_for_actions(actions)
+            return rewards, edge_edits, self._cost_model_for_actions(actions), actions
 
         elif method == "static_honeypot":
-            # Honeypot cố định tại decoy nodes đã biết
-            return {
-                (DB_FAKE, "end"):  0.7,
-                (RTR_FAKE, "end"): 0.5,
-            }, [], self._cost_model_for_actions([
+            actions = [
                 a for a in [
                     self._catalog_action("deploy_decoy_database", DB_FAKE),
                     self._catalog_action("deploy_decoy_router", RTR_FAKE),
                 ] if a
-            ])
+            ]
+            rewards, edge_edits = self._effects_for_actions(actions)
+            return rewards, edge_edits, self._cost_model_for_actions(actions), actions
 
         elif method == "greedy_top_k":
-            # Đặt decoy ở node có reward potential cao nhất gần True Goal
-            return {
-                (DB_FAKE, "end"):  0.85,  # Gần True Goal nhất
-                (SVC_CRED, "end"): 0.60,  # Credential node có giá trị cao
-            }, [], self._cost_model_for_actions([
+            actions = [
                 a for a in [
                     self._catalog_action("deploy_decoy_database", DB_FAKE),
                     self._catalog_action("scatter_honey_credential", SVC_CRED),
                 ] if a
-            ])
+            ]
+            rewards, edge_edits = self._effects_for_actions(actions)
+            return rewards, edge_edits, self._cost_model_for_actions(actions), actions
 
         elif method == "standard_rl":
             # Standard RL: dùng CÙNG engine, tối ưu EXPECTED value (criterion="expected").
@@ -244,7 +248,7 @@ class MIRAGEEvaluator:
                 use_robust_milp=False,
                 seed=self.seed,
             )
-            _, portfolio_result = engine.optimize_portfolio(
+            portfolio, portfolio_result = engine.optimize_portfolio(
                 budget=self.graph.budget,
                 criterion="expected",          # <-- Maximize AVERAGE value
                 belief_state=start_distribution, # <-- Same belief as robust_mirage
@@ -253,10 +257,11 @@ class MIRAGEEvaluator:
                 portfolio_result.get("combined_interventions", {}),
                 portfolio_result.get("edge_cost_edits", []),
                 portfolio_result.get("cost_breakdown", self._empty_cost_model()),
+                portfolio,
             )
 
         elif method == "robust_mirage":
-            # Robust MIRAGE: dùng CÙNG engine, tối ưu PESSIMISTIC value (criterion="pessimistic").
+            # Robust MIRAGE: cùng engine, tối ưu cost-aware robust objective.
             # Khi Benchmark B: truyền belief_state để optimize dưới belief điều kiện.
             from mirage.layer3_deception import DeceptionFabric
             from mirage.layer4_decision_engine import RobustDecisionEngine
@@ -268,29 +273,33 @@ class MIRAGEEvaluator:
                 use_robust_milp=False,
                 seed=self.seed,
             )
-            _, portfolio_result = engine.optimize_portfolio(
+            portfolio, portfolio_result = engine.optimize_portfolio(
                 budget=self.graph.budget,
-                criterion="pessimistic",        # <-- Maximize WORST-CASE value (robust)
+                criterion="cost_aware_robust",
                 belief_state=start_distribution, # <-- Same belief as standard_rl
+                min_actions=1,
             )
             return (
                 portfolio_result.get("combined_interventions", {}),
                 portfolio_result.get("edge_cost_edits", []),
                 portfolio_result.get("cost_breakdown", self._empty_cost_model()),
+                portfolio,
             )
 
-        return {}, [], self._empty_cost_model()
+        return {}, [], self._empty_cost_model(), []
 
     def _compute_metrics_for_method(
         self,
         method: str,
         reward_interventions: Dict,
         edge_cost_edits: List[Tuple[int, int, float]],
+        actions: Optional[List] = None,
         cost_model: Optional[Dict] = None,
         start_distribution: Optional[Dict[int, float]] = None,
     ) -> MethodResult:
         """Tính tất cả metrics cho một phương pháp."""
         from mirage.attacker_agents import run_simulation
+        from mirage.layer2_attack_graph import build_runtime_graph
 
         t0 = time.time()
         per_attacker: Dict[str, float] = {}
@@ -301,71 +310,11 @@ class MIRAGEEvaluator:
 
         eps_per_type = max(50, self.n_episodes // len(self.ATTACKER_TYPES))
 
-        import copy
-
-        # ---- no_defense: dùng clean graph không có đường đến decoy ----
-        if method == "no_defense":
-            graph_copy = self._build_clean_graph_no_defense()
-        else:
-            # Các phương pháp có deception: dùng graph gốc + boost transitions
-            graph_copy = copy.deepcopy(self.graph)
-            # Apply interventions bằng cách tăng xác suất đi đến decoy nodes
-            for (node, action), delta in reward_interventions.items():
-                if node in graph_copy.decoy_sites and delta > 0:
-                    # Tăng xác suất attacker đi đến decoy node
-                    for src in graph_copy.states:
-                        for act in graph_copy.available_actions.get(src, []):
-                            if node in graph_copy.transitions[src][act]:
-                                old_p = graph_copy.transitions[src][act][node]
-                                # Tăng xác suất đến decoy theo strength của intervention
-                                boost = min(delta * 0.15, old_p * 0.4)
-                                graph_copy.transitions[src][act][node] = old_p + boost
-                                # Normalize lại
-                                total = sum(graph_copy.transitions[src][act].values())
-                                graph_copy.transitions[src][act] = {
-                                    k: v/total for k, v in graph_copy.transitions[src][act].items()
-                                }
-            
-            # Apply edge_cost_edits: giảm xác suất đi qua real critical edge,
-            # phân phối lại sang decoy neighbors ưu tiên, rồi đến sink an toàn,
-            # CUỐI CÙNG mới xét các real nodes khác (để tránh vô tình boost đường tấn công).
-            decoy_set = set(self.graph.decoy_sites)
-            sink = self.graph.sink_state
-            for src, dst, delta in edge_cost_edits:
-                for act in graph_copy.available_actions.get(src, []):
-                    if dst in graph_copy.transitions[src][act]:
-                        trans = graph_copy.transitions[src][act]
-                        # Giảm xác suất tối đa 50% (tăng từ 45% để edge cost có tác động rõ hơn)
-                        penalty = min(delta * 0.10, trans[dst] * 0.50)
-                        new_p_dst = max(0.05, trans[dst] - penalty)
-                        freed = trans[dst] - new_p_dst
-
-                        new_trans = {n: p for n, p in trans.items()}
-                        new_trans[dst] = new_p_dst
-
-                        other_nodes = [n for n in trans if n != dst]
-                        decoy_neighbors = [n for n in other_nodes if n in decoy_set]
-                        sink_neighbors  = [n for n in other_nodes if n == sink]
-
-                        if decoy_neighbors:
-                            # Ưu tiên 1: boost decoy neighbors → attacker bị hút vào bẫy
-                            boost_per = freed / len(decoy_neighbors)
-                            for dn in decoy_neighbors:
-                                new_trans[dn] = new_trans[dn] + boost_per
-                        elif sink_neighbors:
-                            # Ưu tiên 2: redirect sang sink an toàn
-                            new_trans[sink] = new_trans.get(sink, 0.0) + freed
-                        else:
-                            # Fallback: phân phối đều sang các nodes còn lại
-                            # (tránh boost ngược về nodes trên đường tấn công)
-                            if other_nodes:
-                                boost_per = freed / len(other_nodes)
-                                for on in other_nodes:
-                                    new_trans[on] = new_trans[on] + boost_per
-
-                        # Normalize lại
-                        total = sum(new_trans.values())
-                        graph_copy.transitions[src][act] = {k: v / total for k, v in new_trans.items()}
+        graph_copy = build_runtime_graph(
+            self.graph,
+            actions=actions or [],
+            edge_cost_edits=edge_cost_edits,
+        )
 
         for atype in self.ATTACKER_TYPES:
             result = run_simulation(
@@ -393,6 +342,14 @@ class MIRAGEEvaluator:
         interception_rate = sum(interception_rates) / len(interception_rates)
         hit_true_goal_rate = sum(hit_rates) / len(hit_rates)
         time_to_compromise = sum(avg_steps_list) / len(avg_steps_list)
+        asset_value = max(
+            (
+                float(self.graph.node_metadata.get(goal, {}).get("value", 1.0) or 1.0)
+                for goal in self.graph.true_goals
+            ),
+            default=1.0,
+        )
+        security_loss = hit_true_goal_rate * asset_value
 
         # Operational cost comes from the same composite model used by Layer 4.
         if cost_model is None:
@@ -420,6 +377,8 @@ class MIRAGEEvaluator:
             optimistic_value=optimistic_value,
             robustness_gap=robustness_gap,
             total_cost=total_cost,
+            security_loss=security_loss,
+            portfolio_actions=[action.action_id for action in (actions or [])],
             per_attacker_type=per_attacker,
             cost_model=cost_model,
             runtime_seconds=runtime,
@@ -452,23 +411,28 @@ class MIRAGEEvaluator:
             print("=" * 70)
 
         for method in self.METHODS:
+            method_started = time.time()
             if verbose:
                 print(f"\n[{method}] Running...")
             # Truyền start_distribution vào _get_reward_interventions_for_method
             # để standard_rl và robust_mirage đều optimize dưới cùng belief (Benchmark B).
-            interventions, edge_edits, cost_model = self._get_reward_interventions_for_method(
+            interventions, edge_edits, cost_model, actions = self._get_reward_interventions_for_method(
                 method, start_distribution=start_distribution
             )
             result = self._compute_metrics_for_method(
                 method, interventions,
                 edge_cost_edits=edge_edits,
+                actions=actions,
                 cost_model=cost_model,
                 start_distribution=start_distribution,
             )
+            result.runtime_seconds = time.time() - method_started
             self.results[method] = result
             if verbose:
                 print(f"  Interception Rate: {result.interception_rate:.1%}")
                 print(f"  True Goal Hit:     {result.hit_true_goal_rate:.1%}")
+                print(f"  Security Loss:     {result.security_loss:.4f}")
+                print(f"  False-Positive:    {result.false_positive_cost:.4f}")
                 print(f"  Pessimistic Val:   {result.pessimistic_value:+.4f}")
                 print(f"  Robustness Gap:    {result.robustness_gap:.4f}")
 
@@ -539,6 +503,14 @@ class MIRAGEEvaluator:
             print("  " + "-" * 68)
 
         for n_nodes in node_sizes:
+            scale_candidate_limit = min(
+                max_candidates,
+                16 if n_nodes <= 100 else 10 if n_nodes <= 500 else 6,
+            )
+            scale_attacker_samples = max(
+                12,
+                int(n_attacker_samples * (100.0 / n_nodes) ** 0.5),
+            )
             graph = build_synthetic_enterprise_graph(
                 n_nodes=n_nodes,
                 budget=12.0,
@@ -577,21 +549,24 @@ class MIRAGEEvaluator:
                 pruned,
                 graph,
                 belief_state=belief,
-                limit=max_candidates,
+                limit=scale_candidate_limit,
             )
 
             engine = RobustDecisionEngine(
                 graph,
                 fabric,
-                n_attacker_samples=n_attacker_samples,
+                n_attacker_samples=scale_attacker_samples,
                 use_robust_milp=False,
                 seed=self.seed,
+                approximate_mode=True,
             )
             portfolio, result = engine.optimize_portfolio(
                 budget=graph.budget,
                 belief_state=belief,
-                criterion="pessimistic",
-                max_candidates=max_candidates,
+                criterion="cost_aware_robust",
+                max_candidates=scale_candidate_limit,
+                min_actions=1,
+                max_portfolio_size=3,
             )
             runtime = time.time() - t0
 
@@ -601,6 +576,8 @@ class MIRAGEEvaluator:
                 "budget_feasible_actions": len(available),
                 "pruned_actions": len(pruned),
                 "ranked_actions": len(ranked),
+                "attacker_samples": scale_attacker_samples,
+                "approximate_mode": True,
                 "portfolio_size": len(portfolio),
                 "portfolio_cost": result.get("total_cost", 0.0),
                 "false_positive_cost": result.get("false_positive_cost", 0.0),
@@ -872,6 +849,8 @@ class MIRAGEEvaluator:
                 "optimistic_value": result.optimistic_value,
                 "robustness_gap": result.robustness_gap,
                 "total_cost": result.total_cost,
+                "security_loss": result.security_loss,
+                "portfolio_actions": result.portfolio_actions,
                 "cost_model": result.cost_model,
                 "per_attacker_type": result.per_attacker_type,
                 "runtime_seconds": result.runtime_seconds,
@@ -940,6 +919,9 @@ class MIRAGEEvaluator:
                     "pessimistic_value": result.pessimistic_value,
                     "optimistic_value": result.optimistic_value,
                     "robustness_gap": result.robustness_gap,
+                    "total_cost": result.total_cost,
+                    "false_positive_cost": result.false_positive_cost,
+                    "runtime_seconds": result.runtime_seconds,
                 })
 
             if verbose:
@@ -958,6 +940,7 @@ class MIRAGEEvaluator:
         metrics = [
             "interception_rate", "hit_true_goal_rate", "time_to_compromise",
             "pessimistic_value", "optimistic_value", "robustness_gap",
+            "total_cost", "false_positive_cost", "runtime_seconds",
         ]
         aggregated: Dict[str, Dict] = {}
         for method, runs in seed_results.items():
@@ -995,6 +978,17 @@ class MIRAGEEvaluator:
                 flag = " ← MIRAGE" if method == "robust_mirage" else ""
                 flag += " ← RL" if method == "standard_rl" else ""
                 print(f"  {method:22s} | {ir:>15s} | {pv:>15s} | {rg:>12s}{flag}")
+                print(
+                    " " * 26
+                    + f"hit={d['mean']['hit_true_goal_rate']:.1%}±"
+                    f"{d['std']['hit_true_goal_rate']:.1%}, "
+                    + f"cost={d['mean']['total_cost']:.3f}±"
+                    f"{d['std']['total_cost']:.3f}, "
+                    + f"fp={d['mean']['false_positive_cost']:.3f}±"
+                    f"{d['std']['false_positive_cost']:.3f}, "
+                    + f"runtime={d['mean']['runtime_seconds']:.3f}±"
+                    f"{d['std']['runtime_seconds']:.3f}s"
+                )
 
         # Lưu kết quả
         out_file = f"multi_seed_benchmark_{label.lower()}_results.json"
@@ -1009,6 +1003,22 @@ class MIRAGEEvaluator:
                     "attacker_types": self.ATTACKER_TYPES,
                     "results": aggregated,
                 }, f, indent=2)
+            csv_path = os.path.join(
+                self.results_dir,
+                f"multi_seed_benchmark_{label.lower()}_results.csv",
+            )
+            with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
+                writer = csv.writer(csv_file)
+                writer.writerow(["method", "metric", "mean", "std", "n_seeds"])
+                for method, summary in aggregated.items():
+                    for metric in metrics:
+                        writer.writerow([
+                            method,
+                            metric,
+                            summary["mean"][metric],
+                            summary["std"][metric],
+                            summary["n_seeds"],
+                        ])
             if verbose:
                 print(f"\n✅ Multi-seed results saved to: {out_path}")
         except Exception as e:
@@ -1016,151 +1026,153 @@ class MIRAGEEvaluator:
 
         return aggregated
 
-    def run_ablation_study(self) -> None:
-        """
-        Ablation study: each variant ACTUALLY disables one MIRAGE component.
-
-        Changes are made to optimize_portfolio() parameters:
-          - criterion: "pessimistic" vs "expected"  -> tests robust objective
-          - belief_state=None                        -> tests stage belief
-          - allowed_action_types filter              -> tests action diversity / edge cost
-        """
-        from mirage.attacker_agents import run_simulation
+    def run_ablation_study(self) -> Dict[str, Dict]:
         from mirage.layer3_deception import DeceptionFabric
         from mirage.layer4_decision_engine import RobustDecisionEngine
 
-        print("\n" + "=" * 70)
-        print("ABLATION STUDY -- Component Contribution Analysis")
-        print("=" * 70)
+        belief = dict(self.BENCHMARK_B_BELIEF)
+        optimization_episodes = max(30, self.n_episodes // 5)
+        evaluation_episodes = max(40, self.n_episodes // 4)
+        all_types = list(self.ATTACKER_TYPES)
+        without_deception_aware = [
+            attacker for attacker in all_types
+            if attacker != "deception_aware"
+        ]
 
-        # Fixed belief state: lateral movement scenario
-        ABLATION_BELIEF = {4: 0.35, 3: 0.25, 6: 0.20, 8: 0.10, 9: 0.10}
-
-        VARIANTS = [
+        variants = [
             {
-                "name": "Full MIRAGE",
-                "criterion": "pessimistic",
-                "allowed_types": None,
-                "use_belief": True,
-                "desc": "All components active",
+                "name": "full_mirage",
+                "criterion": "cost_aware_robust",
+                "belief": belief,
+                "allowed": None,
+                "cost_model": True,
+                "attacker_types": all_types,
             },
             {
-                "name": "- No Robust Objective",
+                "name": "no_robust_objective",
                 "criterion": "expected",
-                "allowed_types": None,
-                "use_belief": True,
-                "desc": "Avg value instead of worst-case -> no robustness guarantee",
+                "belief": belief,
+                "allowed": None,
+                "cost_model": True,
+                "attacker_types": all_types,
             },
             {
-                "name": "- No Stage Belief",
-                "criterion": "pessimistic",
-                "allowed_types": None,
-                "use_belief": False,
-                "desc": "Simulation from entry point, ignoring attacker location",
+                "name": "no_belief",
+                "criterion": "cost_aware_robust",
+                "belief": None,
+                "allowed": None,
+                "cost_model": True,
+                "attacker_types": all_types,
             },
             {
-                "name": "- No Deception Variety",
-                "criterion": "pessimistic",
-                "allowed_types": ["deploy_decoy_database"],
-                "use_belief": True,
-                "desc": "Only Decoy DB -> no honey cred / router / edge cost",
-            },
-            {
-                "name": "- No Edge Cost",
-                "criterion": "pessimistic",
-                "allowed_types": [
+                "name": "no_edge_cost",
+                "criterion": "cost_aware_robust",
+                "belief": belief,
+                "allowed": [
                     "deploy_decoy_database",
                     "deploy_decoy_router",
                     "scatter_honey_credential",
                 ],
-                "use_belief": True,
-                "desc": "Remove INCREASE_EDGE_COST -> reward-only deception (no real path blocking)",
+                "cost_model": True,
+                "attacker_types": all_types,
             },
             {
-                "name": "No Components",
-                "criterion": "expected",
-                "allowed_types": ["deploy_decoy_database"],
-                "use_belief": False,
-                "desc": "No robust + no belief + no variety (degenerate baseline)",
+                "name": "no_deception_variety",
+                "criterion": "cost_aware_robust",
+                "belief": belief,
+                "allowed": ["deploy_decoy_database"],
+                "cost_model": True,
+                "attacker_types": all_types,
+            },
+            {
+                "name": "no_cost_model",
+                "criterion": "cost_aware_robust",
+                "belief": belief,
+                "allowed": None,
+                "cost_model": False,
+                "attacker_types": all_types,
+            },
+            {
+                "name": "no_deception_aware",
+                "criterion": "cost_aware_robust",
+                "belief": belief,
+                "allowed": None,
+                "cost_model": True,
+                "attacker_types": without_deception_aware,
             },
         ]
 
-        eps_opt  = max(60, self.n_episodes // 6)
-        eps_eval = max(80, self.n_episodes // 4)
-
+        print("\n" + "=" * 100)
+        print("ABLATION STUDY -- one component disabled per variant")
+        print("=" * 100)
         print(
-            f"\n{'Variant':28s} | {'Pess.Val':>10s} | {'Exp.Val':>9s}"
-            f" | {'Intercept%':>11s} | {'Hit_TG%':>9s} | Portfolio"
+            f"{'Variant':24s} | {'Cost':>7s} | {'Pess':>9s} | "
+            f"{'Gap':>8s} | Portfolio actions"
         )
         print("-" * 100)
 
-        SHORT = {
-            "deploy_decoy_database":     "decoy_db",
-            "deploy_decoy_router":       "decoy_rt",
-            "scatter_honey_credential":  "honey",
-            "increase_edge_cost":        "edge",
-        }
-
-        for v in VARIANTS:
-            belief = ABLATION_BELIEF if v["use_belief"] else None
-
+        results: Dict[str, Dict] = {}
+        for variant in variants:
             fabric = DeceptionFabric(self.graph)
             engine = RobustDecisionEngine(
-                self.graph, fabric,
-                n_attacker_samples=eps_opt,
+                self.graph,
+                fabric,
+                n_attacker_samples=optimization_episodes,
                 use_robust_milp=False,
                 seed=self.seed,
+                attacker_types=variant["attacker_types"],
+                cost_model_enabled=variant["cost_model"],
             )
-
             portfolio, _ = engine.optimize_portfolio(
                 budget=self.graph.budget,
+                belief_state=variant["belief"],
+                criterion=variant["criterion"],
+                allowed_action_types=variant["allowed"],
+                min_actions=1,
+            )
+
+            evaluation_engine = RobustDecisionEngine(
+                self.graph,
+                DeceptionFabric(self.graph),
+                n_attacker_samples=evaluation_episodes,
+                use_robust_milp=False,
+                seed=self.seed,
+                attacker_types=all_types,
+            )
+            evaluation = evaluation_engine._evaluate_portfolio(
+                portfolio,
+                n_eps=evaluation_episodes,
                 belief_state=belief,
-                criterion=v["criterion"],
-                allowed_action_types=v["allowed_types"],
+                criterion="pure_pessimistic",
             )
-
-            if portfolio:
-                # Evaluate with neutral belief + pessimistic criterion for fair comparison
-                eval_r = engine._evaluate_portfolio(
-                    portfolio, n_eps=eps_eval,
-                    belief_state=None,
-                    criterion="pessimistic",
-                )
-                pess     = eval_r["pessimistic_value"]
-                exp_val  = eval_r["expected_value"]
-                combined = eval_r["combined_interventions"]
-
-                raw_ic, raw_ht = [], []
-                for atype in self.ATTACKER_TYPES:
-                    res = run_simulation(
-                        self.graph, atype,
-                        n_episodes=max(eps_eval // 4, 20),
-                        reward_interventions=combined,
-                        seed=self.seed,
-                    )
-                    raw_ic.append(res["decoy_interception_rate"])
-                    raw_ht.append(res["hit_true_goal_rate"])
-                ic_pct = sum(raw_ic) / len(raw_ic)
-                ht_pct = sum(raw_ht) / len(raw_ht)
-
-                port_desc = "+".join(
-                    SHORT.get(a.action_type.value, a.action_type.value[:8])
-                    for a in portfolio[:3]
-                )
-                if len(portfolio) > 3:
-                    port_desc += f"+{len(portfolio)-3}more"
-            else:
-                pess, exp_val, ic_pct, ht_pct, port_desc = -2.0, -2.0, 0.0, 1.0, "empty"
-
-            flag = " <- FULL" if v["name"] == "Full MIRAGE" else ""
+            action_ids = [action.action_id for action in portfolio]
+            gap = (
+                evaluation["optimistic_value"]
+                - evaluation["pessimistic_value"]
+            )
+            row = {
+                "portfolio_actions": action_ids,
+                "total_cost": evaluation["total_cost"],
+                "false_positive_cost": evaluation["false_positive_cost"],
+                "pessimistic_value": evaluation["pessimistic_value"],
+                "expected_value": evaluation["expected_value"],
+                "robustness_gap": gap,
+                "margin_guarantee": evaluation["margin_guarantee"],
+                "seed": self.seed,
+                "episodes": evaluation_episodes,
+            }
+            results[variant["name"]] = row
             print(
-                f"{v['name']:28s} | {pess:+10.4f} | {exp_val:+9.4f}"
-                f" | {ic_pct:>10.1%} | {ht_pct:>8.1%} | {port_desc}{flag}"
+                f"{variant['name']:24s} | {row['total_cost']:7.3f} | "
+                f"{row['pessimistic_value']:+9.4f} | {gap:8.4f} | "
+                + (", ".join(action_ids) if action_ids else "clean/no-action")
             )
-            print(f"  +-- {v['desc']}")
 
-        print()
-
+        output_path = os.path.join(self.results_dir, "ablation_results.json")
+        with open(output_path, "w", encoding="utf-8") as output:
+            json.dump(results, output, indent=2)
+        print(f"\nAblation results saved to: {output_path}")
+        return results
 
 if __name__ == "__main__":
     from mirage.layer2_attack_graph import build_enterprise_attack_graph

@@ -128,7 +128,7 @@ class ActionPlan:
         portfolio_lines = ""
         if self.portfolio:
             portfolio_lines = "\nPortfolio:\n" + "\n".join(
-                f"  [{i+1}] {a.action_type.value:35s} → Node {a.target_node:2d} "
+                f"  [{i+1}] {a.action_type.value:35s} -> Node {a.target_node:2d} "
                 f"| cost={compute_composite_cost(a).total:.1f} | risk={a.risk_score:.2f}"
                 for i, a in enumerate(self.portfolio)
             )
@@ -192,6 +192,11 @@ class RobustDecisionEngine:
         seed: int = 42,
         operational_cost_weight: float = 0.015,
         false_positive_weight: float = 0.05,
+        expected_value_weight: float = 0.25,
+        margin_weight: float = 0.20,
+        attacker_types: Optional[List[str]] = None,
+        approximate_mode: bool = False,
+        cost_model_enabled: bool = True,
     ):
         self.graph = graph
         self.fabric = fabric
@@ -200,7 +205,13 @@ class RobustDecisionEngine:
         self.seed = seed
         self.operational_cost_weight = operational_cost_weight
         self.false_positive_weight = false_positive_weight
+        self.expected_value_weight = expected_value_weight
+        self.margin_weight = margin_weight
+        self.attacker_types = list(attacker_types or self.ALL_ATTACKER_TYPES)
+        self.approximate_mode = approximate_mode
+        self.cost_model_enabled = cost_model_enabled
         self._decision_history: List[ActionPlan] = []
+        self._evaluation_cache: Dict[Tuple, Dict] = {}
         
         # Exact MDP Math Solver
         self.mdp_solver = MDPSolver(graph)
@@ -234,6 +245,7 @@ class RobustDecisionEngine:
         Pessimistic value = defender value khi attacker chọn strategy bất lợi nhất.
         """
         from mirage.attacker_agents import run_simulation
+        from mirage.layer2_attack_graph import build_runtime_graph
 
         # Tạo reward interventions từ action
         reward_interventions = {}
@@ -251,10 +263,11 @@ class RobustDecisionEngine:
         # +1 nếu attacker đến decoy, -2 nếu attacker đến true goal
         attacker_types = self.ALL_ATTACKER_TYPES
         defender_values = []
+        runtime_graph = build_runtime_graph(self.graph, actions=[action])
 
         for atype in attacker_types:
             result = run_simulation(
-                self.graph, atype,
+                runtime_graph, atype,
                 n_episodes=n_episodes // len(attacker_types),
                 reward_interventions=reward_interventions,
                 seed=self.seed,
@@ -408,7 +421,7 @@ class RobustDecisionEngine:
         actions: List[DeceptionAction],
         n_eps: int = 50,
         belief_state: Optional[Dict[int, float]] = None,
-        criterion: str = "pessimistic",
+        criterion: str = "cost_aware_robust",
     ) -> Dict:
         """
         Đánh giá hiệu quả của một portfolio actions.
@@ -425,80 +438,37 @@ class RobustDecisionEngine:
               "expected"    — avg value (standard RL, không có robust term)
               "optimistic"  — max value (best-case)
         """
-        import copy
         from mirage.attacker_agents import run_simulation
+        from mirage.layer2_attack_graph import build_runtime_graph
+
+        cache_key = (
+            tuple(sorted(action.action_id for action in actions)),
+            int(n_eps),
+            tuple(sorted((belief_state or {}).items())),
+            criterion,
+            tuple(self.attacker_types),
+            self.cost_model_enabled,
+            self.approximate_mode,
+        )
+        if cache_key in self._evaluation_cache:
+            return self._evaluation_cache[cache_key]
 
         combined = self._merge_interventions(actions, belief_state=belief_state)
         edge_cost_edits = getattr(self, "_edge_cost_edits", [])
+        graph_copy = build_runtime_graph(
+            self.graph,
+            actions=actions,
+            edge_cost_edits=edge_cost_edits,
+        )
+        clean_graph = build_runtime_graph(self.graph, actions=[])
 
-        # ---- Channel 2: Transition boost (decoy attraction) ----
-        # Tạo graph_copy với xác suất đi đến decoy nodes được tăng lên.
-        # Phản ánh thực tế: decoy trông giống tài sản thật → attacker có xác suất
-        # cao hơn khi navigate mạng. Ảnh hưởng ALL attacker types.
-        graph_copy = copy.deepcopy(self.graph)
-        decoy_set = set(graph_copy.decoy_sites)
-
-        # 2a. Boost decoy attraction (reward channel)
-        for (node, _), delta in combined.items():
-            if node in decoy_set and delta > 0:
-                for src in graph_copy.states:
-                    for act in graph_copy.available_actions.get(src, []):
-                        if node in graph_copy.transitions[src][act]:
-                            old_p = graph_copy.transitions[src][act][node]
-                            # Boost proportional to deception strength, capped
-                            boost = min(delta * 0.12, old_p * 0.40)
-                            graph_copy.transitions[src][act][node] = old_p + boost
-                            # Normalize để đảm bảo tổng = 1
-                            total = sum(graph_copy.transitions[src][act].values())
-                            graph_copy.transitions[src][act] = {
-                                k: v / total
-                                for k, v in graph_copy.transitions[src][act].items()
-                            }
-
-        # 2b. Apply edge cost edits (real path blocking channel)
-        # Giảm xác suất đi theo cạnh bị tăng cost, phân phối lại sang các neighbors khác
-        for (src, dst, cost_delta) in edge_cost_edits:
-            if src not in graph_copy.transitions:
-                continue
-            for act in graph_copy.available_actions.get(src, []):
-                trans = graph_copy.transitions[src][act]
-                if dst not in trans or len(trans) <= 1:
-                    continue
-                # Giảm xác suất đến dst (max giảm 45%)
-                penalty = min(cost_delta * 0.08, trans[dst] * 0.45)
-                new_p_dst = max(0.05, trans[dst] - penalty)
-                freed = trans[dst] - new_p_dst
-
-                # Phân phối freed probability sang decoy neighbors ưu tiên,
-                # nếu không có thì sang các real neighbors khác
-                other_nodes = [n for n in trans if n != dst]
-                decoy_neighbors = [n for n in other_nodes if n in decoy_set]
-                if decoy_neighbors:
-                    # Ưu tiên boost decoy
-                    boost_per = freed / len(decoy_neighbors)
-                    new_trans = {n: p for n, p in trans.items()}
-                    new_trans[dst] = new_p_dst
-                    for dn in decoy_neighbors:
-                        new_trans[dn] = new_trans[dn] + boost_per
-                else:
-                    # Phân phối đều sang real neighbors
-                    boost_per = freed / len(other_nodes) if other_nodes else 0
-                    new_trans = {n: p for n, p in trans.items()}
-                    new_trans[dst] = new_p_dst
-                    for on in other_nodes:
-                        new_trans[on] = new_trans[on] + boost_per
-
-                # Normalize lại
-                total = sum(new_trans.values())
-                graph_copy.transitions[src][act] = {k: v / total for k, v in new_trans.items()}
-
-        attacker_types = self.ALL_ATTACKER_TYPES
+        attacker_types = self.attacker_types
         defender_values: Dict[str, float] = {}
 
         for atype in attacker_types:
             result = run_simulation(
                 graph_copy, atype,          # Dùng graph đã modified (cả 2 kênh)
-                n_episodes=max(n_eps, 20),
+                n_episodes=max(n_eps, 6 if self.approximate_mode else 20),
                 reward_interventions=combined,  # Channel 1: reward bait
                 seed=self.seed,
                 start_distribution=belief_state,
@@ -512,14 +482,15 @@ class RobustDecisionEngine:
 
         # ---- Exact MDP Evaluation (Robust Reward Design Paper) ----
         # Giải bài toán bằng toán học chính xác thay vì chỉ mô phỏng
-        mdp_solver = self.mdp_solver
+        mdp_solver = MDPSolver(graph_copy)
+        mdp_baseline_graph = clean_graph
         mdp_interventions = combined
         mdp_belief = belief_state
         if len(self.graph.states) > 120:
             from mirage.mdp_solver import build_hierarchical_subgraph, prune_action_space
 
             focus = set(prune_action_space(
-                self.graph,
+                graph_copy,
                 belief_state,
                 top_k_states=min(60, max(20, int(len(self.graph.states) ** 0.5))),
             ))
@@ -527,8 +498,10 @@ class RobustDecisionEngine:
                 focus.add(action.target_node)
                 if action.target_edge:
                     focus.update(action.target_edge)
-            subgraph = build_hierarchical_subgraph(self.graph, sorted(focus))
+            subgraph = build_hierarchical_subgraph(graph_copy, sorted(focus))
+            baseline_subgraph = build_hierarchical_subgraph(clean_graph, sorted(focus))
             mdp_solver = MDPSolver(subgraph)
+            mdp_baseline_graph = baseline_subgraph
             sub_states = set(subgraph.states)
             mdp_interventions = {
                 key: value
@@ -549,6 +522,7 @@ class RobustDecisionEngine:
         exact_results = mdp_solver.evaluate_defense_exact(
             reward_interventions=mdp_interventions,
             start_distribution=mdp_belief,
+            baseline_graph=mdp_baseline_graph,
         )
         
         mdp_pess = exact_results["V_robust"]
@@ -572,21 +546,40 @@ class RobustDecisionEngine:
         total_cost = float(cost_report["total"])
         fp_cost = float(cost_report["false_positive_cost"])
 
-        # Tiêu chí chọn portfolio
-        if criterion == "pessimistic":
+        criterion = {
+            "pessimistic": "cost_aware_robust",
+            "robust": "cost_aware_robust",
+        }.get(criterion, criterion)
+        cost_penalty = 0.0
+        if self.cost_model_enabled:
+            cost_penalty = (
+                self.operational_cost_weight * total_cost
+                + self.false_positive_weight * fp_cost
+            )
+
+        if criterion == "expected":
+            objective_value = hybrid_exp
+            selection_value = objective_value - cost_penalty
+        elif criterion == "pure_pessimistic":
             objective_value = hybrid_pess
+            selection_value = objective_value
         elif criterion == "optimistic":
             objective_value = hybrid_opt
-        else:  # "expected" — standard RL
-            objective_value = hybrid_exp
+            selection_value = objective_value - cost_penalty
+        elif criterion == "cost_aware_robust":
+            objective_value = (
+                hybrid_pess
+                + self.expected_value_weight * hybrid_exp
+                + self.margin_weight * margin_guarantee
+            )
+            selection_value = objective_value - cost_penalty
+        else:
+            raise ValueError(
+                "criterion must be one of: expected, pure_pessimistic, "
+                "cost_aware_robust"
+            )
 
-        cost_penalty = (
-            self.operational_cost_weight * total_cost
-            + self.false_positive_weight * fp_cost
-        )
-        selection_value = objective_value - cost_penalty
-
-        return {
+        evaluation = {
             "pessimistic_value": hybrid_pess,
             "optimistic_value":  hybrid_opt,
             "expected_value":    hybrid_exp,
@@ -601,15 +594,19 @@ class RobustDecisionEngine:
             "false_positive_cost": fp_cost,
             "cost_breakdown":    cost_report,
         }
+        self._evaluation_cache[cache_key] = evaluation
+        return evaluation
 
     def optimize_portfolio(
         self,
         budget: float,
         safety_filter=None,
         belief_state: Optional[Dict[int, float]] = None,
-        criterion: str = "pessimistic",
+        criterion: str = "cost_aware_robust",
         allowed_action_types: Optional[List[str]] = None,
         max_candidates: Optional[int] = None,
+        min_actions: int = 0,
+        max_portfolio_size: Optional[int] = None,
     ):
         """
         Tìm portfolio tối ưu dưới budget constraint.
@@ -664,12 +661,18 @@ class RobustDecisionEngine:
         )
 
         if not available:
-            return [], {"pessimistic_value": float("-inf"), "selection_value": float("-inf"),
-                        "combined_interventions": {}, "total_cost": 0.0}
+            return [], self._evaluate_portfolio(
+                [],
+                n_eps=6 if self.approximate_mode else 20,
+                belief_state=belief_state,
+                criterion=criterion,
+            )
 
         # Độ phân giải episodes: đủ để phân biệt portfolios mà không quá chậm
         # Với 5 attacker types cần nhiều episodes hơn để có signal đủ mạnh
-        if len(self.graph.states) > 120:
+        if self.approximate_mode:
+            eps_per_eval = max(6, min(12, self.n_attacker_samples // 8))
+        elif len(self.graph.states) > 120:
             eps_per_eval = max(25, min(60, self.n_attacker_samples // 4))
         else:
             eps_per_eval = max(60, self.n_attacker_samples // 2)
@@ -690,6 +693,8 @@ class RobustDecisionEngine:
         )
 
         while candidates:
+            if max_portfolio_size is not None and len(portfolio) >= max_portfolio_size:
+                break
             best_candidate = None
             best_sel_val = float("-inf")
             best_result: Dict = {"pessimistic_value": float("-inf"),
@@ -712,7 +717,10 @@ class RobustDecisionEngine:
             if best_candidate is None:
                 break
 
-            if best_result["selection_value"] > current_result["selection_value"]:
+            if (
+                best_result["selection_value"] > current_result["selection_value"]
+                or len(portfolio) < min_actions
+            ):
                 portfolio.append(best_candidate)
                 candidates.remove(best_candidate)
                 remaining_budget -= self._action_cost(best_candidate)
@@ -724,7 +732,7 @@ class RobustDecisionEngine:
             else:
                 candidates.remove(best_candidate)
                 print(f"  ~ Skip: {best_candidate.action_type.value} @ Node {best_candidate.target_node} "
-                      f"(sel={best_result['selection_value']:+.4f} ≤ current {current_result['selection_value']:+.4f})")
+                      f"(sel={best_result['selection_value']:+.4f} <= current {current_result['selection_value']:+.4f})")
 
         # --------------- Pha 2: Local swap ----------------
         print(f"  Phase 2: Local swap on portfolio of {len(portfolio)} actions "
@@ -751,7 +759,7 @@ class RobustDecisionEngine:
                         outside[outside.index(out_action)] = in_action
                         current_result = trial_result
                         improved = True
-                        print(f"  ~ Swap: {in_action.action_type.value} → "
+                        print(f"  ~ Swap: {in_action.action_type.value} -> "
                               f"{out_action.action_type.value} @ Node {out_action.target_node} "
                               f"| pess={trial_result['pessimistic_value']:+.4f}")
                         break
@@ -818,6 +826,8 @@ class RobustDecisionEngine:
             budget=budget_remaining,
             safety_filter=safety_filter,
             belief_state=belief_state,
+            criterion="cost_aware_robust",
+            min_actions=1,
         )
 
         if not portfolio:
@@ -885,7 +895,7 @@ class RobustDecisionEngine:
         if safety_filter is not None:
             safe, warning = safety_filter(plan)
             if not safe:
-                print(f"  ✗ Portfolio blocked by Safety Gate: {warning}")
+                print(f"  [BLOCKED] Portfolio blocked by Safety Gate: {warning}")
                 return None
 
         self._decision_history.append(plan)
@@ -917,7 +927,7 @@ class RobustDecisionEngine:
         # High-risk paths crossing target node
         for i, path in enumerate(self.graph.get_high_risk_paths(), 1):
             if action.target_node in path:
-                path_str = " → ".join(self.graph.label(n) for n in path)
+                path_str = " -> ".join(self.graph.label(n) for n in path)
                 evidence.append(f"Target node on high-risk Path {i}: {path_str}")
 
         # Node metadata
@@ -981,7 +991,7 @@ class RobustDecisionEngine:
         elif action.action_type == DeceptionActionType.INCREASE_EDGE_COST:
             if action.target_edge:
                 src, dst = action.target_edge
-                base += [f"Traffic volume on {self.graph.label(src)} → {self.graph.label(dst)}",
+                base += [f"Traffic volume on {self.graph.label(src)} -> {self.graph.label(dst)}",
                          "Firewall rule trigger count"]
         return base
 

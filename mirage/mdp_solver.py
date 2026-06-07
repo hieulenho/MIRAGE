@@ -87,9 +87,12 @@ class CompositeActionCost:
         """Chi phí riêng do false positive."""
         exposure = (
             1.0
+            + self.risk_score * 1.25
+            + self.business_impact * 1.50
             + self.affected_services * 0.05
             + self.affected_users * 0.002
             + max(0.0, self.duration_hours - 1.0) * 0.03
+            + self.rollback_complexity * 0.50
         )
         return self.fp_likelihood * self.w_fp * exposure
 
@@ -332,10 +335,10 @@ class MDPSolver:
                     j = self.state_to_idx[s_next]
                     P[i, j] += a_prob * t_prob
 
-                # Defender reward (including interventions)
+                # Defender reward is determined by the realized graph state.
+                # Reward interventions are attacker-visible bait only.
                 base_r = self._defender_r.get((s, a), 0.0)
-                intervention_r = interventions.get((s, a), 0.0)
-                r_def[i] += a_prob * (base_r + intervention_r)
+                r_def[i] += a_prob * base_r
 
         return P, r_def
 
@@ -432,6 +435,15 @@ class MDPSolver:
             best_a = max(action_values, key=action_values.get)
             policy[s] = {best_a: 1.0}
 
+        return policy
+
+    def _build_uniform_policy(self) -> Dict[int, Dict[str, float]]:
+        policy = {}
+        for state in self.graph.states:
+            actions = self.graph.available_actions.get(state, [])
+            if actions:
+                probability = 1.0 / len(actions)
+                policy[state] = {action: probability for action in actions}
         return policy
 
     # ----- 2. Occupancy Measure ρ^π(s,a) -----
@@ -562,7 +574,6 @@ class MDPSolver:
 
                     # Defender reward for this (s, a)
                     r_d = self._defender_r.get((s, a), 0.0)
-                    r_d += interventions.get((s, a), 0.0)
 
                     # Expected future value
                     future_v = 0.0
@@ -588,6 +599,7 @@ class MDPSolver:
         self,
         reward_interventions: Optional[Dict[Tuple, float]] = None,
         start_distribution: Optional[Dict[int, float]] = None,
+        baseline_graph: Optional["MIRAGEAttackGraph"] = None,
     ) -> float:
         """
         Margin guarantee c* (khái niệm cốt lõi từ Paper):
@@ -604,8 +616,12 @@ class MDPSolver:
         # Value with defense
         V_defense = self.solve_robust_value(reward_interventions)
 
-        # Value without defense (no interventions)
-        V_no_defense = self.solve_robust_value(None)
+        if baseline_graph is None:
+            from mirage.layer2_attack_graph import build_runtime_graph
+            baseline_graph = build_runtime_graph(self.graph, actions=[])
+
+        baseline_solver = MDPSolver(baseline_graph)
+        V_no_defense = baseline_solver.solve_robust_value(None)
 
         # Weighted by start distribution
         mu0 = start_distribution or self.graph.start_distribution
@@ -662,6 +678,7 @@ class MDPSolver:
         self,
         reward_interventions: Optional[Dict[Tuple, float]] = None,
         start_distribution: Optional[Dict[int, float]] = None,
+        baseline_graph: Optional["MIRAGEAttackGraph"] = None,
     ) -> Dict:
         """
         Đánh giá chính xác (exact) hiệu quả phòng thủ bằng toán MDP.
@@ -681,10 +698,17 @@ class MDPSolver:
         V_greedy = self.solve_value_function(reward_interventions, greedy_policy)
 
         # 3. Value under uniform random attacker (baseline)
-        V_uniform = self.solve_value_function(reward_interventions, policy=None)
+        V_uniform = self.solve_value_function(
+            reward_interventions,
+            policy=self._build_uniform_policy(),
+        )
 
         # 4. Margin guarantee
-        margin = self.compute_margin(reward_interventions, start_distribution)
+        margin = self.compute_margin(
+            reward_interventions,
+            start_distribution,
+            baseline_graph=baseline_graph,
+        )
 
         # 5. Occupancy measure
         occupancy = self.compute_occupancy_measure(
@@ -908,6 +932,10 @@ def build_hierarchical_subgraph(
         attacker_reward=sub_attacker_r,
         defender_reward=sub_defender_r,
         node_metadata={s: graph.node_metadata.get(s, {}) for s in sub_states},
+        active_decoy_sites=[
+            ds for ds in getattr(graph, "active_decoy_sites", [])
+            if ds in focus_set
+        ],
     )
 
 

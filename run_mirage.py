@@ -144,11 +144,11 @@ def run_step2_full_layers():
             decoy = fabric.deploy_action(action)
             deployed.append(decoy)
 
-    print(f"\n  → {len(deployed)} decoys deployed")
+    print(f"\n  → {len(deployed)} deception actions deployed")
     print(fabric.summary())
 
     # --- Demo 4 loại Attacker Agents ---
-    print("\n[Attackers] Simulating 4 attacker types (100 episodes each)...")
+    print("\n[Attackers] Simulating 5 attacker types (100 episodes each)...")
     print("-" * 70)
 
     # Tạo reward interventions từ fabric
@@ -174,9 +174,13 @@ def run_step2_full_layers():
     # Chạy 3 phương pháp để demo nhanh; _get_reward_interventions_for_method
     # trả về tuple (interventions_dict, edge_edits_list) — phải unpack đúng.
     for method in ["no_defense", "static_honeypot", "robust_mirage"]:
-        interventions, edge_edits = evaluator._get_reward_interventions_for_method(method)
+        interventions, edge_edits, cost_model, actions = evaluator._get_reward_interventions_for_method(method)
         result = evaluator._compute_metrics_for_method(
-            method, interventions, edge_cost_edits=edge_edits
+            method,
+            interventions,
+            edge_cost_edits=edge_edits,
+            actions=actions,
+            cost_model=cost_model,
         )
         evaluator.results[method] = result
 
@@ -437,18 +441,20 @@ def run_multi_seed():
     graph = build_enterprise_attack_graph()
     evaluator = MIRAGEEvaluator(graph, n_episodes=300, seed=42, results_dir="results")
 
-    print("\n[Multi-Seed] Running Benchmark A across 10 seeds...")
+    smoke_seeds = list(range(3))
+    smoke_episodes = 200
+    print(f"\n[Multi-Seed] Running Benchmark A across {len(smoke_seeds)} seeds...")
     aggregated_a = evaluator.run_multi_seed_benchmark(
-        seeds=list(range(10)),
-        n_episodes=500,
+        seeds=smoke_seeds,
+        n_episodes=smoke_episodes,
         benchmark_type="a",
         verbose=True,
     )
 
-    print("\n[Multi-Seed] Running Benchmark B across 10 seeds...")
+    print(f"\n[Multi-Seed] Running Benchmark B across {len(smoke_seeds)} seeds...")
     aggregated_b = evaluator.run_multi_seed_benchmark(
-        seeds=list(range(10)),
-        n_episodes=500,
+        seeds=smoke_seeds,
+        n_episodes=smoke_episodes,
         benchmark_type="b",
         verbose=True,
     )

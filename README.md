@@ -51,11 +51,21 @@
 | Tính năng | Mô tả |
 |-----------|-------|
 | 🎭 **Deception-first** | AI tự động triển khai Fake Database, Router giả, Honey Credential |
-| 🔐 **Robust Decision Making** | Tối ưu hóa worst-case (pessimistic) theo Game Theory |
+| 🔐 **Robust Decision Making** | So sánh `expected`, `pure_pessimistic`, `cost_aware_robust` |
 | 🧠 **POMDP-based** | Mô hình trạng thái tin tưởng (belief state) về vị trí kẻ tấn công |
 | 🛡️ **Safety Gate** | Kiểm soát 7 tầng bảo vệ trước khi thực thi bất kỳ hành động nào |
-| 📊 **Multi-attacker Benchmark** | Đánh giá với 4 loại kẻ tấn công: Random, Greedy, Shortest Path, Stealthy |
+| 📊 **Multi-attacker Benchmark** | Đánh giá với 5 attacker: Random, Greedy, Shortest Path, Stealthy, Deception Aware |
 | 🔍 **MITRE ATT&CK** | Phân loại giai đoạn tấn công theo framework chuẩn quốc tế |
+
+### Research simulator invariants
+
+- `decoy_sites` là slot tiềm năng; chỉ `active_decoy_sites` mới được tính là decoy outcome.
+- Clean no-defense graph không có transition đi vào decoy slot.
+- Portfolio rỗng tạo đúng cùng runtime graph và kết quả với no-defense.
+- Reward intervention chỉ đổi bait reward; edge-cost action mới được đổi transition probability.
+- Simulation và exact MDP solver luôn nhận cùng runtime graph đã áp portfolio.
+- `standard_rl` và `robust_mirage` dùng cùng engine, catalog, budget và composite cost model.
+- Optimizer chạy offline/background; online path dùng `PolicyCache` để lookup rồi qua safety gate trước khi deploy.
 
 ---
 
