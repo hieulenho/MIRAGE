@@ -12,7 +12,7 @@
 ║   ╚═╝     ╚═╝╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝               ║
 ║                                                                   ║
 ║   Multi-stage Intelligent Robust Adaptive Graph-based Engagement  ║
-║   Version 1.0 — Research Simulator                                ║
+║   Version 2.0 — Production-oriented Research Platform             ║
 ╚═══════════════════════════════════════════════════════════════════╝
 ```
 
@@ -20,8 +20,8 @@
 
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Version](https://img.shields.io/badge/Version-1.0.0-orange)
-![Framework](https://img.shields.io/badge/Framework-Research%20Simulator-purple)
+![Version](https://img.shields.io/badge/Version-2.0.0-orange)
+![Framework](https://img.shields.io/badge/Framework-Production--oriented-purple)
 
 </div>
 
@@ -54,8 +54,11 @@
 | 🔐 **Robust Decision Making** | So sánh `expected`, `pure_pessimistic`, `cost_aware_robust` |
 | 🧠 **POMDP-based** | Mô hình trạng thái tin tưởng (belief state) về vị trí kẻ tấn công |
 | 🛡️ **Safety Gate** | Kiểm soát 7 tầng bảo vệ trước khi thực thi bất kỳ hành động nào |
-| 📊 **Multi-attacker Benchmark** | Đánh giá với 5 attacker: Random, Greedy, Shortest Path, Stealthy, Deception Aware |
+| 📊 **Multi-attacker Benchmark** | Đánh giá 6 profile, gồm Deception Aware và MITRE Evasion |
 | 🔍 **MITRE ATT&CK** | Phân loại giai đoạn tấn công theo framework chuẩn quốc tế |
+| 🤖 **Deep RL** | DQN backend với Gymnasium environment, PyTorch tùy chọn và NumPy MLP fallback |
+| 📡 **Real-time API** | FastAPI REST/WebSocket ingestion cho Splunk, Elastic và Wazuh |
+| 🖥️ **Dashboard** | Attack Graph, belief state, active defenses và decision log thời gian thực |
 
 ### Research simulator invariants
 
@@ -135,16 +138,23 @@ MIRAGE/
 ├── .gitignore
 │
 └── mirage/                         # Package chính
-    ├── __init__.py                 # Package metadata (v1.0.0)
+    ├── __init__.py                 # Package metadata (v2.0.0)
+    ├── config.py                   # Configuration loader trung tâm
     │
     ├── layer1_attack_modeling.py   # Layer 1: Phân loại giai đoạn tấn công
+    ├── layer1_hmm.py               # HMM + ensemble telemetry classifier
     ├── layer2_attack_graph.py      # Layer 2: Đồ thị tấn công POMDP 15 node
+    ├── graph_parser.py             # Parser MIRAGE/BloodHound/Nmap JSON
     ├── layer3_deception.py         # Layer 3: Deception Fabric
     ├── layer4_decision_engine.py   # Layer 4: Robust Decision Engine
+    ├── rl_agent.py                 # Deep Q-Network + Gymnasium environment
     ├── layer5_safe_control.py      # Layer 5: Safety Gate
     ├── layer6_evaluation.py        # Layer 6: Benchmark & Evaluation
+    ├── api_server.py               # FastAPI REST/WebSocket orchestration
+    ├── attacker_mitre.py           # MITRE ATT&CK evasion attacker
+    ├── dashboard/                  # Web dashboard
     │
-    └── attacker_agents.py          # Mô phỏng 4 loại kẻ tấn công
+    └── attacker_agents.py          # Mô phỏng 5 loại kẻ tấn công
 ```
 
 ---
@@ -161,7 +171,9 @@ MIRAGE/
 |----------|-----------|---------|
 | `numpy` | ≥ 1.24.0 | Tính toán ma trận, xác suất |
 | `matplotlib` | ≥ 3.7.0 | Vẽ biểu đồ kết quả benchmark |
-| `pulp` | ≥ 2.7.0 | MILP solver (Robust Optimization) |
+| `gymnasium` | ≥ 1.0.0 | Chuẩn environment cho Deep RL |
+| `fastapi`, `pydantic` | phiên bản trong `requirements.txt` | API schema và ingestion |
+| `uvicorn` | ≥ 0.30.0 | ASGI production server |
 
 ---
 
@@ -192,6 +204,13 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+Để phát triển và chạy test:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
 ---
 
 ## ▶️ Hướng dẫn chạy
@@ -216,10 +235,70 @@ python run_mirage.py [--mode <mode>]
 | `python run_mirage.py --mode benchmark_b` | Benchmark B: belief-conditioned response, attacker đã ở giữa mạng | ~1-2 phút |
 | `python run_mirage.py --mode multi_seed` | Benchmark A+B qua nhiều seed để lấy mean/std và confidence interval | ~20-40 phút |
 | `python run_mirage.py --mode scaling` | Scaling benchmark trên synthetic graph 100/500/1000 node | ~3-10 phút |
+| `python run_mirage.py --mode train_rl --episodes 200` | Train DQN và lưu `models/mirage_dqn.npz` | phụ thuộc số episode |
 | `python run_mirage.py --mode ablation` | Ablation study phân tích đóng góp từng component | ~1 phút |
 | `python run_mirage.py --mode graph` | Hiển thị thông tin đồ thị tấn công | < 1 giây |
 
 > Thời gian chạy là ước tính trên máy phát triển thông thường. Các mode `multi_seed` và `scaling` có thể lâu hơn nếu CPU chậm hoặc số episode/candidate được tăng lên.
+
+### Giai đoạn 3: Deep RL, API và Dashboard
+
+Train model DQN:
+
+```bash
+python run_mirage.py --mode train_rl --episodes 200
+```
+
+Khởi động API:
+
+```bash
+python -m mirage.api_server
+```
+
+Sau đó mở:
+
+- Dashboard: `http://localhost:8000/dashboard`
+- OpenAPI: `http://localhost:8000/docs`
+- Health check: `http://localhost:8000/healthz`
+
+Các endpoint ingestion chính:
+
+```text
+POST /api/telemetry
+POST /api/telemetry/batch
+POST /api/ingest/splunk
+POST /api/ingest/elastic
+POST /api/ingest/wazuh
+POST /api/decisions/{decision_id}/approve
+WS   /ws
+```
+
+`POST /api/decide` hỗ trợ `backend: "robust"` hoặc `backend: "rl"`. Mọi
+portfolio đều đi qua Safety Gate; action cần human approval hoặc bị block sẽ
+không được deploy và không bị trừ budget.
+
+Thiết lập biến môi trường `MIRAGE_API_KEY` để yêu cầu header `X-API-Key` cho
+các REST endpoint `/api/*`.
+
+### Configuration
+
+MIRAGE đọc `config.json` qua `mirage/config.py`. Có thể trỏ sang file khác:
+
+```bash
+set MIRAGE_CONFIG=C:\path\to\config.json
+```
+
+Để dùng topology import thay vì graph 15 node:
+
+```json
+{
+  "topology": {
+    "source": "file",
+    "path": "examples/enterprise_topology.json",
+    "format": "mirage"
+  }
+}
+```
 
 ### Ví dụ output — `--mode step2`
 
@@ -259,9 +338,10 @@ Quick Comparison (3 methods):
 
 ## 🔬 Chi tiết từng Layer
 
-### Layer 1 — Multi-Stage Attack Modeling (`layer1_attack_modeling.py`)
+### Layer 1 — Multi-Stage Attack Modeling (`layer1_attack_modeling.py`, `layer1_hmm.py`)
 
-Phân loại giai đoạn tấn công theo **MITRE ATT&CK** dựa trên luật (rule-based classifier).
+Kết hợp classifier rule-based với **Hidden Markov Model** theo chuỗi thời gian.
+Ensemble mặc định dùng trọng số HMM `0.6`, cấu hình tại `layer1.hmm_weight`.
 
 **8 giai đoạn tấn công được hỗ trợ:**
 

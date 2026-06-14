@@ -31,14 +31,13 @@ Chú thích:
 
 from __future__ import annotations
 
-import sys
-import os
 import random
 import copy
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
-import numpy as np
+
+from mirage.config import load_config, resolve_project_path
 
 # ---------------------------------------------------------------------------
 # Node definitions — Enterprise Network Topology
@@ -170,12 +169,52 @@ class MIRAGEAttackGraph:
         return state in self.true_goals
 
     def get_high_risk_paths(self) -> List[List[int]]:
-        """Trả về các đường dẫn rủi ro cao từ entry đến True Goal."""
-        return [
-            [INTERNET, WEB_DMZ, WS_FIN, SVC_CRED, DB_REAL],           # Path 1: Web → Finance WS → DB
-            [INTERNET, MAIL_DMZ, WS_ENG, ADMIN_CRED, DC_NODE, DB_REAL], # Path 2: Mail → Admin → DC → DB
-            [INTERNET, WEB_DMZ, SMB_SHARE, SVC_CRED, DB_REAL],          # Path 3: Web → SMB → Cred → DB
+        """Return up to three simple entry-to-goal paths for explanations."""
+        goals = set(self.true_goals)
+        starts = [
+            state
+            for state, probability in sorted(
+                self.start_distribution.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+            if probability > 0
         ]
+        if not starts or not goals:
+            return []
+
+        adjacency: Dict[int, List[Tuple[int, float]]] = {}
+        for source in self.states:
+            destinations: Dict[int, float] = {}
+            for action, distribution in self.transitions.get(source, {}).items():
+                if action in {"end", "noop"}:
+                    continue
+                for destination, probability in distribution.items():
+                    if destination == self.sink_state or probability <= 0:
+                        continue
+                    destinations[destination] = max(
+                        destinations.get(destination, 0.0),
+                        float(probability),
+                    )
+            adjacency[source] = sorted(
+                destinations.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+
+        max_depth = min(max(2, len(self.states)), 20)
+        queue: List[List[int]] = [[start] for start in starts]
+        paths: List[List[int]] = []
+        while queue and len(paths) < 3:
+            path = queue.pop(0)
+            current = path[-1]
+            if current in goals:
+                paths.append(path)
+                continue
+            if len(path) >= max_depth:
+                continue
+            for destination, _ in adjacency.get(current, []):
+                if destination not in path:
+                    queue.append(path + [destination])
+        return paths
 
     def update_belief(self, observation: Dict[int, float]) -> None:
         """
@@ -388,9 +427,9 @@ def apply_runtime_graph_in_place(
 
 
 def build_enterprise_attack_graph(
-    budget: float = 4.0,
-    discount: float = 0.95,
-    decoy_realism: float = 0.8,
+    budget: Optional[float] = None,
+    discount: Optional[float] = None,
+    decoy_realism: Optional[float] = None,
 ) -> MIRAGEAttackGraph:
     """
     Xây dựng đồ thị tấn công doanh nghiệp 15 node.
@@ -403,6 +442,14 @@ def build_enterprise_attack_graph(
     Returns:
         MIRAGEAttackGraph hoàn chỉnh
     """
+    config = load_config()
+    if budget is None:
+        budget = config.get("general", {}).get("budget_limit", 4.0)
+    if discount is None:
+        discount = config.get("general", {}).get("discount_factor", 0.95)
+    if decoy_realism is None:
+        decoy_realism = config.get("layer2", {}).get("decoy_realism", 0.8)
+
     states = list(range(15))
 
     # ---- AVAILABLE ACTIONS PER STATE ----
@@ -589,8 +636,8 @@ def build_enterprise_attack_graph(
 
 def build_synthetic_enterprise_graph(
     n_nodes: int = 100,
-    budget: float = 12.0,
-    discount: float = 0.95,
+    budget: Optional[float] = None,
+    discount: Optional[float] = None,
     seed: int = 42,
     decoy_fraction: float = 0.03,
 ) -> MIRAGEAttackGraph:
@@ -600,6 +647,12 @@ def build_synthetic_enterprise_graph(
     This is intentionally metadata-rich so the decision engine can test
     100/500/1000-node behavior without exploding the action catalog.
     """
+    config = load_config()
+    if budget is None:
+        budget = config.get("general", {}).get("budget_limit", 12.0)
+    if discount is None:
+        discount = config.get("general", {}).get("discount_factor", 0.95)
+
     if n_nodes < 30:
         raise ValueError("n_nodes must be >= 30 for the synthetic scaling graph")
 
@@ -838,6 +891,36 @@ def build_synthetic_enterprise_graph(
     return graph
 
 
+def build_configured_attack_graph(config: Optional[Dict] = None) -> MIRAGEAttackGraph:
+    """Build the configured topology, falling back to the built-in graph."""
+    config = config or load_config()
+    topology = config.get("topology", {})
+    source = str(topology.get("source", "builtin")).lower()
+    if source == "builtin":
+        return build_enterprise_attack_graph()
+    if source != "file":
+        raise ValueError("topology.source must be either 'builtin' or 'file'")
+
+    topology_path = resolve_project_path(topology.get("path", ""))
+    if not topology_path.exists():
+        raise FileNotFoundError(f"Configured topology does not exist: {topology_path}")
+
+    from mirage.graph_parser import load_attack_graph
+
+    graph = load_attack_graph(
+        str(topology_path),
+        fmt=topology.get("format"),
+        config={
+            "budget": config.get("general", {}).get("budget_limit", 4.0),
+            "discount": config.get("general", {}).get("discount_factor", 0.95),
+            "decoy_realism": config.get("layer2", {}).get("decoy_realism", 0.8),
+        },
+    )
+    graph.budget = float(config.get("general", {}).get("budget_limit", graph.budget))
+    graph.discount = float(config.get("general", {}).get("discount_factor", graph.discount))
+    return graph
+
+
 def print_graph_summary(graph: MIRAGEAttackGraph) -> None:
     """In tóm tắt đồ thị tấn công."""
     print("=" * 70)
@@ -850,11 +933,17 @@ def print_graph_summary(graph: MIRAGEAttackGraph) -> None:
     print()
     print("NETWORK TOPOLOGY:")
     print("-" * 70)
-    for node_id, meta in NODE_DEFINITIONS.items():
+    for node_id in graph.states:
+        meta = graph.node_metadata.get(node_id, {})
         is_goal  = "🎯 TRUE GOAL" if graph.is_true_goal(node_id) else ""
-        is_decoy = "🪤 DECOY"     if graph.is_decoy(node_id)     else ""
+        is_decoy = "🪤 ACTIVE DECOY" if graph.is_decoy(node_id) else ""
+        is_slot = "DECOY SLOT" if node_id in graph.decoy_sites and not is_decoy else ""
         flag     = is_goal or is_decoy
-        print(f"  Node {node_id:2d}: {meta['label']:30s} [{meta['layer']:12s}] {flag}")
+        flag = flag or is_slot
+        print(
+            f"  Node {node_id:2d}: {graph.label(node_id):30s} "
+            f"[{meta.get('layer', 'unknown'):12s}] {flag}"
+        )
     print()
     print("HIGH-RISK ATTACK PATHS:")
     print("-" * 70)

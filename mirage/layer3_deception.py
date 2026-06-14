@@ -24,9 +24,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
-import random
+import copy
 import time
 import uuid
+
+from mirage.config import load_config
+
+_CONFIG = load_config()
+_DECEPTION_CONFIG = _CONFIG.get("layer3", {}).get("deception_actions", {})
 
 
 class DeceptionActionType(Enum):
@@ -211,49 +216,73 @@ def _build_generic_action_catalog(
     """
     actions: List[DeceptionAction] = []
     decoys = [d for d in graph.decoy_sites if d in graph.states and d != graph.sink_state]
+    decoy_db_slots = [
+        node for node in decoys
+        if graph.node_metadata.get(node, {}).get("asset_type") == "decoy_db"
+    ]
+    decoy_router_slots = [
+        node for node in decoys
+        if graph.node_metadata.get(node, {}).get("asset_type") == "decoy_router"
+    ]
 
     db_nodes = list(dict.fromkeys(
-        decoys
+        decoy_db_slots
         + _top_nodes(
             graph,
             lambda _n, m: m.get("asset_type") in {"database", "file_share", "workstation", "decoy_db"},
             max_actions_per_type,
         )
     ))[:max_actions_per_type]
+    cfg_db = _DECEPTION_CONFIG.get("deploy_decoy_database", {})
     for node in db_nodes:
         fields = _operational_fields(graph, node, DeceptionActionType.DEPLOY_DECOY_DATABASE)
+        fields["business_impact"] = cfg_db.get(
+            "business_impact",
+            fields["business_impact"],
+        )
         actions.append(DeceptionAction(
             action_type=DeceptionActionType.DEPLOY_DECOY_DATABASE,
             target_node=node,
-            risk_score=min(0.45, 0.08 + fields["business_impact"] * 0.45),
-            realism_score=0.82,
-            cost=1.5,
+            risk_score=cfg_db.get(
+                "risk_score",
+                min(0.45, 0.08 + fields["business_impact"] * 0.45),
+            ),
+            realism_score=cfg_db.get("realism_score", 0.82),
+            cost=cfg_db.get("cost", 1.5),
             description=f"Deploy synthetic database lure near Node {node} ({graph.label(node)}).",
             rollback_plan="Stop decoy database workload and remove route/DNS exposure",
-            reward_delta=0.85,
+            reward_delta=cfg_db.get("reward_delta", 0.85),
             **fields,
         ))
 
     router_nodes = list(dict.fromkeys(
-        decoys
+        decoy_router_slots
         + _top_nodes(
             graph,
             lambda _n, m: m.get("asset_type") in {"dns_server", "web_server", "mail_server", "decoy_router"},
             max_actions_per_type,
         )
     ))[:max_actions_per_type]
+    cfg_router = _DECEPTION_CONFIG.get("deploy_decoy_router", {})
     for node in router_nodes:
         fields = _operational_fields(graph, node, DeceptionActionType.DEPLOY_DECOY_ROUTER)
+        fields["business_impact"] = cfg_router.get(
+            "business_impact",
+            fields["business_impact"],
+        )
         actions.append(DeceptionAction(
             action_type=DeceptionActionType.DEPLOY_DECOY_ROUTER,
             target_node=node,
-            risk_score=min(0.55, 0.12 + fields["business_impact"] * 0.50),
-            realism_score=0.76,
-            cost=1.2,
+            risk_score=cfg_router.get(
+                "risk_score",
+                min(0.55, 0.12 + fields["business_impact"] * 0.50),
+            ),
+            realism_score=cfg_router.get("realism_score", 0.76),
+            cost=cfg_router.get("cost", 1.2),
             description=f"Deploy fake routing/service waypoint near Node {node} ({graph.label(node)}).",
             rollback_plan="Remove virtual route, DNS advertisement, and monitoring hooks",
-            reward_delta=0.70,
-            edge_cost_delta=0.30,
+            reward_delta=cfg_router.get("reward_delta", 0.70),
+            edge_cost_delta=cfg_router.get("edge_cost_delta", 0.30),
             **fields,
         ))
 
@@ -262,17 +291,25 @@ def _build_generic_action_catalog(
         lambda _n, m: m.get("asset_type") in {"credential", "workstation", "file_share"},
         max_actions_per_type,
     )
+    cfg_cred = _DECEPTION_CONFIG.get("scatter_honey_credential", {})
     for node in cred_nodes:
         fields = _operational_fields(graph, node, DeceptionActionType.SCATTER_HONEY_CREDENTIAL)
+        fields["business_impact"] = cfg_cred.get(
+            "business_impact",
+            fields["business_impact"],
+        )
         actions.append(DeceptionAction(
             action_type=DeceptionActionType.SCATTER_HONEY_CREDENTIAL,
             target_node=node,
-            risk_score=min(0.35, 0.05 + fields["business_impact"] * 0.35),
-            realism_score=0.90,
-            cost=0.8,
+            risk_score=cfg_cred.get(
+                "risk_score",
+                min(0.35, 0.05 + fields["business_impact"] * 0.35),
+            ),
+            realism_score=cfg_cred.get("realism_score", 0.90),
+            cost=cfg_cred.get("cost", 0.8),
             description=f"Plant honey credential material at Node {node} ({graph.label(node)}).",
             rollback_plan="Disable honey identity and remove seeded credential material",
-            reward_delta=0.50,
+            reward_delta=cfg_cred.get("reward_delta", 0.50),
             **fields,
         ))
 
@@ -297,6 +334,7 @@ def _build_generic_action_catalog(
     edge_candidates.sort(reverse=True)
 
     seen_edges = set()
+    cfg_edge = _DECEPTION_CONFIG.get("increase_edge_cost", {})
     for _score, src, dst in edge_candidates:
         if len(seen_edges) >= max_actions_per_type:
             break
@@ -304,16 +342,24 @@ def _build_generic_action_catalog(
             continue
         seen_edges.add((src, dst))
         fields = _operational_fields(graph, dst, DeceptionActionType.INCREASE_EDGE_COST)
+        fields["business_impact"] = cfg_edge.get(
+            "business_impact",
+            fields["business_impact"],
+        )
         actions.append(DeceptionAction(
             action_type=DeceptionActionType.INCREASE_EDGE_COST,
             target_node=dst,
             target_edge=(src, dst),
-            risk_score=min(0.45, 0.04 + fields["business_impact"] * 0.45),
-            realism_score=1.0,
-            cost=0.5,
+            risk_score=cfg_edge.get(
+                "risk_score",
+                min(0.45, 0.04 + fields["business_impact"] * 0.45),
+            ),
+            realism_score=cfg_edge.get("realism_score", 1.0),
+            cost=cfg_edge.get("cost", 0.5),
             description=f"Throttle high-risk movement edge {graph.label(src)} -> {graph.label(dst)}.",
             rollback_plan="Remove throttle/MFA/firewall rule for this edge",
-            edge_cost_delta=0.5,
+            reward_delta=cfg_edge.get("reward_delta", 0.0),
+            edge_cost_delta=cfg_edge.get("edge_cost_delta", 0.5),
             **fields,
         ))
 
@@ -325,99 +371,101 @@ def get_action_catalog(graph, max_actions_per_type: int = 40) -> List[DeceptionA
     Trả về danh sách đầy đủ các hành động deception khả dụng.
     Tương thích với đồ thị tấn công doanh nghiệp 15 node.
     """
-    if len(graph.states) > 30:
+    is_builtin = (
+        len(graph.states) == 15
+        and graph.label(10) == "DB_REAL_Finance"
+        and graph.label(14) == "Sink"
+    )
+    if not is_builtin:
         return _build_generic_action_catalog(graph, max_actions_per_type=max_actions_per_type)
 
     from mirage.layer2_attack_graph import (
         DB_FAKE, RTR_FAKE, WS_FIN, WS_ENG, WS_IT,
         SMB_SHARE, SVC_CRED, ADMIN_CRED, DNS_INT,
-        WEB_DMZ, MAIL_DMZ, DC_NODE, DB_REAL
+        WEB_DMZ, DC_NODE, DB_REAL
     )
     actions = []
 
     # ---- 1. DEPLOY DECOY DATABASE ----
-    # Đặt Fake Database tại các node tiềm năng
+    cfg_db = _DECEPTION_CONFIG.get("deploy_decoy_database", {})
     decoy_db_nodes = [DB_FAKE, WS_FIN, SMB_SHARE]
     for node in decoy_db_nodes:
         actions.append(DeceptionAction(
             action_type=DeceptionActionType.DEPLOY_DECOY_DATABASE,
             target_node=node,
-            risk_score=0.1,
-            realism_score=0.85,
-            business_impact=0.05,
-            cost=1.5,
+            risk_score=cfg_db.get("risk_score", 0.1),
+            realism_score=cfg_db.get("realism_score", 0.85),
+            business_impact=cfg_db.get("business_impact", 0.05),
+            cost=cfg_db.get("cost", 1.5),
             description=(
                 f"Deploy Fake Database at Node {node} ({graph.label(node)}). "
                 "Contains synthetic financial records with watermarks. "
                 "Triggers alert on any SQL query."
             ),
             rollback_plan="Shut down decoy DB container",
-            reward_delta=0.9,  # Đặt reward cao để kéo attacker vào đây
+            reward_delta=cfg_db.get("reward_delta", 0.9),
         ))
 
     # ---- 2. DEPLOY DECOY ROUTER ----
-    # Đặt Router giả tại các điểm phân nhánh
+    cfg_rtr = _DECEPTION_CONFIG.get("deploy_decoy_router", {})
     decoy_router_nodes = [RTR_FAKE, DNS_INT, WEB_DMZ]
     for node in decoy_router_nodes:
         actions.append(DeceptionAction(
             action_type=DeceptionActionType.DEPLOY_DECOY_ROUTER,
             target_node=node,
-            risk_score=0.15,
-            realism_score=0.75,
-            business_impact=0.08,
-            cost=1.2,
+            risk_score=cfg_rtr.get("risk_score", 0.15),
+            realism_score=cfg_rtr.get("realism_score", 0.75),
+            business_impact=cfg_rtr.get("business_impact", 0.08),
+            cost=cfg_rtr.get("cost", 1.2),
             description=(
                 f"Deploy Fake Router/Gateway at Node {node} ({graph.label(node)}). "
                 "Presents realistic routing table and SNMP banners. "
                 "Redirects traffic to honeynet."
             ),
             rollback_plan="Disable virtual router interface",
-            reward_delta=0.7,
-            edge_cost_delta=0.3,
+            reward_delta=cfg_rtr.get("reward_delta", 0.7),
+            edge_cost_delta=cfg_rtr.get("edge_cost_delta", 0.3),
         ))
 
     # ---- 3. SCATTER HONEY CREDENTIAL ----
-    # Rải tài khoản giả tại các vị trí attacker có thể dump
+    cfg_cred = _DECEPTION_CONFIG.get("scatter_honey_credential", {})
     honey_cred_nodes = [WS_FIN, WS_ENG, WS_IT, SMB_SHARE, ADMIN_CRED, SVC_CRED]
     for node in honey_cred_nodes:
         actions.append(DeceptionAction(
             action_type=DeceptionActionType.SCATTER_HONEY_CREDENTIAL,
             target_node=node,
-            risk_score=0.05,
-            realism_score=0.90,
-            business_impact=0.02,
-            cost=0.8,
+            risk_score=cfg_cred.get("risk_score", 0.05),
+            realism_score=cfg_cred.get("realism_score", 0.90),
+            business_impact=cfg_cred.get("business_impact", 0.02),
+            cost=cfg_cred.get("cost", 0.8),
             description=(
                 f"Plant Honey Credential at Node {node} ({graph.label(node)}). "
                 "Fake admin account 'svc_backup_2023' with convincing password hash. "
                 "Triggers alert if credential is used anywhere."
             ),
             rollback_plan="Deactivate honey account in IAM",
-            reward_delta=0.5,
+            reward_delta=cfg_cred.get("reward_delta", 0.5),
         ))
 
     # ---- 4. INCREASE EDGE COST ----
-    # Tăng chi phí di chuyển trên các CẠNH THẬT dẫn đến DB_REAL.
-    # Mục đích: chặn/làm khó attacker trên đường tấn công thực sự,
-    # không phải chỉ hướng họ sang decoy.
-    # Khi apply: giảm xác suất đi qua edge → phân phối lại sang decoy/sink.
+    cfg_edge = _DECEPTION_CONFIG.get("increase_edge_cost", {})
     critical_edges = [
-        (WS_FIN,    SVC_CRED),   # Finance WS → ServiceAcct Credential (đường ngắn nhất qua Finance)
-        (SVC_CRED,  DB_REAL),    # ServiceAcct Cred → DB thật (junction cuối cùng)
-        (WS_ENG,    ADMIN_CRED), # Engineering WS → Admin Credential
-        (ADMIN_CRED, DC_NODE),   # Admin Cred → Domain Controller
-        (DC_NODE,   DB_REAL),    # Domain Controller → DB thật (đường DC attack)
-        (SMB_SHARE, SVC_CRED),   # SMB FileShare → ServiceAcct Cred
+        (WS_FIN,    SVC_CRED),
+        (SVC_CRED,  DB_REAL),
+        (WS_ENG,    ADMIN_CRED),
+        (ADMIN_CRED, DC_NODE),
+        (DC_NODE,   DB_REAL),
+        (SMB_SHARE, SVC_CRED),
     ]
     for src, dst in critical_edges:
         actions.append(DeceptionAction(
             action_type=DeceptionActionType.INCREASE_EDGE_COST,
             target_node=dst,
             target_edge=(src, dst),
-            risk_score=0.05,
-            realism_score=1.0,  # Vô hình với attacker (firewall rule)
-            business_impact=0.03,
-            cost=0.5,
+            risk_score=cfg_edge.get("risk_score", 0.05),
+            realism_score=cfg_edge.get("realism_score", 1.0),
+            business_impact=cfg_edge.get("business_impact", 0.03),
+            cost=cfg_edge.get("cost", 0.5),
             description=(
                 f"Increase movement cost on critical real path: "
                 f"{graph.label(src)} → {graph.label(dst)}. "
@@ -425,8 +473,8 @@ def get_action_catalog(graph, max_actions_per_type: int = 40) -> List[DeceptionA
                 "Reduces transition probability; redistributes toward decoys or sink."
             ),
             rollback_plan="Remove throttle rule from firewall/SDN",
-            reward_delta=0.0,
-            edge_cost_delta=0.5,  # Cao hơn trước (0.4→0.5) để có tác động rõ ràng
+            reward_delta=cfg_edge.get("reward_delta", 0.0),
+            edge_cost_delta=cfg_edge.get("edge_cost_delta", 0.5),
         ))
 
     return actions
@@ -447,8 +495,13 @@ class DeceptionFabric:
     4. Thu thập intelligence
     """
 
-    def __init__(self, graph, max_actions_per_type: int = 40):
+    def __init__(self, graph, max_actions_per_type: Optional[int] = None):
+        if max_actions_per_type is None:
+            max_actions_per_type = int(
+                _CONFIG.get("layer3", {}).get("max_actions_per_type", 40)
+            )
         self.graph = graph
+        self._base_graph = copy.deepcopy(graph)
         self.active_decoys: Dict[str, ActiveDecoy] = {}
         self.deployed_actions: List[DeceptionAction] = []
         self.action_catalog = get_action_catalog(graph, max_actions_per_type=max_actions_per_type)
@@ -458,12 +511,20 @@ class DeceptionFabric:
         # Mapping: (node, action) → reward delta (dành cho Robust RL)
         self.reward_interventions: Dict[Tuple[int, str], float] = {}
 
+    def generate_action_catalog(self) -> List[DeceptionAction]:
+        """Return a copy of the configured action catalog."""
+        return list(self.action_catalog)
+
     def get_available_actions(self, budget_remaining: float) -> List[DeceptionAction]:
         """Lọc các action khả dụng theo ngân sách."""
         from mirage.mdp_solver import compute_composite_cost
+        deployed_ids = {action.action_id for action in self.deployed_actions}
         return [
             a for a in self.action_catalog
-            if compute_composite_cost(a, self.graph).total <= budget_remaining
+            if (
+                a.action_id not in deployed_ids
+                and compute_composite_cost(a, self.graph).total <= budget_remaining
+            )
         ]
 
     def deploy_action(self, action: DeceptionAction) -> ActiveDecoy:
@@ -473,7 +534,16 @@ class DeceptionFabric:
         Returns:
             ActiveDecoy object đang được triển khai
         """
+        if any(
+            deployed.action_id == action.action_id
+            for deployed in self.deployed_actions
+        ):
+            raise ValueError(f"Action already deployed: {action.action_id}")
+
         decoy_id = str(uuid.uuid4())[:8]
+        from mirage.mdp_solver import compute_composite_cost
+
+        deployment_cost = compute_composite_cost(action, self.graph).total
 
         # Cập nhật đồ thị tùy theo loại action
         if action.action_type == DeceptionActionType.DEPLOY_DECOY_DATABASE:
@@ -490,8 +560,7 @@ class DeceptionFabric:
 
         # Tạo ActiveDecoy record
         self.deployed_actions.append(action)
-        from mirage.layer2_attack_graph import apply_runtime_graph_in_place
-        apply_runtime_graph_in_place(self.graph, actions=self.deployed_actions)
+        self._refresh_runtime_graph()
 
         decoy = ActiveDecoy(
             decoy_id=decoy_id,
@@ -500,10 +569,23 @@ class DeceptionFabric:
             deployed_at=time.time(),
         )
         self.active_decoys[decoy_id] = decoy
-        from mirage.mdp_solver import compute_composite_cost
-        self.total_cost_spent += compute_composite_cost(action, self.graph).total
+        self.total_cost_spent += deployment_cost
 
         return decoy
+
+    def _refresh_runtime_graph(self) -> None:
+        """Rebuild deployment effects from the immutable topology baseline."""
+        from mirage.layer2_attack_graph import build_runtime_graph
+
+        runtime = build_runtime_graph(
+            self._base_graph,
+            actions=self.deployed_actions,
+        )
+        self.graph.transitions = runtime.transitions
+        self.graph.active_decoy_sites = runtime.active_decoy_sites
+        self.graph.edge_costs = runtime.edge_costs
+        self.graph.node_metadata = runtime.node_metadata
+        self.graph.defender_reward = runtime.defender_reward
 
     def _deploy_decoy_database(self, action: DeceptionAction) -> None:
         """Triển khai fake database — tăng reward kéo attacker vào đây."""
@@ -580,8 +662,7 @@ class DeceptionFabric:
                 for action in self.deployed_actions
                 if id(action) not in retired_ids
             ]
-            from mirage.layer2_attack_graph import apply_runtime_graph_in_place
-            apply_runtime_graph_in_place(self.graph, actions=self.deployed_actions)
+            self._refresh_runtime_graph()
         return retired
 
     def get_interception_rate(self) -> float:

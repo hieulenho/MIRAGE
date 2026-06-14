@@ -20,7 +20,7 @@ Dependencies: numpy (required), scipy (optional, for sparse solvers on large gra
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import numpy as np
 
@@ -310,8 +310,6 @@ class MDPSolver:
         P = np.zeros((n, n))
         r_def = np.zeros(n)
 
-        interventions = reward_interventions or {}
-
         for s in self.graph.states:
             i = self.state_to_idx[s]
             actions = self.graph.available_actions.get(s, [])
@@ -549,7 +547,6 @@ class MDPSolver:
         """
         n = self.n_states
         gamma = self._discount
-        interventions = reward_interventions or {}
         V = np.zeros(n)
 
         for iteration in range(max_iters):
@@ -862,7 +859,6 @@ def build_hierarchical_subgraph(
     Returns:
         Subgraph chỉ chứa focus_states + sink
     """
-    import copy
 
     focus_set = set(focus_states)
     # Ensure sink is included
@@ -985,7 +981,7 @@ if __name__ == "__main__":
     if c_star > 0:
         print(f"  [OK] Defense improves worst-case by {c_star:+.4f}")
     else:
-        print(f"  [!] Defense does not improve worst-case")
+        print("  [!] Defense does not improve worst-case")
 
     # 5. Occupancy measure
     print("\n[5] Top occupancy states (attacker visits):")

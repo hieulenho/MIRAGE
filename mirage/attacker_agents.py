@@ -640,6 +640,11 @@ class DeceptionAwareAttacker(BaseAttacker):
 
 def create_attacker(attacker_type: str, graph, seed: int = 42) -> BaseAttacker:
     """Factory function tạo attacker theo loại."""
+    if attacker_type == "mitre_evasion":
+        from mirage.attacker_mitre import MITREEvasionAttacker
+
+        return MITREEvasionAttacker(graph, seed=seed)
+
     types = {
         "random":           RandomAttacker,
         "greedy":           GreedyAttacker,
@@ -648,7 +653,8 @@ def create_attacker(attacker_type: str, graph, seed: int = 42) -> BaseAttacker:
         "deception_aware":  DeceptionAwareAttacker,
     }
     if attacker_type not in types:
-        raise ValueError(f"Unknown attacker type: {attacker_type}. Choose from {list(types.keys())}")
+        choices = list(types.keys()) + ["mitre_evasion"]
+        raise ValueError(f"Unknown attacker type: {attacker_type}. Choose from {choices}")
     return types[attacker_type](graph, seed=seed)
 
 
@@ -708,7 +714,10 @@ if __name__ == "__main__":
 
     print("Testing all attacker types (no defense)...")
     print("=" * 70)
-    for atype in ["random", "greedy", "shortest_path", "stealthy", "deception_aware"]:
+    for atype in [
+        "random", "greedy", "shortest_path", "stealthy",
+        "deception_aware", "mitre_evasion",
+    ]:
         result = run_simulation(graph, atype, n_episodes=200, seed=42)
         print(f"\n{result['attacker_type']:20s}:")
         print(f"  True Goal Hit Rate:      {result['hit_true_goal_rate']:.1%}")
@@ -718,9 +727,22 @@ if __name__ == "__main__":
 
     print("\nTesting with deception (fake DB reward=0.9 planted)...")
     print("=" * 70)
-    fake_interventions = {(11, "end"): 0.9}  # DB_FAKE node 11
-    for atype in ["random", "greedy", "shortest_path", "stealthy", "deception_aware"]:
-        result = run_simulation(graph, atype, n_episodes=200,
+    from mirage.layer2_attack_graph import build_runtime_graph, DB_FAKE
+    from mirage.layer3_deception import DeceptionFabric
+
+    fabric = DeceptionFabric(graph)
+    deploy = next(
+        action for action in fabric.action_catalog
+        if action.action_type.value == "deploy_decoy_database"
+        and action.target_node == DB_FAKE
+    )
+    active_graph = build_runtime_graph(graph, actions=[deploy])
+    fake_interventions = {(DB_FAKE, "end"): deploy.reward_delta}
+    for atype in [
+        "random", "greedy", "shortest_path", "stealthy",
+        "deception_aware", "mitre_evasion",
+    ]:
+        result = run_simulation(active_graph, atype, n_episodes=200,
                                 reward_interventions=fake_interventions, seed=42)
         print(f"\n{result['attacker_type']:20s} (with deception):")
         print(f"  True Goal Hit Rate:      {result['hit_true_goal_rate']:.1%}")

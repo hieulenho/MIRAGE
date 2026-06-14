@@ -28,6 +28,10 @@ import time
 import json
 import os
 
+from mirage.config import load_config
+
+_CONFIG = load_config()
+
 
 class RiskLevel(Enum):
     """Cấp độ rủi ro của hành động."""
@@ -112,7 +116,7 @@ class SafetyGate:
     """
 
     # Node IDs quan trọng KHÔNG được tự động block/isolate
-    PROTECTED_NODES = {10, 13}  # DB_REAL, DomainController
+    PROTECTED_NODES = set(_CONFIG.get("layer5", {}).get("protected_nodes", [10, 13]))
 
     # Action types không bao giờ được phép thực thi
     FORBIDDEN_ACTIONS = {
@@ -142,6 +146,25 @@ class SafetyGate:
         self.budget_spent: float = 0.0
         self.audit_entries: List[AuditLogEntry] = []
         self._pending_approvals: List[Dict] = []
+        layer_config = _CONFIG.get("layer5", {})
+        self.protected_nodes = set(
+            layer_config.get("protected_nodes", self.PROTECTED_NODES)
+        )
+        self.protected_asset_types = set(
+            layer_config.get("protected_asset_types", ["database", "dc"])
+        )
+
+    def _is_protected(self, node: int, graph=None) -> bool:
+        if graph is None:
+            return node in self.protected_nodes
+        if node in getattr(graph, "true_goals", []):
+            return True
+        metadata = getattr(graph, "node_metadata", {}).get(node, {}) or {}
+        if metadata.get("is_real") is False:
+            return False
+        if node in self.protected_nodes:
+            return True
+        return metadata.get("asset_type") in self.protected_asset_types
 
     def classify_risk(self, action, graph=None) -> RiskLevel:
         """
@@ -150,7 +173,7 @@ class SafetyGate:
         risk_score = action.risk_score
 
         # Tăng risk nếu target là node quan trọng
-        if hasattr(action, 'target_node') and action.target_node in self.PROTECTED_NODES:
+        if hasattr(action, "target_node") and self._is_protected(action.target_node, graph):
             risk_score = min(1.0, risk_score + 0.4)
 
         # Tăng risk nếu business impact cao
@@ -167,7 +190,12 @@ class SafetyGate:
         else:
             return RiskLevel.CRITICAL
 
-    def check_action_plan(self, plan, graph=None) -> Tuple[bool, SafetyDecision]:
+    def check_action_plan(
+        self,
+        plan,
+        graph=None,
+        reserve_budget: bool = True,
+    ) -> Tuple[bool, SafetyDecision]:
         """
         Kiểm tra một ActionPlan trước khi thực thi.
         
@@ -178,7 +206,9 @@ class SafetyGate:
         risk_level = self.classify_risk(plan.action, graph)
         warnings = []
         allowed = True
-        requires_human = False
+        requires_human = bool(getattr(plan, "required_approval", False))
+        if requires_human:
+            audit_notes.append("Decision engine requested human approval")
         from mirage.mdp_solver import compute_portfolio_cost
 
         plan_actions = getattr(plan, "portfolio", None) or [plan.action]
@@ -206,14 +236,18 @@ class SafetyGate:
             )
 
         # ---- GUARDRAIL 2: Forbidden action types ----
-        action_str = plan.action.action_type.value
-        if action_str in self.FORBIDDEN_ACTIONS:
+        forbidden = [
+            action.action_type.value
+            for action in plan_actions
+            if action.action_type.value in self.FORBIDDEN_ACTIONS
+        ]
+        if forbidden:
             return False, SafetyDecision(
                 allowed=False,
                 risk_level=RiskLevel.CRITICAL,
-                warning_message=f"🚫 FORBIDDEN ACTION: '{action_str}' is not in the allowed list.",
+                warning_message=f"🚫 FORBIDDEN ACTION: '{forbidden[0]}' is not in the allowed list.",
                 requires_human_approval=True,
-                audit_notes=[f"Forbidden action blocked: {action_str}"],
+                audit_notes=[f"Forbidden action blocked: {forbidden[0]}"],
             )
 
         # ---- GUARDRAIL 3: Budget check ----
@@ -225,21 +259,27 @@ class SafetyGate:
             audit_notes.append(budget_warning)
             return False, SafetyDecision(
                 allowed=False,
-                risk_level=RiskLevel.MEDIUM,
+                risk_level=risk_level,
                 warning_message=f"⚠️ Budget limit exceeded. {budget_warning}",
                 requires_human_approval=False,
                 audit_notes=audit_notes,
             )
 
         # ---- GUARDRAIL 4: Protected node check ----
-        if plan.target_node in self.PROTECTED_NODES:
+        protected_targets = [
+            action.target_node
+            for action in plan_actions
+            if self._is_protected(action.target_node, graph)
+        ]
+        if protected_targets:
             warnings.append(
-                f"⚠️ Target is PROTECTED node (Node {plan.target_node}: {plan.target_node_label}). "
+                f"⚠️ Portfolio targets protected node(s): {sorted(set(protected_targets))}. "
                 "Extra caution required."
             )
-            risk_level = RiskLevel.HIGH
+            if risk_rank[risk_level] < risk_rank[RiskLevel.HIGH]:
+                risk_level = RiskLevel.HIGH
             requires_human = True
-            audit_notes.append(f"Protected node targeted: {plan.target_node_label}")
+            audit_notes.append(f"Protected nodes targeted: {sorted(set(protected_targets))}")
 
         # ---- GUARDRAIL 5: Risk-based approval ----
         if risk_level == RiskLevel.LOW:
@@ -253,7 +293,7 @@ class SafetyGate:
                 f"{plan.action.action_type.value} tại {plan.target_node_label}. "
                 "Đang được ghi lại và theo dõi kỹ."
             )
-            audit_notes.append(f"MEDIUM risk - logging enhanced monitoring")
+            audit_notes.append("MEDIUM risk - logging enhanced monitoring")
 
         elif risk_level == RiskLevel.HIGH:
             # Cảnh báo mạnh, cần human approval
@@ -315,7 +355,7 @@ class SafetyGate:
         self._add_audit_entry(entry)
 
         # Cập nhật budget nếu được phép
-        if allowed:
+        if reserve_budget and allowed and not requires_human:
             self.budget_spent += request_cost
 
         decision = SafetyDecision(
@@ -345,6 +385,20 @@ class SafetyGate:
                     }) + "\n")
             except Exception:
                 pass
+
+    def commit_action_plan(self, plan, graph=None) -> float:
+        """Commit budget after a previously approved plan is deployed."""
+        from mirage.mdp_solver import compute_portfolio_cost
+
+        plan_actions = getattr(plan, "portfolio", None) or [plan.action]
+        cost_report = compute_portfolio_cost(plan_actions, graph)
+        request_cost = float(
+            getattr(plan, "portfolio_cost", 0.0) or cost_report["total"]
+        )
+        if self.budget_spent + request_cost > self.budget_limit:
+            raise ValueError("Cannot commit plan: safety budget would be exceeded.")
+        self.budget_spent += request_cost
+        return request_cost
 
     def enter_fail_safe(self, reason: str = "Manual override") -> None:
         """Kích hoạt fail-safe mode (observe-only)."""
@@ -408,9 +462,12 @@ class SafetyGate:
 
 def create_safety_gate(
     audit_log_dir: str = "results",
-    budget_limit: float = 6.0,
+    budget_limit: Optional[float] = None,
 ) -> SafetyGate:
     """Factory function tạo Safety Gate với audit logging."""
+    if budget_limit is None:
+        budget_limit = load_config().get("general", {}).get("budget_limit", 6.0)
+
     os.makedirs(audit_log_dir, exist_ok=True)
     audit_path = os.path.join(audit_log_dir, "mirage_audit_log.jsonl")
     return SafetyGate(
@@ -437,8 +494,7 @@ def make_safety_filter(gate: SafetyGate, graph=None):
 
 if __name__ == "__main__":
     from mirage.layer2_attack_graph import build_enterprise_attack_graph
-    from mirage.layer3_deception import DeceptionFabric, DeceptionActionType
-    from mirage.layer4_decision_engine import RobustDecisionEngine, ActionPlan
+    from mirage.layer3_deception import DeceptionActionType
 
     print("Testing Layer 5 — Safety Gate")
     graph = build_enterprise_attack_graph()
@@ -446,7 +502,7 @@ if __name__ == "__main__":
 
     # Test với các action có risk level khác nhau
     from mirage.layer3_deception import DeceptionAction
-    from mirage.layer2_attack_graph import DB_FAKE, DB_REAL, DC_NODE
+    from mirage.layer2_attack_graph import DB_FAKE, DB_REAL
 
     print("\n--- Test 1: LOW risk action (Fake DB at decoy node) ---")
     low_risk_action = DeceptionAction(

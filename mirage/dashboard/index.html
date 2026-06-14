@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="MIRAGE — Real-time Cyber Deception Dashboard for Attack Graph Monitoring">
+  <title>MIRAGE — Cyber Deception Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/dashboard-static/style.css">
+</head>
+<body>
+
+  <!-- ============ TOP NAVIGATION BAR ============ -->
+  <nav class="topbar" id="topbar">
+    <div class="topbar__brand">
+      <span class="topbar__logo">◈</span>
+      <span class="topbar__title">MIRAGE</span>
+      <span class="topbar__subtitle">Cyber Deception Engine</span>
+    </div>
+    <div class="topbar__status">
+      <div class="topbar__indicator" id="ws-indicator">
+        <span class="indicator__dot"></span>
+        <span class="indicator__text">Connecting…</span>
+      </div>
+      <div class="topbar__metric" id="metric-events">
+        <span class="metric__value">0</span>
+        <span class="metric__label">Events</span>
+      </div>
+      <div class="topbar__metric" id="metric-hosts">
+        <span class="metric__value">0</span>
+        <span class="metric__label">Hosts</span>
+      </div>
+      <div class="topbar__metric" id="metric-decoys">
+        <span class="metric__value">0</span>
+        <span class="metric__label">Decoys</span>
+      </div>
+    </div>
+  </nav>
+
+  <!-- ============ MAIN LAYOUT ============ -->
+  <main class="layout">
+
+    <!-- LEFT: Attack Graph Visualization -->
+    <section class="panel panel--graph" id="panel-graph">
+      <div class="panel__header">
+        <h2 class="panel__title">🗺️ Attack Graph</h2>
+        <div class="panel__controls">
+          <button class="btn btn--icon" id="btn-reset-view" title="Reset view">⟳</button>
+          <button class="btn btn--icon" id="btn-toggle-labels" title="Toggle labels">🏷️</button>
+        </div>
+      </div>
+      <div class="panel__body graph-container" id="graph-container">
+        <canvas id="graph-canvas" width="900" height="600"></canvas>
+        <!-- Node tooltip -->
+        <div class="node-tooltip" id="node-tooltip" style="display:none;">
+          <div class="tooltip__title" id="tooltip-title"></div>
+          <div class="tooltip__body" id="tooltip-body"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- RIGHT: Side panels -->
+    <aside class="sidebar">
+
+      <!-- Belief State Panel -->
+      <section class="panel panel--belief" id="panel-belief">
+        <div class="panel__header">
+          <h2 class="panel__title">🧠 Belief State</h2>
+        </div>
+        <div class="panel__body" id="belief-body">
+          <div class="empty-state">Waiting for telemetry data…</div>
+        </div>
+      </section>
+
+      <!-- Active Decoys Panel -->
+      <section class="panel panel--decoys" id="panel-decoys">
+        <div class="panel__header">
+          <h2 class="panel__title">🛡️ Active Defenses</h2>
+        </div>
+        <div class="panel__body" id="decoys-body">
+          <div class="empty-state">No active deception actions</div>
+        </div>
+      </section>
+
+      <!-- Decision Log Panel -->
+      <section class="panel panel--log" id="panel-log">
+        <div class="panel__header">
+          <h2 class="panel__title">📋 Audit Log</h2>
+          <button class="btn btn--sm" id="btn-clear-log">Clear</button>
+        </div>
+        <div class="panel__body log-container" id="log-body">
+          <div class="empty-state">No events yet</div>
+        </div>
+      </section>
+
+    </aside>
+
+  </main>
+
+  <!-- ============ BOTTOM BAR (Quick Actions) ============ -->
+  <footer class="bottombar" id="bottombar">
+    <div class="bottombar__group">
+      <button class="btn btn--primary" id="btn-trigger-decision">⚡ Trigger Decision</button>
+      <button class="btn btn--secondary" id="btn-simulate-attack">🎯 Simulate Attack</button>
+      <button class="btn btn--secondary" id="btn-refresh-graph">🔄 Refresh Graph</button>
+    </div>
+    <div class="bottombar__info">
+      <span id="uptime-display">Uptime: —</span>
+      <span id="api-url">API: <code>localhost:8000</code></span>
+    </div>
+  </footer>
+
+  <script src="/dashboard-static/app.js"></script>
+</body>
+</html>

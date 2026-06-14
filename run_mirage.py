@@ -2,7 +2,7 @@
 MIRAGE — Main Entry Point
 =========================
 Multi-stage Intelligent Robust Adaptive Graph-based Engagement
-Version 1: Research Simulator
+Version 2: Production-oriented Research Platform
 
 Usage:
   python run_mirage.py                    # Chạy demo đầy đủ end-to-end
@@ -12,6 +12,7 @@ Usage:
   python run_mirage.py --mode benchmark_b # Benchmark B: Belief-conditioned response (mid-network)
   python run_mirage.py --mode multi_seed  # Multi-seed Benchmark A+B với confidence intervals
   python run_mirage.py --mode scaling     # Scaling benchmark trên synthetic graph 100/500/1000 node
+  python run_mirage.py --mode train_rl    # Train và lưu Deep Q-Network
   python run_mirage.py --mode step1       # Bước 1: MVP (Layer 2+4)
   python run_mirage.py --mode step2       # Bước 2: Đắp thịt (Layer 3+6+Attackers)
   python run_mirage.py --mode step3       # Bước 3: Gắn mắt phanh (Layer 1+5)
@@ -46,7 +47,7 @@ BANNER = r"""
 ║   ╚═╝     ╚═╝╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝               ║
 ║                                                                   ║
 ║   Multi-stage Intelligent Robust Adaptive Graph-based Engagement  ║
-║   Version 1.0 — Research Simulator                                ║
+║   Version 2.0 — Production-oriented Research Platform             ║
 ║   Based on: Robust Reward Design for Attack Graph MDP             ║
 ╚═══════════════════════════════════════════════════════════════════╝
 """
@@ -208,8 +209,8 @@ def run_step3_safety():
         AttackStageClassifier, simulate_attack_telemetry
     )
     from mirage.layer2_attack_graph import build_enterprise_attack_graph
-    from mirage.layer3_deception import DeceptionFabric, DeceptionAction, DeceptionActionType
-    from mirage.layer5_safe_control import SafetyGate, RiskLevel, create_safety_gate
+    from mirage.layer3_deception import DeceptionActionType
+    from mirage.layer5_safe_control import create_safety_gate
     from mirage.layer2_attack_graph import DB_FAKE, DB_REAL, RTR_FAKE
 
     graph = build_enterprise_attack_graph()
@@ -444,7 +445,7 @@ def run_multi_seed():
     smoke_seeds = list(range(3))
     smoke_episodes = 200
     print(f"\n[Multi-Seed] Running Benchmark A across {len(smoke_seeds)} seeds...")
-    aggregated_a = evaluator.run_multi_seed_benchmark(
+    evaluator.run_multi_seed_benchmark(
         seeds=smoke_seeds,
         n_episodes=smoke_episodes,
         benchmark_type="a",
@@ -452,7 +453,7 @@ def run_multi_seed():
     )
 
     print(f"\n[Multi-Seed] Running Benchmark B across {len(smoke_seeds)} seeds...")
-    aggregated_b = evaluator.run_multi_seed_benchmark(
+    evaluator.run_multi_seed_benchmark(
         seeds=smoke_seeds,
         n_episodes=smoke_episodes,
         benchmark_type="b",
@@ -477,6 +478,35 @@ def run_scaling_benchmark():
     )
 
 
+def run_train_rl(episodes: int = 200, model_path: str = "models/mirage_dqn.npz"):
+    """Train the Deep RL defender and persist a reusable model."""
+    from mirage.layer2_attack_graph import build_configured_attack_graph
+    from mirage.layer3_deception import DeceptionFabric
+    from mirage.rl_agent import RLDecisionBridge
+
+    graph = build_configured_attack_graph()
+    fabric = DeceptionFabric(graph)
+    bridge = RLDecisionBridge(graph, fabric, seed=42)
+    bridge.train(
+        n_episodes=episodes,
+        belief_state=dict(graph.belief_state),
+        verbose=True,
+    )
+    model_dir = os.path.dirname(os.path.abspath(model_path))
+    os.makedirs(model_dir, exist_ok=True)
+    bridge.save_model(model_path)
+
+    plan = bridge.get_action_plan(
+        belief_state=dict(graph.belief_state),
+        budget_remaining=graph.budget,
+    )
+    if plan is None:
+        print("\n[RL Agent] Trained policy recommends NOOP for the initial belief.")
+    else:
+        print("\n[RL Agent] Inference smoke test:")
+        print(plan)
+
+
 def show_graph_info():
     """Hiển thị thông tin đồ thị."""
     from mirage.layer2_attack_graph import build_enterprise_attack_graph, print_graph_summary
@@ -486,7 +516,7 @@ def show_graph_info():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="MIRAGE — Research Simulator v1.0",
+        description="MIRAGE — Production-oriented Research Platform v2.0",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -494,10 +524,22 @@ def main():
         "--mode",
         choices=[
             "demo", "benchmark", "benchmark_a", "benchmark_b",
-            "multi_seed", "scaling", "step1", "step2", "step3", "ablation", "graph",
+            "multi_seed", "scaling", "train_rl", "step1", "step2",
+            "step3", "ablation", "graph",
         ],
         default="demo",
         help="Chế độ chạy",
+    )
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=200,
+        help="Training episodes for --mode train_rl",
+    )
+    parser.add_argument(
+        "--model-path",
+        default="models/mirage_dqn.npz",
+        help="Output model path for --mode train_rl",
     )
     args = parser.parse_args()
 
@@ -525,6 +567,8 @@ def main():
         run_multi_seed()
     elif args.mode == "scaling":
         run_scaling_benchmark()
+    elif args.mode == "train_rl":
+        run_train_rl(args.episodes, args.model_path)
     elif args.mode == "ablation":
         from mirage.layer2_attack_graph import build_enterprise_attack_graph
         from mirage.layer6_evaluation import MIRAGEEvaluator

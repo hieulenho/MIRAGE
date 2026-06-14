@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 import time
 
 
@@ -191,7 +191,7 @@ class AttackStageClassifier:
             evidence.append(f"Multiple login failures ({counters['login_failures']})")
         if counters["login_failures"] > 5:
             scores[AttackStage.INITIAL_ACCESS] += 0.4
-            evidence.append(f"Brute force pattern detected")
+            evidence.append("Brute force pattern detected")
 
         # IF honey credential được dùng THEN Initial Access/Credential
         if counters["honey_credential_uses"] > 0:
@@ -246,7 +246,7 @@ class AttackStageClassifier:
         # IF external_connection + data_transfer THEN Exfiltration
         if counters["external_connections"] > 0 and counters["data_transfers"] > 0:
             scores[AttackStage.EXFILTRATION] += 0.9
-            evidence.append(f"External transfer detected → Exfiltration")
+            evidence.append("External transfer detected → Exfiltration")
 
         if counters["external_connections"] > 2:
             scores[AttackStage.EXFILTRATION] += 0.4
@@ -301,12 +301,12 @@ class AttackStageClassifier:
             lines.append(f"  Dominant Stage: [{STAGE_NAMES[est.dominant_stage]}] ({est.confidence:.1%})")
             lines.append(f"  MITRE Tactic: {MITRE_TACTIC_MAP.get(est.dominant_stage, 'N/A')}")
             top3 = sorted(est.stage_distribution.items(), key=lambda x: -x[1])[:3]
-            lines.append(f"  Stage Distribution (Top 3):")
+            lines.append("  Stage Distribution (Top 3):")
             for stage, prob in top3:
                 if prob > 0.01:
                     lines.append(f"    {STAGE_NAMES[stage]:20s}: {prob:.2%}")
             if est.evidence:
-                lines.append(f"  Evidence:")
+                lines.append("  Evidence:")
                 for e in est.evidence[-3:]:  # Hiện 3 evidence gần nhất
                     lines.append(f"    • {e}")
         return "\n".join(lines)

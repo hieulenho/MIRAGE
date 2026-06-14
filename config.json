@@ -1,0 +1,77 @@
+{
+  "general": {
+    "budget_limit": 6.0,
+    "discount_factor": 0.95
+  },
+  "topology": {
+    "source": "builtin",
+    "path": "examples/enterprise_topology.json",
+    "format": "mirage"
+  },
+  "layer1": {
+    "hmm_weight": 0.6
+  },
+  "layer2": {
+    "decoy_realism": 0.8
+  },
+  "layer3": {
+    "max_actions_per_type": 40,
+    "deception_actions": {
+      "deploy_decoy_database": {
+        "risk_score": 0.1,
+        "realism_score": 0.85,
+        "business_impact": 0.05,
+        "cost": 1.5,
+        "reward_delta": 0.9
+      },
+      "deploy_decoy_router": {
+        "risk_score": 0.15,
+        "realism_score": 0.75,
+        "business_impact": 0.08,
+        "cost": 1.2,
+        "reward_delta": 0.7,
+        "edge_cost_delta": 0.3
+      },
+      "scatter_honey_credential": {
+        "risk_score": 0.05,
+        "realism_score": 0.90,
+        "business_impact": 0.02,
+        "cost": 0.8,
+        "reward_delta": 0.5
+      },
+      "increase_edge_cost": {
+        "risk_score": 0.05,
+        "realism_score": 1.0,
+        "business_impact": 0.03,
+        "cost": 0.5,
+        "reward_delta": 0.0,
+        "edge_cost_delta": 0.5
+      }
+    }
+  },
+  "layer5": {
+    "protected_nodes": [10, 13],
+    "protected_asset_types": ["database", "dc"]
+  },
+  "rl": {
+    "max_steps": 5,
+    "n_attacker_episodes": 12,
+    "cost_weight": 0.015,
+    "max_actions": 200,
+    "hidden_size": 128,
+    "model_path": "models/mirage_dqn.npz"
+  },
+  "api": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "cors_origins": [
+      "http://localhost:8000",
+      "http://127.0.0.1:8000"
+    ],
+    "max_batch_size": 1000,
+    "decision_backend": "robust",
+    "decision_samples": 60,
+    "auto_deploy": true,
+    "api_key_env": "MIRAGE_API_KEY"
+  }
+}

@@ -1,6 +1,6 @@
 """
 MIRAGE - Multi-stage Intelligent Robust Adaptive Graph-based Engagement
-Version 1: Research Simulator
+Version 2: Production-oriented Research Platform
 
 Kiến trúc 6 lớp:
   Layer 1: Multi-Stage Attack Modeling
@@ -11,5 +11,5 @@ Kiến trúc 6 lớp:
   Layer 6: Evaluation, Digital Twin & Continuous Learning
 """
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 __author__ = "MIRAGE Research Team"

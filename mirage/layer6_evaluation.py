@@ -83,8 +83,15 @@ class MIRAGEEvaluator:
         "robust_mirage",
     ]
 
-    # 5 loại attacker (thêm deception_aware)
-    ATTACKER_TYPES = ["random", "greedy", "shortest_path", "stealthy", "deception_aware"]
+    # Six attacker profiles, including deception-aware and MITRE evasion.
+    ATTACKER_TYPES = [
+        "random",
+        "greedy",
+        "shortest_path",
+        "stealthy",
+        "deception_aware",
+        "mitre_evasion",
+    ]
 
     # Belief state cố định cho Benchmark B (mid-network intrusion scenario)
     BENCHMARK_B_BELIEF = {
@@ -635,13 +642,6 @@ class MIRAGEEvaluator:
         print(top_row)
         print(fmt_row(HEADERS))
         print(sep_row())
-
-        # Tìm best values cho mỗi metric
-        best_intercept = max(r.interception_rate for r in self.results.values())
-        best_hit = min(r.hit_true_goal_rate for r in self.results.values())
-        best_steps = max(r.time_to_compromise for r in self.results.values())
-        best_pess = max(r.pessimistic_value for r in self.results.values())
-        best_gap = min(r.robustness_gap for r in self.results.values())
 
         for method in self.METHODS:
             if method not in self.results:

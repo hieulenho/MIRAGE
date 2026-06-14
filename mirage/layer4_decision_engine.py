@@ -23,21 +23,9 @@ Workflow tại mỗi time step:
 
 from __future__ import annotations
 
-import sys
-import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 import time
-import json
-
-# Thêm đường dẫn codebase cũ để dùng thuật toán Robust RL
-_ROBUST_RL_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "..", "..",
-    "robust_reward_design_journal_production_suite",
-    "robust_reward_design_lab", "src"
-)
-if os.path.exists(_ROBUST_RL_PATH):
-    sys.path.insert(0, os.path.abspath(_ROBUST_RL_PATH))
 
 from mirage.layer2_attack_graph import MIRAGEAttackGraph
 from mirage.layer3_deception import DeceptionAction, DeceptionFabric, DeceptionActionType
@@ -129,7 +117,7 @@ class ActionPlan:
         if self.portfolio:
             portfolio_lines = "\nPortfolio:\n" + "\n".join(
                 f"  [{i+1}] {a.action_type.value:35s} -> Node {a.target_node:2d} "
-                f"| cost={compute_composite_cost(a).total:.1f} | risk={a.risk_score:.2f}"
+                f"| base_cost={a.cost:.1f} | risk={a.risk_score:.2f}"
                 for i, a in enumerate(self.portfolio)
             )
             portfolio_lines += f"\nTotal portfolio cost: {self.portfolio_cost:.1f}\n"
@@ -175,13 +163,20 @@ class RobustDecisionEngine:
     Lớp 4: Bộ não ra quyết định Robust.
     
     Tối ưu pessimistic defender value bằng cách:
-    1. Đánh giá mỗi DeceptionAction qua nhiều loại attacker (5 loại, kể cả deception_aware)
+    1. Đánh giá mỗi DeceptionAction qua nhiều loại attacker, kể cả MITRE evasion
     2. Chọn action có pessimistic_value cao nhất (robust to worst-case)
     3. Ánh xạ kết quả toán học → ActionPlan có thể thực thi
     """
 
-    # Tất cả 5 loại attacker — dùng chung cho cả optimization lẫn evaluation
-    ALL_ATTACKER_TYPES = ["random", "greedy", "shortest_path", "stealthy", "deception_aware"]
+    # Six attacker profiles shared by optimization and evaluation.
+    ALL_ATTACKER_TYPES = [
+        "random",
+        "greedy",
+        "shortest_path",
+        "stealthy",
+        "deception_aware",
+        "mitre_evasion",
+    ]
 
     def __init__(
         self,
@@ -201,7 +196,9 @@ class RobustDecisionEngine:
         self.graph = graph
         self.fabric = fabric
         self.n_attacker_samples = n_attacker_samples
-        self.use_robust_milp = use_robust_milp
+        # Kept for API compatibility. The external MILP package was removed;
+        # exact MDP math and robust simulation are now fully in-package.
+        self.use_robust_milp = False
         self.seed = seed
         self.operational_cost_weight = operational_cost_weight
         self.false_positive_weight = false_positive_weight
@@ -215,25 +212,6 @@ class RobustDecisionEngine:
         
         # Exact MDP Math Solver
         self.mdp_solver = MDPSolver(graph)
-
-        # Thử import robust MILP solver từ codebase cũ
-        self._milp_available = self._check_milp_available()
-
-    def _check_milp_available(self) -> bool:
-        """Kiểm tra xem robust MILP solver có khả dụng không."""
-        try:
-            import pulp
-            # Thử import từ codebase cũ
-            if os.path.exists(_ROBUST_RL_PATH):
-                import importlib.util
-                spec = importlib.util.spec_from_file_location(
-                    "robust_reward_design",
-                    os.path.join(_ROBUST_RL_PATH, "robust_reward_design.py")
-                )
-                return spec is not None
-        except ImportError:
-            pass
-        return False
 
     def _run_attacker_simulation(
         self,
@@ -293,66 +271,6 @@ class RobustDecisionEngine:
             "per_attacker":      dict(zip(attacker_types, defender_values)),
             "reward_interventions": reward_interventions,
         }
-
-    def _run_milp_optimization(self, budget: float) -> Optional[Dict]:
-        """
-        Chạy MILP Robust Reward Design từ codebase cũ (nếu khả dụng).
-        Trả về x_alloc tối ưu.
-        """
-        if not self._milp_available:
-            return None
-        try:
-            sys.path.insert(0, _ROBUST_RL_PATH)
-            from mdp_model import AttackGraphMDP, InterventionSite
-            from robust_reward_design import solve_max_margin_reward_design
-
-            # Chuyển enterprise graph sang AttackGraphMDP format
-            mdp_data = self.graph.to_mdp_dict()
-
-            # Build AttackGraphMDP compatible format
-            transitions_compat = {}
-            for s, acts in mdp_data["transitions"].items():
-                transitions_compat[int(s)] = {
-                    a: {int(ns): float(p) for ns, p in nxt.items()}
-                    for a, nxt in acts.items()
-                }
-
-            from mdp_model import _parse_sa_key
-            attacker_reward = {_parse_sa_key(k): float(v) for k, v in mdp_data["attacker_reward"].items()}
-            defender_reward = {_parse_sa_key(k): float(v) for k, v in mdp_data["defender_reward"].items()}
-            interventions = [
-                InterventionSite(name=it["name"], state=int(it["state"]), action=it["action"])
-                for it in mdp_data["interventions"]
-            ]
-
-            mdp = AttackGraphMDP(
-                name=mdp_data["name"],
-                states=[int(s) for s in mdp_data["states"]],
-                actions=mdp_data["actions"],
-                available_actions={int(k): v for k, v in mdp_data["available_actions"].items()},
-                transitions=transitions_compat,
-                start_distribution={int(k): float(v) for k, v in mdp_data["start_distribution"].items()},
-                discount=float(mdp_data["discount"]),
-                budget=float(budget),
-                true_goals=[int(s) for s in mdp_data["true_goals"]],
-                decoy_sites=[int(s) for s in mdp_data["decoy_sites"]],
-                sink_state=int(mdp_data["sink_state"]),
-                state_labels={int(k): v for k, v in mdp_data["state_labels"].items()},
-                attacker_reward=attacker_reward,
-                defender_reward=defender_reward,
-                interventions=interventions,
-            )
-
-            result = solve_max_margin_reward_design(mdp, solver_msg=False, time_limit_seconds=30)
-            return {
-                "x_ip": result.x_ip,
-                "c_star": result.c_star,
-                "v1_star": result.v1_star,
-                "solver_status": result.solver_status,
-            }
-        except Exception as e:
-            print(f"  [!] MILP solver error: {e}. Falling back to simulation-based method.")
-            return None
 
     def evaluate_action(self, action: DeceptionAction) -> Dict:
         """(Legacy) Đánh giá một action đơn lẻ qua simulation."""

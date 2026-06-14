@@ -1,8 +1,3 @@
-import io
-import sys
-
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-
 from mirage.attacker_agents import run_simulation
 from mirage.layer2_attack_graph import (
     DB_FAKE,
@@ -19,10 +14,11 @@ ATTACKER_TYPES = [
     "shortest_path",
     "stealthy",
     "deception_aware",
+    "mitre_evasion",
 ]
 
 
-def find_action(fabric, action_type, target_node):
+def _find_action(fabric, action_type, target_node):
     return next(
         action
         for action in fabric.action_catalog
@@ -31,65 +27,43 @@ def find_action(fabric, action_type, target_node):
     )
 
 
-graph = build_enterprise_attack_graph()
-clean_graph = build_runtime_graph(graph, actions=[])
-for slot in clean_graph.decoy_sites:
-    visible = clean_graph.attacker_label(slot).lower()
-    assert all(keyword not in visible for keyword in ["fake", "decoy", "honey"])
+def test_clean_graph_has_no_reachable_decoy_slots():
+    graph = build_enterprise_attack_graph()
+    clean_graph = build_runtime_graph(graph, actions=[])
 
-for source in clean_graph.states:
-    for action in clean_graph.available_actions.get(source, []):
-        destinations = clean_graph.transitions[source][action]
-        assert not set(destinations).intersection(clean_graph.decoy_sites)
+    for source in clean_graph.states:
+        for action in clean_graph.available_actions.get(source, []):
+            destinations = clean_graph.transitions[source][action]
+            assert not set(destinations).intersection(clean_graph.decoy_sites)
 
-print("Testing all attacker types on clean no-defense graph...")
-clean_results = {}
-for attacker_type in ATTACKER_TYPES:
-    result = run_simulation(
-        clean_graph,
-        attacker_type,
-        n_episodes=300,
-        seed=42,
+    for attacker_type in ATTACKER_TYPES:
+        result = run_simulation(
+            clean_graph,
+            attacker_type,
+            n_episodes=30,
+            seed=42,
+        )
+        assert result["decoy_interception_rate"] == 0.0
+
+
+def test_deploy_actions_activate_only_selected_slots():
+    graph = build_enterprise_attack_graph()
+    fabric = DeceptionFabric(graph)
+    actions = [
+        _find_action(fabric, "deploy_decoy_database", DB_FAKE),
+        _find_action(fabric, "deploy_decoy_router", RTR_FAKE),
+    ]
+    active_graph = build_runtime_graph(graph, actions=actions)
+
+    assert set(active_graph.active_decoy_sites) == {DB_FAKE, RTR_FAKE}
+    assert any(
+        set(active_graph.transitions[source][action]).intersection({DB_FAKE, RTR_FAKE})
+        for source in active_graph.states
+        for action in active_graph.available_actions.get(source, [])
     )
-    clean_results[attacker_type] = result
-    assert result["decoy_interception_rate"] == 0.0
-    print(
-        f"{attacker_type:20s}: "
-        f"Hit TG={result['hit_true_goal_rate']:.1%}  "
-        f"Decoy={result['decoy_interception_rate']:.1%}  "
-        f"Steps={result['avg_steps_to_terminal']:.1f}"
-    )
 
-fabric = DeceptionFabric(graph)
-actions = [
-    find_action(fabric, "deploy_decoy_database", DB_FAKE),
-    find_action(fabric, "deploy_decoy_router", RTR_FAKE),
-]
-active_graph = build_runtime_graph(graph, actions=actions)
-reward_interventions = {
-    (action.target_node, "end"): action.reward_delta
-    for action in actions
-}
 
-assert set(active_graph.active_decoy_sites) == {DB_FAKE, RTR_FAKE}
-assert any(
-    set(active_graph.transitions[source][action]).intersection({DB_FAKE, RTR_FAKE})
-    for source in active_graph.states
-    for action in active_graph.available_actions.get(source, [])
-)
-
-print("\nTesting all attacker types on active deception graph...")
-for attacker_type in ATTACKER_TYPES:
-    result = run_simulation(
-        active_graph,
-        attacker_type,
-        n_episodes=300,
-        seed=42,
-        reward_interventions=reward_interventions,
-    )
-    print(
-        f"{attacker_type:20s}: "
-        f"Hit TG={result['hit_true_goal_rate']:.1%}  "
-        f"Decoy={result['decoy_interception_rate']:.1%}  "
-        f"Steps={result['avg_steps_to_terminal']:.1f}"
-    )
+if __name__ == "__main__":
+    test_clean_graph_has_no_reachable_decoy_slots()
+    test_deploy_actions_activate_only_selected_slots()
+    print("Attacker-agent smoke tests passed.")

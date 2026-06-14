@@ -8,6 +8,11 @@ __pycache__/
 venv/
 env/
 .venv/
+.venv-dev/
+.python/
+.uv-cache/
+.pytest_cache/
+.ruff_cache/
 .env/
 
 # Distribution / packaging
@@ -30,6 +35,7 @@ Desktop.ini
 
 # Results (generated at runtime)
 results/
+models/
 
 # Logs
 *.log
