@@ -206,6 +206,7 @@ class HMMTelemetryClassifier:
         transition: Optional[List[List[float]]] = None,
         emission: Optional[List[List[float]]] = None,
         initial: Optional[List[float]] = None,
+        max_tracked_hosts: int = 10000,
     ):
         """
         Args:
@@ -216,12 +217,51 @@ class HMMTelemetryClassifier:
         self._A = transition if transition is not None else _TRANSITION
         self._B = emission if emission is not None else _EMISSION
         self._pi = initial if initial is not None else _INITIAL_PROBS_NORM
+        if max_tracked_hosts < 1:
+            raise ValueError("max_tracked_hosts must be at least 1")
+        self.max_tracked_hosts = int(max_tracked_hosts)
+        self._validate_parameters()
 
         # Per-host forward variables: alpha[host] = List[float] of length N_STATES
         self._alpha: Dict[str, List[float]] = {}
         self._event_counts: Dict[str, int] = {}
         self._log_likelihoods: Dict[str, float] = {}
         self._last_belief: Dict[str, HMMBeliefState] = {}
+        self._last_seen: Dict[str, int] = {}
+        self._sequence = 0
+
+    def _validate_parameters(self) -> None:
+        if len(self._A) != N_STATES or any(
+            len(row) != N_STATES for row in self._A
+        ):
+            raise ValueError(
+                f"transition must have shape {N_STATES}x{N_STATES}"
+            )
+        if len(self._B) != N_STATES or any(
+            len(row) != N_OBS for row in self._B
+        ):
+            raise ValueError(
+                f"emission must have shape {N_STATES}x{N_OBS}"
+            )
+        if len(self._pi) != N_STATES:
+            raise ValueError(f"initial must contain {N_STATES} probabilities")
+        for name, rows in (
+            ("transition", self._A),
+            ("emission", self._B),
+            ("initial", [self._pi]),
+        ):
+            for row in rows:
+                if any(
+                    not math.isfinite(float(value)) or value < 0
+                    for value in row
+                ):
+                    raise ValueError(
+                        f"{name} probabilities must be finite and non-negative"
+                    )
+                if abs(sum(row) - 1.0) > 1e-6:
+                    raise ValueError(
+                        f"Each {name} probability row must sum to 1"
+                    )
 
     def _init_host(self, host: str) -> None:
         """Initialize forward variable for a new host."""
@@ -237,7 +277,12 @@ class HMMTelemetryClassifier:
         """
         host = event.source_host
         if host not in self._alpha:
+            if len(self._alpha) >= self.max_tracked_hosts:
+                oldest = min(self._last_seen, key=self._last_seen.get)
+                self.reset_host(oldest)
             self._init_host(host)
+        self._sequence += 1
+        self._last_seen[host] = self._sequence
 
         obs_idx = _map_event_to_obs_idx(event)
         alpha = self._alpha[host]
@@ -347,6 +392,7 @@ class HMMTelemetryClassifier:
         self._event_counts.pop(host, None)
         self._log_likelihoods.pop(host, None)
         self._last_belief.pop(host, None)
+        self._last_seen.pop(host, None)
 
     def viterbi(self, events: List[TelemetryEvent], host: str = "viterbi_host") -> List[AttackStage]:
         """
@@ -427,10 +473,20 @@ class EnsembleTelemetryClassifier:
       - HMM: chính xác hơn trên chuỗi dài, phát hiện multi-stage sequence
     """
 
-    def __init__(self, hmm_weight: float = 0.6):
+    def __init__(
+        self,
+        hmm_weight: float = 0.6,
+        event_history_limit: int = 1000,
+        max_tracked_hosts: int = 10000,
+    ):
         from mirage.layer1_attack_modeling import AttackStageClassifier
-        self.rule_clf = AttackStageClassifier()
-        self.hmm_clf = HMMTelemetryClassifier()
+        self.rule_clf = AttackStageClassifier(
+            event_history_limit=event_history_limit,
+            max_tracked_hosts=max_tracked_hosts,
+        )
+        self.hmm_clf = HMMTelemetryClassifier(
+            max_tracked_hosts=max_tracked_hosts,
+        )
         self.hmm_weight = max(0.0, min(1.0, hmm_weight))
         self._last_ensemble: Dict[str, Dict[AttackStage, float]] = {}
 

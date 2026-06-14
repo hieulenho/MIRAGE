@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Callable, Dict, List, Optional
 import json
 import os
+import tempfile
 import time
 
 
@@ -75,15 +76,27 @@ class PolicyCache:
         directory = os.path.dirname(self.path)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        with open(self.path, "w", encoding="utf-8") as output:
-            json.dump(
-                {
-                    key: asdict(policy)
-                    for key, policy in self._policies.items()
-                },
-                output,
-                indent=2,
-            )
+        target_directory = directory or "."
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(self.path)}.",
+            suffix=".tmp",
+            dir=target_directory,
+            text=True,
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                json.dump(
+                    {
+                        key: asdict(policy)
+                        for key, policy in self._policies.items()
+                    },
+                    output,
+                    indent=2,
+                )
+            os.replace(temporary_path, self.path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
 
     def load(self) -> None:
         if not os.path.exists(self.path):
@@ -175,6 +188,18 @@ class OnlinePolicyController:
             for action_id in policy.action_ids
             if action_id in catalog
         ]
+        missing = [
+            action_id
+            for action_id in policy.action_ids
+            if action_id not in catalog
+        ]
+        if missing:
+            return {
+                "status": "cache_stale",
+                "stage": stage,
+                "belief": belief_state,
+                "missing_action_ids": missing,
+            }
         safe, reason = safety_gate(actions, belief_state)
         if not safe:
             return {

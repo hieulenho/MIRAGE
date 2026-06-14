@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import math
 import random
+import copy
 from collections import deque
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -92,15 +94,30 @@ class MIRAGEDefenderEnv(_BaseEnv):
         config = load_config().get("rl", {})
         self.graph = graph
         self.fabric = fabric
-        self.max_steps = int(max_steps or config.get("max_steps", 5))
+        self._base_graph = copy.deepcopy(
+            getattr(fabric, "_base_graph", graph)
+        )
+        self.max_steps = int(
+            max_steps if max_steps is not None else config.get("max_steps", 5)
+        )
         self.n_attacker_episodes = int(
-            n_attacker_episodes or config.get("n_attacker_episodes", 12)
+            n_attacker_episodes
+            if n_attacker_episodes is not None
+            else config.get("n_attacker_episodes", 12)
         )
         self.cost_weight = float(
             cost_weight if cost_weight is not None else config.get("cost_weight", 0.015)
         )
         self.max_actions = int(config.get("max_actions", 200))
         self.attacker_type = attacker_type
+        if self.max_steps < 1:
+            raise ValueError("max_steps must be at least 1")
+        if self.n_attacker_episodes < 1:
+            raise ValueError("n_attacker_episodes must be at least 1")
+        if not math.isfinite(self.cost_weight) or self.cost_weight < 0:
+            raise ValueError("cost_weight must be finite and non-negative")
+        if self.max_actions < 1:
+            raise ValueError("rl.max_actions must be at least 1")
         self.rng = random.Random(seed)
         self.np_rng = np.random.RandomState(seed)
 
@@ -151,6 +168,7 @@ class MIRAGEDefenderEnv(_BaseEnv):
                     belief_vec[index] = max(0.0, float(p))
 
         budget_frac = self._budget_remaining / max(1.0, self.graph.budget)
+        budget_frac = min(1.0, max(0.0, budget_frac))
         step_frac = self._step / max(1, self.max_steps)
 
         active_vec = np.zeros(len(self._action_catalog), dtype=np.float32)
@@ -163,6 +181,38 @@ class MIRAGEDefenderEnv(_BaseEnv):
             np.array([budget_frac, step_frac], dtype=np.float32),
             active_vec,
         ])
+
+    def _normalize_belief(
+        self,
+        belief_state: Optional[Dict[int, float]],
+    ) -> Dict[int, float]:
+        source = belief_state or self.graph.belief_state
+        valid_states = set(self.graph.states)
+        normalized: Dict[int, float] = {}
+        for raw_state, raw_probability in source.items():
+            state = int(raw_state)
+            probability = float(raw_probability)
+            if state not in valid_states:
+                raise ValueError(f"Belief references unknown state {state}")
+            if state == self.graph.sink_state:
+                continue
+            if not math.isfinite(probability) or probability < 0:
+                raise ValueError(
+                    "Belief probabilities must be finite and non-negative"
+                )
+            if probability > 0:
+                normalized[state] = (
+                    normalized.get(state, 0.0) + probability
+                )
+        total = sum(normalized.values())
+        if total <= 0:
+            raise ValueError(
+                "Belief must assign positive probability to a non-sink state"
+            )
+        return {
+            state: probability / total
+            for state, probability in normalized.items()
+        }
 
     def reset(
         self,
@@ -179,14 +229,19 @@ class MIRAGEDefenderEnv(_BaseEnv):
         options = options or {}
         belief_state = options.get("belief_state")
         self._step = 0
-        self._budget_remaining = float(
+        requested_budget = float(
             options.get("budget_remaining", self.graph.budget)
         )
+        if not math.isfinite(requested_budget) or requested_budget < 0:
+            raise ValueError(
+                "budget_remaining must be finite and non-negative"
+            )
+        self._budget_remaining = min(requested_budget, self.graph.budget)
         self._active_actions = list(self.fabric.deployed_actions)
         self._active_action_ids = {
             action.action_id for action in self._active_actions
         }
-        self._belief = belief_state or dict(self.graph.belief_state)
+        self._belief = self._normalize_belief(belief_state)
         return self._get_obs(), {"action_mask": self.action_mask()}
 
     def step(self, action_idx: int) -> Tuple[np.ndarray, float, bool, bool, Dict]:
@@ -236,12 +291,26 @@ class MIRAGEDefenderEnv(_BaseEnv):
                 DeceptionActionType.DEPLOY_DECOY_DATABASE,
                 DeceptionActionType.DEPLOY_DECOY_ROUTER,
             ):
-                reward_interventions[(act.target_node, "end")] = act.reward_delta
+                key = (act.target_node, "end")
+                reward_interventions[key] = (
+                    reward_interventions.get(key, 0.0) + act.reward_delta
+                )
             elif act.action_type == DeceptionActionType.SCATTER_HONEY_CREDENTIAL:
-                reward_interventions[(act.target_node, "cred_dump")] = act.reward_delta * 0.5
-                reward_interventions[(act.target_node, "end")] = act.reward_delta * 0.3
+                cred_key = (act.target_node, "cred_dump")
+                end_key = (act.target_node, "end")
+                reward_interventions[cred_key] = (
+                    reward_interventions.get(cred_key, 0.0)
+                    + act.reward_delta * 0.5
+                )
+                reward_interventions[end_key] = (
+                    reward_interventions.get(end_key, 0.0)
+                    + act.reward_delta * 0.3
+                )
 
-        runtime_graph = build_runtime_graph(self.graph, actions=self._active_actions)
+        runtime_graph = build_runtime_graph(
+            self._base_graph,
+            actions=self._active_actions,
+        )
         result = run_simulation(
             runtime_graph,
             self.attacker_type,
@@ -368,6 +437,7 @@ class DQNAgent:
         buffer_size: int = 10000,
         target_update: int = 100,
         seed: int = 42,
+        backend: Optional[str] = None,
     ):
         self.env = env
         self.gamma = gamma
@@ -379,14 +449,43 @@ class DQNAgent:
         self.rng = random.Random(seed)
         self.steps_done = 0
         self.training_rewards: List[float] = []
+        if not math.isfinite(lr) or lr <= 0:
+            raise ValueError("lr must be finite and positive")
+        if not math.isfinite(gamma) or not 0 <= gamma <= 1:
+            raise ValueError("gamma must satisfy 0 <= gamma <= 1")
+        if (
+            not math.isfinite(epsilon_start)
+            or not math.isfinite(epsilon_end)
+            or not 0 <= epsilon_end <= epsilon_start <= 1
+        ):
+            raise ValueError(
+                "epsilon values must satisfy 0 <= end <= start <= 1"
+            )
+        if epsilon_decay < 1:
+            raise ValueError("epsilon_decay must be at least 1")
+        if batch_size < 1 or buffer_size < 1 or target_update < 1:
+            raise ValueError(
+                "batch_size, buffer_size, and target_update must be at least 1"
+            )
 
         self.buffer = ReplayBuffer(buffer_size, seed=seed)
 
         state_dim = env.state_dim
         n_actions = env.n_actions
-        hidden = int(load_config().get("rl", {}).get("hidden_size", 128))
+        rl_config = load_config().get("rl", {})
+        hidden = int(rl_config.get("hidden_size", 128))
+        selected_backend = str(
+            backend or rl_config.get("backend", "numpy")
+        ).lower()
+        if selected_backend not in {"numpy", "torch", "auto"}:
+            raise ValueError("backend must be 'numpy', 'torch', or 'auto'")
+        if selected_backend == "torch" and not HAS_TORCH:
+            raise RuntimeError(
+                "PyTorch backend requested but torch is not installed"
+            )
+        use_torch = HAS_TORCH and selected_backend in {"torch", "auto"}
 
-        if HAS_TORCH:
+        if use_torch:
             torch.manual_seed(seed)
             self.device = torch.device("cpu")
             self.q_network = _QNetwork(state_dim, n_actions, hidden=hidden).to(self.device)
@@ -417,6 +516,13 @@ class DQNAgent:
             ] + [0.0],
             dtype=np.float32,
         )
+
+    def _model_signature(self) -> Tuple[List[int], List[str]]:
+        state_ids = [int(state) for state in self.env.graph.states]
+        action_ids = [
+            action.action_id for action in self.env._action_catalog
+        ] + ["__noop__"]
+        return state_ids, action_ids
 
     def _numpy_weights_copy(self) -> Tuple[np.ndarray, ...]:
         return tuple(
@@ -598,6 +704,10 @@ class DQNAgent:
         Returns:
             List of per-episode cumulative rewards
         """
+        if n_episodes < 1:
+            raise ValueError("n_episodes must be at least 1")
+        if log_every < 1:
+            raise ValueError("log_every must be at least 1")
         all_rewards = []
         best_reward = -float('inf')
 
@@ -697,6 +807,9 @@ class DQNAgent:
 
     def save(self, path: str) -> None:
         """Save trained model weights."""
+        model_path = Path(path)
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        state_ids, action_ids = self._model_signature()
         if self._use_torch:
             torch.save({
                 "q_network": self.q_network.state_dict(),
@@ -706,53 +819,131 @@ class DQNAgent:
                 "training_rewards": self.training_rewards,
                 "state_dim": self.env.state_dim,
                 "n_actions": self.env.n_actions,
-            }, path)
+                "state_ids": state_ids,
+                "action_ids": action_ids,
+            }, model_path)
         else:
-            np.savez(
-                path,
-                W1=self._W1,
-                b1=self._b1,
-                W2=self._W2,
-                b2=self._b2,
-                W3=self._W3,
-                b3=self._b3,
-                steps_done=self.steps_done,
-                training_rewards=np.asarray(self.training_rewards, dtype=np.float32),
-                state_dim=self.env.state_dim,
-                n_actions=self.env.n_actions,
-            )
-        print(f"[RL Agent] Model saved to {path}")
+            with model_path.open("wb") as output:
+                np.savez(
+                    output,
+                    W1=self._W1,
+                    b1=self._b1,
+                    W2=self._W2,
+                    b2=self._b2,
+                    W3=self._W3,
+                    b3=self._b3,
+                    steps_done=self.steps_done,
+                    training_rewards=np.asarray(
+                        self.training_rewards,
+                        dtype=np.float32,
+                    ),
+                    state_dim=self.env.state_dim,
+                    n_actions=self.env.n_actions,
+                    state_ids=np.asarray(state_ids, dtype=np.int64),
+                    action_ids=np.asarray(action_ids, dtype=np.str_),
+                )
+        print(f"[RL Agent] Model saved to {model_path}")
 
     def load(self, path: str) -> None:
         """Load trained model weights."""
         if self._use_torch:
-            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+            checkpoint = torch.load(
+                path,
+                map_location=self.device,
+                weights_only=True,
+            )
             if (
                 checkpoint.get("state_dim", self.env.state_dim) != self.env.state_dim
                 or checkpoint.get("n_actions", self.env.n_actions) != self.env.n_actions
             ):
                 raise ValueError("Saved RL model is incompatible with this graph/action catalog.")
+            expected_states, expected_actions = self._model_signature()
+            if (
+                checkpoint.get("state_ids") != expected_states
+                or checkpoint.get("action_ids") != expected_actions
+            ):
+                raise ValueError(
+                    "Saved RL model graph/action signature does not match"
+                )
             self.q_network.load_state_dict(checkpoint["q_network"])
             self.target_network.load_state_dict(checkpoint["target_network"])
             self.optimizer.load_state_dict(checkpoint["optimizer"])
             self.steps_done = checkpoint["steps_done"]
             self.training_rewards = checkpoint.get("training_rewards", [])
         else:
-            data = np.load(path, allow_pickle=True)
-            if (
-                int(data["state_dim"]) != self.env.state_dim
-                or int(data["n_actions"]) != self.env.n_actions
-            ):
-                raise ValueError("Saved RL model is incompatible with this graph/action catalog.")
-            self._W1 = data["W1"]
-            self._b1 = data["b1"]
-            self._W2 = data["W2"]
-            self._b2 = data["b2"]
-            self._W3 = data["W3"]
-            self._b3 = data["b3"]
+            required = {
+                "W1", "b1", "W2", "b2", "W3", "b3",
+                "steps_done", "training_rewards", "state_dim", "n_actions",
+                "state_ids", "action_ids",
+            }
+            with np.load(path, allow_pickle=False) as data:
+                missing = required.difference(data.files)
+                if missing:
+                    raise ValueError(
+                        f"Saved RL model is missing fields: {sorted(missing)}"
+                    )
+                if (
+                    int(data["state_dim"]) != self.env.state_dim
+                    or int(data["n_actions"]) != self.env.n_actions
+                ):
+                    raise ValueError(
+                        "Saved RL model is incompatible with this "
+                        "graph/action catalog."
+                    )
+                expected_states, expected_actions = self._model_signature()
+                saved_states = [
+                    int(value) for value in data["state_ids"]
+                ]
+                saved_actions = [
+                    str(value) for value in data["action_ids"]
+                ]
+                if (
+                    saved_states != expected_states
+                    or saved_actions != expected_actions
+                ):
+                    raise ValueError(
+                        "Saved RL model graph/action signature does not match"
+                    )
+                arrays = {
+                    name: np.asarray(data[name], dtype=np.float32)
+                    for name in ("W1", "b1", "W2", "b2", "W3", "b3")
+                }
+                if not all(
+                    np.all(np.isfinite(value))
+                    for value in arrays.values()
+                ):
+                    raise ValueError("Saved RL model contains non-finite weights")
+                expected_shapes = {
+                    "W1": self._W1.shape,
+                    "b1": self._b1.shape,
+                    "W2": self._W2.shape,
+                    "b2": self._b2.shape,
+                    "W3": self._W3.shape,
+                    "b3": self._b3.shape,
+                }
+                for name, expected_shape in expected_shapes.items():
+                    if arrays[name].shape != expected_shape:
+                        raise ValueError(
+                            f"Saved RL model field {name} has shape "
+                            f"{arrays[name].shape}, expected {expected_shape}"
+                        )
+                self._W1 = arrays["W1"]
+                self._b1 = arrays["b1"]
+                self._W2 = arrays["W2"]
+                self._b2 = arrays["b2"]
+                self._W3 = arrays["W3"]
+                self._b3 = arrays["b3"]
+                self.steps_done = int(data["steps_done"])
+                self.training_rewards = [
+                    float(value) for value in data["training_rewards"]
+                ]
+                if self.steps_done < 0 or not all(
+                    math.isfinite(value) for value in self.training_rewards
+                ):
+                    raise ValueError(
+                        "Saved RL model contains invalid training metadata"
+                    )
             self._target_weights = self._numpy_weights_copy()
-            self.steps_done = int(data["steps_done"])
-            self.training_rewards = list(data["training_rewards"])
         print(f"[RL Agent] Model loaded from {path}")
 
 
@@ -825,22 +1016,28 @@ class RLDecisionBridge:
             target_node=chosen_action.target_node,
             target_node_label=self.graph.label(chosen_action.target_node),
             optimistic_value=info["q_value"],
-            pessimistic_value=info["q_value"] * 0.7,  # Conservative estimate
-            expected_value=info["q_value"] * 0.85,
-            margin_guarantee=max(0.0, info["q_value"]),
+            pessimistic_value=(
+                info["q_value"]
+                - abs(info["q_value"]) * (1.0 - info["confidence"])
+            ),
+            expected_value=info["q_value"],
+            margin_guarantee=0.0,
             risk_score=chosen_action.risk_score,
             confidence=info["confidence"],
             required_approval=chosen_action.risk_score > 0.6,
             reasoning=(
                 f"RL agent (DQN) selected {chosen_action.action_type.value} at node "
                 f"{chosen_action.target_node} ({self.graph.label(chosen_action.target_node)}). "
-                f"Q-value: {info['q_value']:.4f}, ε: {info['epsilon']:.3f}"
+                f"Estimated Q-value: {info['q_value']:.4f}, "
+                f"ε: {info['epsilon']:.3f}. "
+                "No exact MDP margin is claimed for this RL inference."
             ),
             evidence=[
                 f"Q-value: {info['q_value']:.4f}",
                 f"Confidence: {info['confidence']:.3f}",
                 f"Cost: {cost_info.total:.2f}",
-                f"Training episodes: {self.agent.steps_done}",
+                f"Training episodes: {len(self.agent.training_rewards)}",
+                "Pessimistic value is a confidence-adjusted RL estimate",
             ],
             rollback_plan=f"Remove {chosen_action.action_type.value} from node {chosen_action.target_node}.",
             monitoring_metrics=[

@@ -23,14 +23,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
 from typing import Dict, List, Optional, Tuple
 import time
 import json
+import logging
+import math
 import os
 
 from mirage.config import load_config
 
 _CONFIG = load_config()
+LOGGER = logging.getLogger(__name__)
 
 
 class RiskLevel(Enum):
@@ -116,33 +120,39 @@ class SafetyGate:
     """
 
     # Node IDs quan trọng KHÔNG được tự động block/isolate
-    PROTECTED_NODES = set(_CONFIG.get("layer5", {}).get("protected_nodes", [10, 13]))
+    PROTECTED_NODES = frozenset(
+        _CONFIG.get("layer5", {}).get("protected_nodes", [10, 13])
+    )
 
     # Action types không bao giờ được phép thực thi
-    FORBIDDEN_ACTIONS = {
+    FORBIDDEN_ACTIONS = frozenset({
         "hack_back",
         "isolate_production_db",
         "block_all_traffic",
         "delete_credentials",
-    }
+    })
 
     # Ngưỡng confidence tối thiểu theo risk level
-    MIN_CONFIDENCE = {
+    MIN_CONFIDENCE = MappingProxyType({
         RiskLevel.LOW:      0.0,
         RiskLevel.MEDIUM:   0.5,
         RiskLevel.HIGH:     0.7,
         RiskLevel.CRITICAL: 0.9,
-    }
+    })
 
     def __init__(
         self,
         audit_log_path: Optional[str] = None,
         fail_safe_mode: bool = False,
         budget_limit: float = 6.0,
+        verbose: bool = True,
     ):
         self.audit_log_path = audit_log_path
         self.fail_safe_mode = fail_safe_mode
-        self.budget_limit = budget_limit
+        self.verbose = verbose
+        self.budget_limit = float(budget_limit)
+        if not math.isfinite(self.budget_limit) or self.budget_limit < 0:
+            raise ValueError("budget_limit must be finite and non-negative")
         self.budget_spent: float = 0.0
         self.audit_entries: List[AuditLogEntry] = []
         self._pending_approvals: List[Dict] = []
@@ -214,6 +224,16 @@ class SafetyGate:
         plan_actions = getattr(plan, "portfolio", None) or [plan.action]
         cost_report = compute_portfolio_cost(plan_actions, graph)
         request_cost = float(getattr(plan, "portfolio_cost", 0.0) or cost_report["total"])
+        if not math.isfinite(request_cost) or request_cost < 0:
+            decision = SafetyDecision(
+                allowed=False,
+                risk_level=RiskLevel.CRITICAL,
+                warning_message="Invalid or negative portfolio cost.",
+                requires_human_approval=True,
+                audit_notes=["Invalid portfolio cost blocked"],
+            )
+            self._audit_plan(plan, decision)
+            return False, decision
         risk_rank = {
             RiskLevel.LOW: 0,
             RiskLevel.MEDIUM: 1,
@@ -227,13 +247,15 @@ class SafetyGate:
 
         # ---- GUARDRAIL 1: Fail-safe mode ----
         if self.fail_safe_mode:
-            return False, SafetyDecision(
+            decision = SafetyDecision(
                 allowed=False,
                 risk_level=RiskLevel.CRITICAL,
                 warning_message="System is in FAIL-SAFE (observe-only) mode. No actions allowed.",
                 requires_human_approval=True,
                 audit_notes=["Fail-safe mode active"],
             )
+            self._audit_plan(plan, decision)
+            return False, decision
 
         # ---- GUARDRAIL 2: Forbidden action types ----
         forbidden = [
@@ -242,13 +264,15 @@ class SafetyGate:
             if action.action_type.value in self.FORBIDDEN_ACTIONS
         ]
         if forbidden:
-            return False, SafetyDecision(
+            decision = SafetyDecision(
                 allowed=False,
                 risk_level=RiskLevel.CRITICAL,
                 warning_message=f"🚫 FORBIDDEN ACTION: '{forbidden[0]}' is not in the allowed list.",
                 requires_human_approval=True,
                 audit_notes=[f"Forbidden action blocked: {forbidden[0]}"],
             )
+            self._audit_plan(plan, decision)
+            return False, decision
 
         # ---- GUARDRAIL 3: Budget check ----
         if self.budget_spent + request_cost > self.budget_limit:
@@ -257,13 +281,15 @@ class SafetyGate:
                 f"request={request_cost:.1f}, limit={self.budget_limit:.1f}"
             )
             audit_notes.append(budget_warning)
-            return False, SafetyDecision(
+            decision = SafetyDecision(
                 allowed=False,
                 risk_level=risk_level,
                 warning_message=f"⚠️ Budget limit exceeded. {budget_warning}",
                 requires_human_approval=False,
                 audit_notes=audit_notes,
             )
+            self._audit_plan(plan, decision)
+            return False, decision
 
         # ---- GUARDRAIL 4: Protected node check ----
         protected_targets = [
@@ -337,13 +363,14 @@ class SafetyGate:
             audit_notes.append(f"Low pessimistic value: {plan.pessimistic_value:.4f}")
 
         # In cảnh báo
-        for w in warnings:
-            print(f"\n  {w}")
+        if self.verbose:
+            for w in warnings:
+                print(f"\n  {w}")
 
         # Ghi audit log
         entry = AuditLogEntry(
             timestamp=time.time(),
-            agent="MIRAGE_Decision_Engine_v1",
+            agent="MIRAGE_Decision_Engine_v2",
             action_type=plan.action.action_type.value,
             target_node=plan.target_node,
             target_node_label=plan.target_node_label,
@@ -367,6 +394,28 @@ class SafetyGate:
         )
         return allowed, decision
 
+    def _audit_plan(self, plan, decision: SafetyDecision) -> None:
+        """Persist a safety outcome, including guardrail early returns."""
+        self._add_audit_entry(AuditLogEntry(
+            timestamp=decision.timestamp,
+            agent="MIRAGE_Decision_Engine_v2",
+            action_type=plan.action.action_type.value,
+            target_node=plan.target_node,
+            target_node_label=plan.target_node_label,
+            risk_level=decision.risk_level.value,
+            decision=(
+                "BLOCKED"
+                if not decision.allowed
+                else (
+                    "PENDING_APPROVAL"
+                    if decision.requires_human_approval
+                    else "ALLOWED"
+                )
+            ),
+            reasoning=getattr(plan, "reasoning", ""),
+            approved_by=None,
+        ))
+
     def _add_audit_entry(self, entry: AuditLogEntry) -> None:
         """Thêm entry vào audit log."""
         self.audit_entries.append(entry)
@@ -382,9 +431,14 @@ class SafetyGate:
                         "risk_level": entry.risk_level,
                         "decision": entry.decision,
                         "reasoning": entry.reasoning[:200],
+                        "approved_by": entry.approved_by,
                     }) + "\n")
-            except Exception:
-                pass
+            except (OSError, TypeError, ValueError) as exc:
+                LOGGER.warning(
+                    "Could not append MIRAGE safety audit log %s: %s",
+                    self.audit_log_path,
+                    exc,
+                )
 
     def commit_action_plan(self, plan, graph=None) -> float:
         """Commit budget after a previously approved plan is deployed."""
@@ -395,6 +449,8 @@ class SafetyGate:
         request_cost = float(
             getattr(plan, "portfolio_cost", 0.0) or cost_report["total"]
         )
+        if not math.isfinite(request_cost) or request_cost < 0:
+            raise ValueError("Cannot commit plan: invalid portfolio cost.")
         if self.budget_spent + request_cost > self.budget_limit:
             raise ValueError("Cannot commit plan: safety budget would be exceeded.")
         self.budget_spent += request_cost
@@ -403,7 +459,8 @@ class SafetyGate:
     def enter_fail_safe(self, reason: str = "Manual override") -> None:
         """Kích hoạt fail-safe mode (observe-only)."""
         self.fail_safe_mode = True
-        print(f"\n🚫 [FAIL-SAFE ACTIVATED] System entering observe-only mode. Reason: {reason}")
+        if self.verbose:
+            print(f"\n🚫 [FAIL-SAFE ACTIVATED] System entering observe-only mode. Reason: {reason}")
         self._add_audit_entry(AuditLogEntry(
             timestamp=time.time(),
             agent="MIRAGE_Safety_Layer",
@@ -418,18 +475,34 @@ class SafetyGate:
     def exit_fail_safe(self, approved_by: str = "SOC_Admin") -> None:
         """Thoát fail-safe mode sau khi có approval."""
         self.fail_safe_mode = False
-        print(f"\n✅ [FAIL-SAFE DEACTIVATED] System resuming normal operations. Approved by: {approved_by}")
+        if self.verbose:
+            print(f"\n✅ [FAIL-SAFE DEACTIVATED] System resuming normal operations. Approved by: {approved_by}")
 
     def approve_action(self, plan, approved_by: str = "SOC_Analyst") -> None:
         """Human operator phê duyệt một action đang chờ."""
-        print(f"\n✅ [HUMAN APPROVAL] Action '{plan.action.action_type.value}' "
-              f"approved by {approved_by}")
+        approved_by = str(approved_by).strip()
+        if not approved_by:
+            raise ValueError("approved_by cannot be empty")
+        if self.verbose:
+            print(f"\n✅ [HUMAN APPROVAL] Action '{plan.action.action_type.value}' "
+                  f"approved by {approved_by}")
         # Tìm và update audit entry
         for entry in reversed(self.audit_entries):
             if entry.action_type == plan.action.action_type.value:
                 entry.approved_by = approved_by
                 entry.decision = "ALLOWED"
                 break
+        self._add_audit_entry(AuditLogEntry(
+            timestamp=time.time(),
+            agent="MIRAGE_Safety_Layer",
+            action_type=plan.action.action_type.value,
+            target_node=plan.target_node,
+            target_node_label=plan.target_node_label,
+            risk_level=self.classify_risk(plan.action).value,
+            decision="APPROVED",
+            reasoning=f"Human approval recorded for: {getattr(plan, 'reasoning', '')}",
+            approved_by=approved_by,
+        ))
 
     def get_audit_summary(self) -> str:
         """In tóm tắt audit log."""
@@ -463,6 +536,7 @@ class SafetyGate:
 def create_safety_gate(
     audit_log_dir: str = "results",
     budget_limit: Optional[float] = None,
+    verbose: bool = True,
 ) -> SafetyGate:
     """Factory function tạo Safety Gate với audit logging."""
     if budget_limit is None:
@@ -474,6 +548,7 @@ def create_safety_gate(
         audit_log_path=audit_path,
         fail_safe_mode=False,
         budget_limit=budget_limit,
+        verbose=verbose,
     )
 
 
@@ -484,11 +559,15 @@ def create_safety_gate(
 def make_safety_filter(gate: SafetyGate, graph=None):
     """
     Tạo safety filter function để truyền vào Decision Engine.
-    Returns: function(plan) → (allowed: bool, message: str)
+    Returns whether the plan may be executed automatically.
     """
     def filter_fn(plan) -> Tuple[bool, str]:
         allowed, decision = gate.check_action_plan(plan, graph)
-        return allowed, decision.warning_message
+        executable = allowed and not decision.requires_human_approval
+        message = decision.warning_message
+        if allowed and decision.requires_human_approval and not message:
+            message = "Human approval is required before deployment."
+        return executable, message
     return filter_fn
 
 

@@ -18,7 +18,7 @@ const CONFIG = {
   API_BASE: window.location.hostname === '' || window.location.protocol === 'file:'
     ? 'http://localhost:8000'
     : window.location.origin,
-  WS_URL: window.location.hostname === '' || window.location.protocol === 'file:'
+  WS_BASE: window.location.hostname === '' || window.location.protocol === 'file:'
     ? 'ws://localhost:8000/ws'
     : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`,
   RECONNECT_DELAY: 3000,
@@ -35,6 +35,13 @@ const CONFIG = {
 // State
 // ============================================================
 
+const legacyApiKey = window.localStorage.getItem('mirage_api_key') || '';
+const storedApiKey = window.sessionStorage.getItem('mirage_api_key') || legacyApiKey;
+if (legacyApiKey) {
+  window.sessionStorage.setItem('mirage_api_key', legacyApiKey);
+  window.localStorage.removeItem('mirage_api_key');
+}
+
 const state = {
   ws: null,
   connected: false,
@@ -47,6 +54,8 @@ const state = {
   mousePos: { x: 0, y: 0 },
   hoverNode: null,
   metrics: { events: 0, hosts: 0, decoys: 0 },
+  apiKey: storedApiKey,
+  authWarningShown: false,
 };
 
 // ============================================================
@@ -77,7 +86,42 @@ const DOM = {
   tooltipTitle: $('#tooltip-title'),
   tooltipBody: $('#tooltip-body'),
   uptimeDisplay: $('#uptime-display'),
+  apiKeyInput: $('#api-key-input'),
+  apiUrl: $('#api-url code'),
 };
+
+function apiHeaders(headers = {}) {
+  const result = { ...headers };
+  if (state.apiKey) result['X-API-Key'] = state.apiKey;
+  return result;
+}
+
+function apiFetch(path, options = {}) {
+  return fetch(`${CONFIG.API_BASE}${path}`, {
+    ...options,
+    headers: apiHeaders(options.headers || {}),
+  });
+}
+
+function websocketProtocols() {
+  if (!state.apiKey) return [];
+  const bytes = new TextEncoder().encode(state.apiKey);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  const encoded = btoa(binary)
+    .replaceAll('+', '-')
+    .replaceAll('/', '_')
+    .replaceAll('=', '');
+  return ['mirage', `mirage-key.${encoded}`];
+}
+
+function handleUnauthorized() {
+  updateConnectionStatus('auth-required');
+  if (!state.authWarningShown) {
+    addLog('warning', 'API key required. Enter it in the bottom bar and click Apply key.');
+    state.authWarningShown = true;
+  }
+}
 
 // ============================================================
 // WebSocket Connection
@@ -86,7 +130,10 @@ const DOM = {
 function connectWebSocket() {
   if (state.ws && state.ws.readyState <= 1) return;
 
-  state.ws = new WebSocket(CONFIG.WS_URL);
+  const protocols = websocketProtocols();
+  state.ws = protocols.length > 0
+    ? new WebSocket(CONFIG.WS_BASE, protocols)
+    : new WebSocket(CONFIG.WS_BASE);
 
   state.ws.onopen = () => {
     state.connected = true;
@@ -103,8 +150,12 @@ function connectWebSocket() {
     }
   };
 
-  state.ws.onclose = () => {
+  state.ws.onclose = (event) => {
     state.connected = false;
+    if (event.code === 4401) {
+      handleUnauthorized();
+      return;
+    }
     updateConnectionStatus('disconnected');
     addLog('warning', 'WebSocket disconnected. Reconnecting…');
     setTimeout(connectWebSocket, CONFIG.RECONNECT_DELAY);
@@ -166,7 +217,13 @@ function updateConnectionStatus(status) {
   const dot = DOM.wsIndicator.querySelector('.indicator__dot');
   const text = DOM.wsIndicator.querySelector('.indicator__text');
   dot.className = 'indicator__dot ' + status;
-  text.textContent = status === 'connected' ? 'Connected' : status === 'disconnected' ? 'Disconnected' : 'Connecting…';
+  text.textContent = status === 'connected'
+    ? 'Connected'
+    : status === 'disconnected'
+      ? 'Disconnected'
+      : status === 'auth-required'
+        ? 'API Key Required'
+        : 'Connecting…';
 }
 
 // ============================================================
@@ -224,6 +281,7 @@ function getStageEmoji(stage) {
 
 let graphNodes = [];
 let graphEdges = [];
+let nodeById = new Map();
 
 const LAYER_COLORS = {
   external:    { fill: '#2d3748', stroke: '#718096' },
@@ -243,6 +301,7 @@ function initGraphLayout() {
   const H = canvas.parentElement.clientHeight || 600;
   canvas.width = W;
   canvas.height = H;
+  nodeById = new Map(state.graph.nodes.map(node => [node.id, node]));
 
   // Initialize node positions using layer-based layout
   const layerOrder = ['external', 'dmz', 'services', 'internal', 'credentials', 'critical', 'data', 'sink'];
@@ -281,7 +340,8 @@ function initGraphLayout() {
   });
 
   // Run physics simulation for initial layout
-  for (let i = 0; i < 120; i++) {
+  const layoutIterations = state.graph.nodes.length <= 200 ? 120 : 20;
+  for (let i = 0; i < layoutIterations; i++) {
     stepPhysics();
   }
 
@@ -296,9 +356,8 @@ function stepPhysics() {
   const H = canvas.height;
   const P = CONFIG.GRAPH_PHYSICS;
 
-  // Repulsion (all pairs)
-  for (let i = 0; i < nodes.length; i++) {
-    for (let j = i + 1; j < nodes.length; j++) {
+  // Exact repulsion for small graphs; bounded sampling for large graphs.
+  const applyRepulsion = (i, j) => {
       const dx = nodes[j].x - nodes[i].x;
       const dy = nodes[j].y - nodes[i].y;
       const dist = Math.max(1, Math.sqrt(dx * dx + dy * dy));
@@ -309,13 +368,27 @@ function stepPhysics() {
       nodes[i].vy -= fy;
       nodes[j].vx += fx;
       nodes[j].vy += fy;
+  };
+  if (nodes.length <= 250) {
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        applyRepulsion(i, j);
+      }
+    }
+  } else {
+    const samplesPerNode = 24;
+    for (let i = 0; i < nodes.length; i++) {
+      for (let sample = 0; sample < samplesPerNode; sample++) {
+        const j = (i + 1 + sample * 97) % nodes.length;
+        if (j !== i) applyRepulsion(i, j);
+      }
     }
   }
 
   // Attraction (edges)
   for (const edge of edges) {
-    const src = nodes.find(n => n.id === edge.source);
-    const tgt = nodes.find(n => n.id === edge.target);
+    const src = nodeById.get(edge.source);
+    const tgt = nodeById.get(edge.target);
     if (!src || !tgt) continue;
     const dx = tgt.x - src.x;
     const dy = tgt.y - src.y;
@@ -368,8 +441,8 @@ function renderGraph() {
 
   // Draw edges
   for (const edge of edges) {
-    const src = nodes.find(n => n.id === edge.source);
-    const tgt = nodes.find(n => n.id === edge.target);
+    const src = nodeById.get(edge.source);
+    const tgt = nodeById.get(edge.target);
     if (!src || !tgt) continue;
 
     ctx.beginPath();
@@ -546,8 +619,8 @@ function showTooltip(node, clientX, clientY) {
     <div class="tooltip-row"><span class="label">Type</span><span class="value">${typeIcon}</span></div>
     <div class="tooltip-row"><span class="label">Layer</span><span class="value">${escapeHTML(node.layer)}</span></div>
     <div class="tooltip-row"><span class="label">Asset</span><span class="value">${escapeHTML(node.asset_type)}</span></div>
-    <div class="tooltip-row"><span class="label">Value</span><span class="value">${node.value.toFixed(1)}</span></div>
-    <div class="tooltip-row"><span class="label">Belief</span><span class="value">${(node.belief || 0).toFixed(3)}</span></div>
+    <div class="tooltip-row"><span class="label">Value</span><span class="value">${Number(node.value || 0).toFixed(1)}</span></div>
+    <div class="tooltip-row"><span class="label">Belief</span><span class="value">${Number(node.belief || 0).toFixed(3)}</span></div>
   `;
   if (belief) {
     bodyHTML += `<div class="tooltip-row"><span class="label">Stage</span><span class="value">${escapeHTML(belief.stage)}</span></div>`;
@@ -686,9 +759,11 @@ function addLog(level, message) {
 function setupButtonHandlers() {
   // Trigger Decision
   $('#btn-trigger-decision')?.addEventListener('click', async () => {
+    const button = $('#btn-trigger-decision');
+    button.disabled = true;
     addLog('info', 'Triggering decision engine…');
     try {
-      const res = await fetch(`${CONFIG.API_BASE}/api/decide`, {
+      const res = await apiFetch('/api/decide', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ deploy: true }),
@@ -698,6 +773,8 @@ function setupButtonHandlers() {
       addLog('success', `Decision: ${data.action_type} → Node ${data.target_node}`);
     } catch (e) {
       addLog('danger', `Decision trigger failed: ${e.message}`);
+    } finally {
+      button.disabled = false;
     }
   });
 
@@ -719,7 +796,7 @@ function setupButtonHandlers() {
 
     for (const ev of events) {
       try {
-        const response = await fetch(`${CONFIG.API_BASE}/api/telemetry`, {
+        const response = await apiFetch('/api/telemetry', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(ev),
@@ -737,7 +814,11 @@ function setupButtonHandlers() {
   // Refresh Graph
   $('#btn-refresh-graph')?.addEventListener('click', async () => {
     try {
-      const res = await fetch(`${CONFIG.API_BASE}/api/graph`);
+      const res = await apiFetch('/api/graph');
+      if (res.status === 401) {
+        handleUnauthorized();
+        return;
+      }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       state.graph = await res.json();
       state.decoys = state.graph.active_defenses || [];
@@ -768,6 +849,24 @@ function setupButtonHandlers() {
     state.logs = [];
     DOM.logBody.innerHTML = '<div class="empty-state">No events yet</div>';
   });
+
+  $('#btn-save-api-key')?.addEventListener('click', () => {
+    state.apiKey = DOM.apiKeyInput.value.trim();
+    state.authWarningShown = false;
+    if (state.apiKey) {
+      window.sessionStorage.setItem('mirage_api_key', state.apiKey);
+    } else {
+      window.sessionStorage.removeItem('mirage_api_key');
+    }
+    if (state.ws) {
+      state.ws.onclose = null;
+      state.ws.close();
+      state.ws = null;
+    }
+    updateConnectionStatus('connecting');
+    loadGraphFromAPI();
+    connectWebSocket();
+  });
 }
 
 // ============================================================
@@ -776,17 +875,21 @@ function setupButtonHandlers() {
 
 async function loadGraphFromAPI() {
   try {
-    const res = await fetch(`${CONFIG.API_BASE}/api/graph`);
-    if (res.ok) {
-      state.graph = await res.json();
-      state.decoys = state.graph.active_defenses || [];
-      initGraphLayout();
-      renderGraph();
-      renderDecoysPanel();
-      addLog('info', `Graph loaded: ${state.graph.nodes.length} nodes, ${state.graph.edges.length} edges`);
+    const res = await apiFetch('/api/graph');
+    if (res.status === 401) {
+      handleUnauthorized();
+      return;
     }
-  } catch {
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    state.graph = await res.json();
+    state.decoys = state.graph.active_defenses || [];
+    initGraphLayout();
+    renderGraph();
+    renderDecoysPanel();
+    addLog('info', `Graph loaded: ${state.graph.nodes.length} nodes, ${state.graph.edges.length} edges`);
+  } catch (error) {
     // API not available — load demo graph
+    addLog('warning', `API graph unavailable (${error.message}); loading demo graph`);
     loadDemoGraph();
   }
 }
@@ -839,8 +942,16 @@ function loadDemoGraph() {
 function handleResize() {
   const container = DOM.canvas.parentElement;
   if (container) {
-    DOM.canvas.width = container.clientWidth;
-    DOM.canvas.height = container.clientHeight;
+    const oldWidth = Math.max(1, DOM.canvas.width);
+    const oldHeight = Math.max(1, DOM.canvas.height);
+    const newWidth = Math.max(1, container.clientWidth);
+    const newHeight = Math.max(1, container.clientHeight);
+    for (const node of state.graph.nodes) {
+      node.x = (node.x || oldWidth / 2) * newWidth / oldWidth;
+      node.y = (node.y || oldHeight / 2) * newHeight / oldHeight;
+    }
+    DOM.canvas.width = newWidth;
+    DOM.canvas.height = newHeight;
     renderGraph();
   }
 }
@@ -850,6 +961,8 @@ function handleResize() {
 // ============================================================
 
 document.addEventListener('DOMContentLoaded', () => {
+  DOM.apiKeyInput.value = state.apiKey;
+  DOM.apiUrl.textContent = CONFIG.API_BASE;
   setupCanvasInteraction();
   setupButtonHandlers();
   window.addEventListener('resize', handleResize);
@@ -860,10 +973,18 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Periodic status update
   setInterval(async () => {
-    if (!state.connected) return;
     try {
-      const res = await fetch(`${CONFIG.API_BASE}/api/status`);
-      if (res.ok) updateMetrics(await res.json());
-    } catch { /* ignore */ }
+      const res = await apiFetch('/api/status');
+      if (res.status === 401) {
+        handleUnauthorized();
+        return;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      updateMetrics(await res.json());
+    } catch (error) {
+      if (state.connected) {
+        addLog('warning', `Status refresh failed: ${error.message}`);
+      }
+    }
   }, 10000);
 });

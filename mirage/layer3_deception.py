@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 import copy
+import math
 import time
 import uuid
 
@@ -81,6 +82,29 @@ class DeceptionAction:
     reward_delta: float      = 0.0      # Delta reward gán cho (target_node, "end")
     edge_cost_delta: float   = 0.0      # Tăng bao nhiêu cost cho edge
 
+    def __post_init__(self) -> None:
+        self.target_node = int(self.target_node)
+        if self.target_edge is not None:
+            self.target_edge = (
+                int(self.target_edge[0]),
+                int(self.target_edge[1]),
+            )
+        for name in ("risk_score", "realism_score", "business_impact"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f"{name} must be between 0 and 1")
+            setattr(self, name, value)
+        for name in (
+            "cost",
+            "duration_hours",
+            "reward_delta",
+            "edge_cost_delta",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+            setattr(self, name, value)
+
     @property
     def action_id(self) -> str:
         if self.target_edge:
@@ -118,6 +142,10 @@ class ActiveDecoy:
 
     def should_retire(self, max_engagements: int = 5, max_age_seconds: float = 3600) -> bool:
         """Kiểm tra xem decoy có cần được thay thế không."""
+        if max_engagements < 1:
+            raise ValueError("max_engagements must be at least 1")
+        if max_age_seconds < 0:
+            raise ValueError("max_age_seconds cannot be negative")
         age = time.time() - self.deployed_at
         return (self.engagement_count >= max_engagements) or (age > max_age_seconds)
 
@@ -225,14 +253,7 @@ def _build_generic_action_catalog(
         if graph.node_metadata.get(node, {}).get("asset_type") == "decoy_router"
     ]
 
-    db_nodes = list(dict.fromkeys(
-        decoy_db_slots
-        + _top_nodes(
-            graph,
-            lambda _n, m: m.get("asset_type") in {"database", "file_share", "workstation", "decoy_db"},
-            max_actions_per_type,
-        )
-    ))[:max_actions_per_type]
+    db_nodes = decoy_db_slots[:max_actions_per_type]
     cfg_db = _DECEPTION_CONFIG.get("deploy_decoy_database", {})
     for node in db_nodes:
         fields = _operational_fields(graph, node, DeceptionActionType.DEPLOY_DECOY_DATABASE)
@@ -255,14 +276,7 @@ def _build_generic_action_catalog(
             **fields,
         ))
 
-    router_nodes = list(dict.fromkeys(
-        decoy_router_slots
-        + _top_nodes(
-            graph,
-            lambda _n, m: m.get("asset_type") in {"dns_server", "web_server", "mail_server", "decoy_router"},
-            max_actions_per_type,
-        )
-    ))[:max_actions_per_type]
+    router_nodes = decoy_router_slots[:max_actions_per_type]
     cfg_router = _DECEPTION_CONFIG.get("deploy_decoy_router", {})
     for node in router_nodes:
         fields = _operational_fields(graph, node, DeceptionActionType.DEPLOY_DECOY_ROUTER)
@@ -381,14 +395,13 @@ def get_action_catalog(graph, max_actions_per_type: int = 40) -> List[DeceptionA
 
     from mirage.layer2_attack_graph import (
         DB_FAKE, RTR_FAKE, WS_FIN, WS_ENG, WS_IT,
-        SMB_SHARE, SVC_CRED, ADMIN_CRED, DNS_INT,
-        WEB_DMZ, DC_NODE, DB_REAL
+        SMB_SHARE, SVC_CRED, ADMIN_CRED, DC_NODE, DB_REAL
     )
     actions = []
 
     # ---- 1. DEPLOY DECOY DATABASE ----
     cfg_db = _DECEPTION_CONFIG.get("deploy_decoy_database", {})
-    decoy_db_nodes = [DB_FAKE, WS_FIN, SMB_SHARE]
+    decoy_db_nodes = [DB_FAKE]
     for node in decoy_db_nodes:
         actions.append(DeceptionAction(
             action_type=DeceptionActionType.DEPLOY_DECOY_DATABASE,
@@ -408,7 +421,7 @@ def get_action_catalog(graph, max_actions_per_type: int = 40) -> List[DeceptionA
 
     # ---- 2. DEPLOY DECOY ROUTER ----
     cfg_rtr = _DECEPTION_CONFIG.get("deploy_decoy_router", {})
-    decoy_router_nodes = [RTR_FAKE, DNS_INT, WEB_DMZ]
+    decoy_router_nodes = [RTR_FAKE]
     for node in decoy_router_nodes:
         actions.append(DeceptionAction(
             action_type=DeceptionActionType.DEPLOY_DECOY_ROUTER,
@@ -495,12 +508,18 @@ class DeceptionFabric:
     4. Thu thập intelligence
     """
 
-    def __init__(self, graph, max_actions_per_type: Optional[int] = None):
+    def __init__(
+        self,
+        graph,
+        max_actions_per_type: Optional[int] = None,
+        verbose: bool = True,
+    ):
         if max_actions_per_type is None:
             max_actions_per_type = int(
                 _CONFIG.get("layer3", {}).get("max_actions_per_type", 40)
             )
         self.graph = graph
+        self.verbose = verbose
         self._base_graph = copy.deepcopy(graph)
         self.active_decoys: Dict[str, ActiveDecoy] = {}
         self.deployed_actions: List[DeceptionAction] = []
@@ -534,16 +553,44 @@ class DeceptionFabric:
         Returns:
             ActiveDecoy object đang được triển khai
         """
+        if action.target_node not in self.graph.states:
+            raise ValueError(
+                f"Action target {action.target_node} is not in the graph"
+            )
+        if action.target_edge is not None:
+            src, dst = action.target_edge
+            if src not in self.graph.states or dst not in self.graph.states:
+                raise ValueError(
+                    f"Action edge {src}->{dst} references an unknown node"
+                )
+            if not any(
+                dst in distribution
+                for distribution in self.graph.transitions.get(src, {}).values()
+            ):
+                raise ValueError(
+                    f"Action edge {src}->{dst} does not exist in the graph"
+                )
         if any(
             deployed.action_id == action.action_id
             for deployed in self.deployed_actions
         ):
             raise ValueError(f"Action already deployed: {action.action_id}")
+        if action.action_type in {
+            DeceptionActionType.DEPLOY_DECOY_DATABASE,
+            DeceptionActionType.DEPLOY_DECOY_ROUTER,
+        } and action.target_node not in self.graph.decoy_sites:
+            raise ValueError(
+                f"Deploy target {action.target_node} is not a decoy slot"
+            )
 
         decoy_id = str(uuid.uuid4())[:8]
         from mirage.mdp_solver import compute_composite_cost
 
         deployment_cost = compute_composite_cost(action, self.graph).total
+        if self.total_cost_spent + deployment_cost > self.graph.budget + 1e-9:
+            raise ValueError(
+                "Deployment would exceed the deception fabric budget"
+            )
 
         # Cập nhật đồ thị tùy theo loại action
         if action.action_type == DeceptionActionType.DEPLOY_DECOY_DATABASE:
@@ -560,7 +607,12 @@ class DeceptionFabric:
 
         # Tạo ActiveDecoy record
         self.deployed_actions.append(action)
-        self._refresh_runtime_graph()
+        try:
+            self._refresh_runtime_graph()
+        except Exception:
+            self.deployed_actions.pop()
+            self._refresh_runtime_graph()
+            raise
 
         decoy = ActiveDecoy(
             decoy_id=decoy_id,
@@ -586,40 +638,64 @@ class DeceptionFabric:
         self.graph.edge_costs = runtime.edge_costs
         self.graph.node_metadata = runtime.node_metadata
         self.graph.defender_reward = runtime.defender_reward
+        self._refresh_reward_interventions()
+
+    def _refresh_reward_interventions(self) -> None:
+        """Rebuild reward effects so overlapping actions compose safely."""
+        interventions: Dict[Tuple[int, str], float] = {}
+        for action in self.deployed_actions:
+            if action.action_type in {
+                DeceptionActionType.DEPLOY_DECOY_DATABASE,
+                DeceptionActionType.DEPLOY_DECOY_ROUTER,
+            }:
+                key = (action.target_node, "end")
+                interventions[key] = (
+                    interventions.get(key, 0.0) + action.reward_delta
+                )
+            elif (
+                action.action_type
+                == DeceptionActionType.SCATTER_HONEY_CREDENTIAL
+            ):
+                cred_key = (action.target_node, "cred_dump")
+                end_key = (action.target_node, "end")
+                interventions[cred_key] = (
+                    interventions.get(cred_key, 0.0)
+                    + action.reward_delta * 0.5
+                )
+                interventions[end_key] = (
+                    interventions.get(end_key, 0.0)
+                    + action.reward_delta * 0.3
+                )
+        self.reward_interventions = interventions
 
     def _deploy_decoy_database(self, action: DeceptionAction) -> None:
         """Triển khai fake database — tăng reward kéo attacker vào đây."""
         node = action.target_node
-        # Tăng reward tại decoy node để kéo attacker
-        self.reward_interventions[(node, "end")] = action.reward_delta
-        # Đảm bảo node là decoy site nếu chưa phải
-        print(f"  [Deception] Fake Database deployed at Node {node} "
-              f"({self.graph.label(node)}) | Reward bait: +{action.reward_delta:.1f}")
+        if self.verbose:
+            print(f"  [Deception] Fake Database deployed at Node {node} "
+                  f"({self.graph.label(node)}) | Reward bait: +{action.reward_delta:.1f}")
 
     def _deploy_decoy_router(self, action: DeceptionAction) -> None:
         """Triển khai fake router — vừa thu hút vừa làm chậm attacker."""
         node = action.target_node
-        self.reward_interventions[(node, "end")] = action.reward_delta
-        # Tăng edge cost đến router giả (attacker bị giữ lại lâu hơn)
-        if action.edge_cost_delta > 0 and action.target_edge:
-            src, dst = action.target_edge
-        print(f"  [Deception] Fake Router deployed at Node {node} "
-              f"({self.graph.label(node)}) | Edge cost +{action.edge_cost_delta:.1f}")
+        if self.verbose:
+            print(f"  [Deception] Fake Router deployed at Node {node} "
+                  f"({self.graph.label(node)}) | Edge cost +{action.edge_cost_delta:.1f}")
 
     def _scatter_honey_credential(self, action: DeceptionAction) -> None:
         """Rải honey credential — tăng khả năng attacker bị phát hiện khi dùng."""
         node = action.target_node
-        self.reward_interventions[(node, "cred_dump")] = action.reward_delta * 0.5
-        self.reward_interventions[(node, "end")] = action.reward_delta * 0.3
-        print(f"  [Honey] Honey Credential planted at Node {node} "
-              f"({self.graph.label(node)}) | Trigger reward: +{action.reward_delta:.1f}")
+        if self.verbose:
+            print(f"  [Honey] Honey Credential planted at Node {node} "
+                  f"({self.graph.label(node)}) | Trigger reward: +{action.reward_delta:.1f}")
 
     def _increase_edge_cost(self, action: DeceptionAction) -> None:
         """Tăng cost edge — làm khó attacker trên con đường cụ thể."""
         if action.target_edge:
             src, dst = action.target_edge
-            print(f"  [Edge Cost] Edge cost increased: Node {src} -> Node {dst} "
-                  f"| Delta: +{action.edge_cost_delta:.2f}")
+            if self.verbose:
+                print(f"  [Edge Cost] Edge cost increased: Node {src} -> Node {dst} "
+                      f"| Delta: +{action.edge_cost_delta:.2f}")
 
     def record_engagement(self, decoy_id: str, attacker_info: str = "") -> Dict:
         """Ghi nhận sự kiện attacker chạm vào decoy."""
@@ -628,6 +704,8 @@ class DeceptionFabric:
 
         decoy = self.active_decoys[decoy_id]
         decoy.engage(attacker_info)
+        if attacker_info and attacker_info not in decoy.attacker_ips:
+            decoy.attacker_ips.append(attacker_info)
 
         log_entry = {
             "timestamp": time.time(),
@@ -650,8 +728,6 @@ class DeceptionFabric:
             if decoy.should_retire():
                 decoy.status = DecoyStatus.RETIRED
                 action = decoy.action
-                self.reward_interventions.pop((action.target_node, "end"), None)
-                self.reward_interventions.pop((action.target_node, "cred_dump"), None)
                 retired_actions.append(action)
                 self.active_decoys.pop(did, None)
                 retired.append(did)
@@ -665,10 +741,23 @@ class DeceptionFabric:
             self._refresh_runtime_graph()
         return retired
 
-    def get_interception_rate(self) -> float:
-        """Tỷ lệ attacker bị dẫn vào decoy (so với tổng engagement)."""
-        total = sum(d.engagement_count for d in self.active_decoys.values())
-        return total / max(1, total)  # Simplified; trong thực tế so sánh với total attacks
+    def get_interception_rate(self, total_attacks: Optional[int] = None) -> float:
+        """Return decoy engagements divided by an explicit attack-session count."""
+        engagements = len(self.engagement_log)
+        if total_attacks is None:
+            raise ValueError(
+                "total_attacks is required; engagements alone cannot define "
+                "an interception rate"
+            )
+        if total_attacks < 0:
+            raise ValueError("total_attacks cannot be negative")
+        if engagements > total_attacks:
+            raise ValueError(
+                "total_attacks cannot be smaller than recorded engagements"
+            )
+        if total_attacks == 0:
+            return 0.0
+        return engagements / total_attacks
 
     def summary(self) -> str:
         """In tóm tắt trạng thái Deception Fabric."""
@@ -688,7 +777,7 @@ class DeceptionFabric:
             f"Active Actions:   {len(self.active_decoys)}",
             f"Active Decoys:    {active_assets}",
             f"Total Cost Spent: {self.total_cost_spent:.1f}",
-            f"Total Engagements:{sum(d.engagement_count for d in self.active_decoys.values())}",
+            f"Total Engagements:{len(self.engagement_log)}",
             "",
             "Active Deployments:",
         ]

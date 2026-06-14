@@ -1,4 +1,4 @@
 -r requirements.txt
-httpx2>=2.0.0
+httpx>=0.28.0,<1.0.0
 pytest>=8.0.0
 ruff>=0.15.0

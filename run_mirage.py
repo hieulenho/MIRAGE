@@ -63,13 +63,16 @@ def run_step1_mvp():
     print("BƯỚC 1: Khung xương MVP (Layer 2 + Layer 4)")
     print("─" * 70)
 
-    from mirage.layer2_attack_graph import build_enterprise_attack_graph, print_graph_summary
+    from mirage.layer2_attack_graph import (
+        build_configured_attack_graph,
+        print_graph_summary,
+    )
     from mirage.layer3_deception import DeceptionFabric
     from mirage.layer4_decision_engine import RobustDecisionEngine
 
     # Layer 2: Xây dựng đồ thị
     print("\n[Layer 2] Xây dựng Enterprise Attack Graph (15 nodes)...")
-    graph = build_enterprise_attack_graph()
+    graph = build_configured_attack_graph()
     print_graph_summary(graph)
 
     # Layer 3: Khởi tạo Deception Fabric
@@ -84,16 +87,19 @@ def run_step1_mvp():
     )
 
     # Belief state: attacker có thể ở Workstation Finance (node 4)
-    belief_state = {
-        4: 0.45,   # WS_Finance — most likely
-        3: 0.25,   # WS_Engineering
-        5: 0.15,   # WS_IT
-        1: 0.10,   # WebServer DMZ
-        0: 0.05,   # Internet
-    }
+    from mirage.layer6_evaluation import MIRAGEEvaluator
+
+    belief_state = MIRAGEEvaluator(
+        graph,
+        n_episodes=1,
+    ).benchmark_b_belief()
+    top_node = max(belief_state, key=belief_state.get)
 
     print("\n[Layer 4] Evaluating deception options...")
-    print(f"  Current belief: Attacker likely at Node 4 (WS_Finance) — {belief_state[4]:.0%}")
+    print(
+        f"  Current belief: Attacker likely at Node {top_node} "
+        f"({graph.label(top_node)}) — {belief_state[top_node]:.0%}"
+    )
 
     plan = engine.decide(
         belief_state=belief_state,
@@ -121,18 +127,20 @@ def run_step2_full_layers():
     print("BƯỚC 2: Đắp thịt — Layer 3 + Attackers + Evaluation")
     print("─" * 70)
 
-    from mirage.layer2_attack_graph import build_enterprise_attack_graph
+    from mirage.layer2_attack_graph import build_configured_attack_graph
     from mirage.layer3_deception import DeceptionFabric, DeceptionActionType
     from mirage.attacker_agents import run_simulation
+    from mirage.mdp_solver import compute_composite_cost
 
-    graph = build_enterprise_attack_graph()
+    graph = build_configured_attack_graph()
     fabric = DeceptionFabric(graph)
 
     # --- Demo Layer 3: Triển khai nhiều loại deception ---
     print("\n[Layer 3] Triển khai Deception Fabric...")
-    catalog = fabric.get_available_actions(budget_remaining=5.0)
+    catalog = fabric.generate_action_catalog()
+    budget_remaining = graph.budget
 
-    # Chọn mỗi loại action một cái
+    # Chọn tối đa một action mỗi loại nhưng luôn giữ tổng composite cost trong budget.
     deployed = []
     for action_type in [
         DeceptionActionType.DEPLOY_DECOY_DATABASE,
@@ -140,22 +148,45 @@ def run_step2_full_layers():
         DeceptionActionType.SCATTER_HONEY_CREDENTIAL,
         DeceptionActionType.INCREASE_EDGE_COST,
     ]:
-        action = next((a for a in catalog if a.action_type == action_type), None)
+        action = next(
+            (
+                candidate
+                for candidate in catalog
+                if (
+                    candidate.action_type == action_type
+                    and compute_composite_cost(candidate, graph).total
+                    <= budget_remaining + 1e-9
+                )
+            ),
+            None,
+        )
         if action:
+            deployment_cost = compute_composite_cost(action, graph).total
             decoy = fabric.deploy_action(action)
             deployed.append(decoy)
+            budget_remaining -= deployment_cost
 
-    print(f"\n  → {len(deployed)} deception actions deployed")
+    print(
+        f"\n  → {len(deployed)} deception actions deployed "
+        f"(budget remaining: {budget_remaining:.2f}/{graph.budget:.2f})"
+    )
     print(fabric.summary())
 
-    # --- Demo 4 loại Attacker Agents ---
-    print("\n[Attackers] Simulating 5 attacker types (100 episodes each)...")
+    # --- Demo 6 loại Attacker Agents ---
+    print("\n[Attackers] Simulating 6 attacker types (100 episodes each)...")
     print("-" * 70)
 
     # Tạo reward interventions từ fabric
     reward_interventions = dict(fabric.reward_interventions)
 
-    for atype in ["random", "greedy", "shortest_path", "stealthy", "deception_aware"]:
+    for atype in [
+        "random",
+        "greedy",
+        "shortest_path",
+        "stealthy",
+        "deception_aware",
+        "mitre_evasion",
+    ]:
         result = run_simulation(
             graph, atype,
             n_episodes=100,
@@ -208,12 +239,10 @@ def run_step3_safety():
     from mirage.layer1_attack_modeling import (
         AttackStageClassifier, simulate_attack_telemetry
     )
-    from mirage.layer2_attack_graph import build_enterprise_attack_graph
+    from mirage.layer2_attack_graph import build_configured_attack_graph
     from mirage.layer3_deception import DeceptionActionType
     from mirage.layer5_safe_control import create_safety_gate
-    from mirage.layer2_attack_graph import DB_FAKE, DB_REAL, RTR_FAKE
-
-    graph = build_enterprise_attack_graph()
+    graph = build_configured_attack_graph()
 
     # --- Layer 1: Attack Stage Classification ---
     print("\n[Layer 1] Processing telemetry events...")
@@ -254,29 +283,113 @@ def run_step3_safety():
             self.confidence = conf
             self.reasoning = f"Deploy {action.action_type.value} at {label}"
 
-    print("\n  Test 1: LOW risk — Fake DB at decoy node")
-    act1 = MockAction(DeceptionActionType.DEPLOY_DECOY_DATABASE, DB_FAKE, 0.1, 0.02, 1.5)
-    plan1 = MockPlan(act1, DB_FAKE, "DB_FAKE_Backup", 0.35, 0.80)
-    allowed1, decision1 = gate.check_action_plan(plan1, graph)
+    decoy_node = (
+        graph.decoy_sites[0]
+        if graph.decoy_sites
+        else next(
+            node
+            for node in graph.states
+            if node != graph.sink_state and node not in graph.true_goals
+        )
+    )
+    true_goal = graph.true_goals[0]
+    normal_node = next(
+        node
+        for node in graph.states
+        if (
+            node != graph.sink_state
+            and node not in graph.true_goals
+            and node not in graph.decoy_sites
+        )
+    )
+
+    print("\n  Test 1: LOW risk — Fake asset at a decoy slot")
+    act1 = MockAction(
+        DeceptionActionType.DEPLOY_DECOY_DATABASE,
+        decoy_node,
+        0.1,
+        0.02,
+        1.5,
+    )
+    plan1 = MockPlan(
+        act1,
+        decoy_node,
+        graph.label(decoy_node),
+        0.35,
+        0.80,
+    )
+    allowed1, decision1 = gate.check_action_plan(
+        plan1,
+        graph,
+        reserve_budget=False,
+    )
     print(decision1)
 
-    print("\n  Test 2: MEDIUM risk — Honey Credential at Workstation Finance")
-    act2 = MockAction(DeceptionActionType.SCATTER_HONEY_CREDENTIAL, 4, 0.35, 0.08, 0.8)
-    plan2 = MockPlan(act2, 4, "Workstation_Finance", 0.15, 0.65)
-    allowed2, decision2 = gate.check_action_plan(plan2, graph)
+    print("\n  Test 2: MEDIUM risk — Honey Credential at a real asset")
+    act2 = MockAction(
+        DeceptionActionType.SCATTER_HONEY_CREDENTIAL,
+        normal_node,
+        0.35,
+        0.08,
+        0.8,
+    )
+    plan2 = MockPlan(
+        act2,
+        normal_node,
+        graph.label(normal_node),
+        0.15,
+        0.65,
+    )
+    allowed2, decision2 = gate.check_action_plan(
+        plan2,
+        graph,
+        reserve_budget=False,
+    )
     print(decision2)
 
     print("\n  Test 3: HIGH risk — Action near Real DB (protected node)")
-    act3 = MockAction(DeceptionActionType.DEPLOY_DECOY_DATABASE, DB_REAL, 0.6, 0.25, 2.0)
-    plan3 = MockPlan(act3, DB_REAL, "DB_REAL_Finance", -0.5, 0.55)
-    allowed3, decision3 = gate.check_action_plan(plan3, graph)
+    act3 = MockAction(
+        DeceptionActionType.DEPLOY_DECOY_DATABASE,
+        true_goal,
+        0.6,
+        0.25,
+        2.0,
+    )
+    plan3 = MockPlan(
+        act3,
+        true_goal,
+        graph.label(true_goal),
+        -0.5,
+        0.55,
+    )
+    allowed3, decision3 = gate.check_action_plan(
+        plan3,
+        graph,
+        reserve_budget=False,
+    )
     print(decision3)
 
     print("\n  Test 4: FAIL-SAFE mode activation")
     gate.enter_fail_safe("Anomaly detected in telemetry — confidence too low")
-    act4 = MockAction(DeceptionActionType.DEPLOY_DECOY_ROUTER, RTR_FAKE, 0.1, 0.02, 1.2)
-    plan4 = MockPlan(act4, RTR_FAKE, "Router_FAKE_Gateway", 0.25, 0.75)
-    allowed4, decision4 = gate.check_action_plan(plan4, graph)
+    act4 = MockAction(
+        DeceptionActionType.DEPLOY_DECOY_ROUTER,
+        decoy_node,
+        0.1,
+        0.02,
+        1.2,
+    )
+    plan4 = MockPlan(
+        act4,
+        decoy_node,
+        graph.label(decoy_node),
+        0.25,
+        0.75,
+    )
+    allowed4, decision4 = gate.check_action_plan(
+        plan4,
+        graph,
+        reserve_budget=False,
+    )
     print(decision4)
     gate.exit_fail_safe("SOC_Admin_001")
 
@@ -291,41 +404,52 @@ def run_full_demo():
     print("MIRAGE END-TO-END DEMO")
     print("─" * 70)
 
-    from mirage.layer1_attack_modeling import AttackStageClassifier, simulate_attack_telemetry
-    from mirage.layer2_attack_graph import build_enterprise_attack_graph
+    from mirage.layer1_attack_modeling import simulate_attack_telemetry
+    from mirage.layer1_hmm import EnsembleTelemetryClassifier
+    from mirage.layer2_attack_graph import build_configured_attack_graph
     from mirage.layer3_deception import DeceptionFabric
     from mirage.layer4_decision_engine import RobustDecisionEngine
     from mirage.layer5_safe_control import create_safety_gate, make_safety_filter
     from mirage.layer6_evaluation import MIRAGEEvaluator
 
     print("\n📡 [Layer 1] Processing real-time telemetry...")
-    classifier = AttackStageClassifier()
+    classifier = EnsembleTelemetryClassifier()
     events = simulate_attack_telemetry("lateral_movement")
     for event in events:
-        est = classifier.process_event(event)
+        classifier.process_event(event)
 
     # Lấy stage estimate
-    estimates = classifier.get_all_estimates()
-    dominant_host = list(estimates.keys())[0] if estimates else None
+    estimates = classifier.hmm_clf.get_all_beliefs()
+    dominant_host = next(iter(estimates), None)
     stage_ctx = {}
     if dominant_host:
-        est = estimates[dominant_host]
+        dominant_stage, confidence = classifier.get_dominant_stage(
+            dominant_host
+        )
         from mirage.layer1_attack_modeling import STAGE_NAMES
         stage_ctx = {
-            "stage": STAGE_NAMES[est.dominant_stage],
-            "confidence": est.confidence,
+            "stage": STAGE_NAMES[dominant_stage],
+            "confidence": confidence,
         }
         print(f"  → Detected: [{stage_ctx['stage']}] "
               f"({stage_ctx['confidence']:.1%} confidence)")
-        print(f"  → Evidence: {est.evidence[-2] if est.evidence else 'None'}")
+        print(f"  → Events processed: {estimates[dominant_host].n_events_processed}")
 
     print("\n🗺️  [Layer 2] Building Enterprise Attack Graph...")
-    graph = build_enterprise_attack_graph()
+    graph = build_configured_attack_graph()
 
     # Cập nhật belief state dựa trên telemetry
-    belief_state = {4: 0.40, 3: 0.25, 6: 0.15, 5: 0.12, 1: 0.08}
-    graph.update_belief({4: 0.8, 3: 0.4, 6: 0.3})
-    print(f"  → Belief updated: WS_Finance (Node 4) has {graph.belief_state.get(4, 0):.1%} probability")
+    belief_likelihood = classifier.get_graph_belief_update(
+        dominant_host,
+        graph,
+    )
+    graph.update_belief(belief_likelihood)
+    belief_state = dict(graph.belief_state)
+    top_node = max(belief_state, key=belief_state.get)
+    print(
+        f"  → Belief updated: {graph.label(top_node)} "
+        f"(Node {top_node}) has {belief_state[top_node]:.1%} probability"
+    )
 
     print("\n🎭 [Layer 3] Initializing Deception Fabric...")
     fabric = DeceptionFabric(graph)
@@ -371,10 +495,10 @@ def run_full_demo():
 
 def run_full_benchmark():
     """Chạy benchmark đầy đủ với tất cả 6 phương pháp."""
-    from mirage.layer2_attack_graph import build_enterprise_attack_graph
+    from mirage.layer2_attack_graph import build_configured_attack_graph
     from mirage.layer6_evaluation import MIRAGEEvaluator
 
-    graph = build_enterprise_attack_graph()
+    graph = build_configured_attack_graph()
     evaluator = MIRAGEEvaluator(graph, n_episodes=500, seed=42, results_dir="results")
 
     print("\n[Benchmark] Running full 6-method comparison...")
@@ -395,10 +519,10 @@ def run_full_benchmark():
 
 def run_benchmark_a():
     """Chạy Benchmark A: Attacker bắt đầu từ Internet/Entry Point."""
-    from mirage.layer2_attack_graph import build_enterprise_attack_graph
+    from mirage.layer2_attack_graph import build_configured_attack_graph
     from mirage.layer6_evaluation import MIRAGEEvaluator
 
-    graph = build_enterprise_attack_graph()
+    graph = build_configured_attack_graph()
     evaluator = MIRAGEEvaluator(graph, n_episodes=500, seed=42, results_dir="results")
 
     print("\n[Benchmark A] Entry-point attack — Attacker starts at Internet (Node 0)")
@@ -415,14 +539,14 @@ def run_benchmark_a():
 
 def run_benchmark_b():
     """Chạy Benchmark B: Attacker đã bị nghi ở mid-network (post-intrusion)."""
-    from mirage.layer2_attack_graph import build_enterprise_attack_graph
+    from mirage.layer2_attack_graph import build_configured_attack_graph
     from mirage.layer6_evaluation import MIRAGEEvaluator
 
-    graph = build_enterprise_attack_graph()
+    graph = build_configured_attack_graph()
     evaluator = MIRAGEEvaluator(graph, n_episodes=500, seed=42, results_dir="results")
 
     print("\n[Benchmark B] Belief-conditioned response")
-    print("  Belief: WS_Finance(35%), SMB(25%), SVC_Cred(20%), Admin_Cred(10%), WS_Eng(10%)")
+    print("  Belief: generated from configured mid-network topology metadata")
     evaluator.run_benchmark_b(verbose=True)
 
     print("\n[Benchmark B] Results:")
@@ -436,10 +560,10 @@ def run_benchmark_b():
 
 def run_multi_seed():
     """Chạy Multi-Seed Benchmark để lấy mean ± std."""
-    from mirage.layer2_attack_graph import build_enterprise_attack_graph
+    from mirage.layer2_attack_graph import build_configured_attack_graph
     from mirage.layer6_evaluation import MIRAGEEvaluator
 
-    graph = build_enterprise_attack_graph()
+    graph = build_configured_attack_graph()
     evaluator = MIRAGEEvaluator(graph, n_episodes=300, seed=42, results_dir="results")
 
     smoke_seeds = list(range(3))
@@ -509,8 +633,11 @@ def run_train_rl(episodes: int = 200, model_path: str = "models/mirage_dqn.npz")
 
 def show_graph_info():
     """Hiển thị thông tin đồ thị."""
-    from mirage.layer2_attack_graph import build_enterprise_attack_graph, print_graph_summary
-    graph = build_enterprise_attack_graph()
+    from mirage.layer2_attack_graph import (
+        build_configured_attack_graph,
+        print_graph_summary,
+    )
+    graph = build_configured_attack_graph()
     print_graph_summary(graph)
 
 
@@ -570,9 +697,9 @@ def main():
     elif args.mode == "train_rl":
         run_train_rl(args.episodes, args.model_path)
     elif args.mode == "ablation":
-        from mirage.layer2_attack_graph import build_enterprise_attack_graph
+        from mirage.layer2_attack_graph import build_configured_attack_graph
         from mirage.layer6_evaluation import MIRAGEEvaluator
-        graph = build_enterprise_attack_graph()
+        graph = build_configured_attack_graph()
         evaluator = MIRAGEEvaluator(graph, n_episodes=300, seed=42)
         evaluator.run_ablation_study()
     elif args.mode == "graph":

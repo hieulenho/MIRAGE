@@ -37,6 +37,7 @@ Example MIRAGE Native JSON format:
 from __future__ import annotations
 
 import json
+import math
 import os
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -49,11 +50,15 @@ from mirage.layer2_attack_graph import MIRAGEAttackGraph
 
 def _normalize_dist(dist: Dict[int, float], sink: int) -> Dict[int, float]:
     """Normalize a probability distribution, routing remainder to sink."""
-    positive = {
-        state: float(probability)
-        for state, probability in dist.items()
-        if probability > 0
-    }
+    positive = {}
+    for state, raw_probability in dist.items():
+        probability = float(raw_probability)
+        if not math.isfinite(probability) or probability < 0:
+            raise ValueError(
+                "Transition probabilities must be finite and non-negative"
+            )
+        if probability > 0:
+            positive[state] = probability
     total = sum(positive.values())
     if total <= 0:
         return {sink: 1.0}
@@ -85,6 +90,14 @@ def _build_graph_from_spec(
     budget = float(config.get("budget", 4.0))
     discount = float(config.get("discount", 0.95))
     decoy_realism = float(config.get("decoy_realism", 0.8))
+    if not math.isfinite(budget) or budget < 0:
+        raise ValueError("budget must be a finite non-negative number")
+    if not math.isfinite(discount) or not 0 <= discount < 1:
+        raise ValueError("discount must satisfy 0 <= discount < 1")
+    if not math.isfinite(decoy_realism) or not 0 <= decoy_realism <= 1:
+        raise ValueError("decoy_realism must satisfy 0 <= value <= 1")
+    if not nodes:
+        raise ValueError("At least one node is required")
 
     # ---- Classify nodes ----
     node_ids: List[int] = [int(n["id"]) for n in nodes]
@@ -117,7 +130,20 @@ def _build_graph_from_spec(
         node_meta[nid] = meta
         state_labels[nid] = meta["label"]
 
-        if n.get("start"):
+        start_probability = n.get("start_probability")
+        if start_probability is not None:
+            start_probability = float(start_probability)
+            if (
+                not math.isfinite(start_probability)
+                or start_probability < 0
+            ):
+                raise ValueError(
+                    f"Invalid start_probability for node {nid}"
+                )
+            if start_probability > 0:
+                start_nodes.append(nid)
+                meta["start_probability"] = start_probability
+        elif n.get("start"):
             start_nodes.append(nid)
         if n.get("goal"):
             goal_nodes.append(nid)
@@ -151,6 +177,15 @@ def _build_graph_from_spec(
         start_nodes = [node_ids[0]]
     if not goal_nodes:
         raise ValueError("At least one node must be marked as 'goal': true in the JSON spec.")
+    if sink_node in start_nodes:
+        raise ValueError("The sink node cannot be an attacker start node")
+    if sink_node in goal_nodes:
+        raise ValueError("The sink node cannot be a true goal")
+    overlap = set(goal_nodes).intersection(decoy_nodes)
+    if overlap:
+        raise ValueError(
+            f"Nodes cannot be both true goals and decoys: {sorted(overlap)}"
+        )
 
     # ---- Build transitions from edges ----
     # Group edges by (src, action) → list of (dst, prob)
@@ -164,8 +199,10 @@ def _build_graph_from_spec(
             raise ValueError(f"Edge references unknown node: {src} -> {dst}")
         action = str(e.get("action", "move"))
         prob = float(e.get("prob", 1.0))
-        if prob < 0:
-            raise ValueError(f"Edge probability must be non-negative: {src} -> {dst}")
+        if not math.isfinite(prob) or prob < 0:
+            raise ValueError(
+                f"Edge probability must be finite and non-negative: {src} -> {dst}"
+            )
         key = (src, action)
         edge_map.setdefault(key, []).append((dst, prob))
 
@@ -216,7 +253,24 @@ def _build_graph_from_spec(
         defender_reward[(d, "end")] = 1.0
 
     # ---- Build start distribution ----
-    start_dist = {s: 1.0 / len(start_nodes) for s in start_nodes}
+    explicit_start = {
+        node: float(node_meta[node].get("start_probability", 0.0))
+        for node in start_nodes
+        if "start_probability" in node_meta[node]
+    }
+    if explicit_start:
+        for node in start_nodes:
+            explicit_start.setdefault(node, 0.0)
+        total_start = sum(explicit_start.values())
+        if total_start <= 0:
+            raise ValueError("start_probability values must sum to a positive number")
+        start_dist = {
+            node: probability / total_start
+            for node, probability in explicit_start.items()
+            if probability > 0
+        }
+    else:
+        start_dist = {s: 1.0 / len(start_nodes) for s in start_nodes}
 
     # ---- Collect all unique actions ----
     all_actions: List[str] = sorted({
@@ -595,8 +649,16 @@ def save_graph_to_json(graph: MIRAGEAttackGraph, path: str) -> None:
             "service_count": meta.get("service_count", 1),
             "user_count": meta.get("user_count", 10),
         }
-        if nid in list(graph.start_distribution.keys()):
+        for key in (
+            "realism_score",
+            "service_banner",
+            "attacker_visible_label",
+        ):
+            if key in meta:
+                node[key] = meta[key]
+        if nid in graph.start_distribution:
             node["start"] = True
+            node["start_probability"] = graph.start_distribution[nid]
         if nid in graph.true_goals:
             node["goal"] = True
         if nid in graph.decoy_sites:
@@ -608,9 +670,13 @@ def save_graph_to_json(graph: MIRAGEAttackGraph, path: str) -> None:
     edges = []
     seen = set()
     for src in graph.states:
-        for action, dist in graph.transitions.get(src, {}).items():
+        for action, live_distribution in graph.transitions.get(src, {}).items():
             if action in ("end", "noop"):
                 continue
+            dist = graph.decoy_transition_templates.get(
+                (src, action),
+                live_distribution,
+            )
             for dst, prob in dist.items():
                 key = (src, dst, action)
                 if key not in seen and prob > 0:
@@ -623,7 +689,18 @@ def save_graph_to_json(graph: MIRAGEAttackGraph, path: str) -> None:
         "config": {
             "budget": graph.budget,
             "discount": graph.discount,
-            "decoy_realism": 0.8,
+            "decoy_realism": max(
+                (
+                    float(
+                        graph.node_metadata.get(node, {}).get(
+                            "realism_score",
+                            0.8,
+                        )
+                    )
+                    for node in graph.decoy_sites
+                ),
+                default=0.8,
+            ),
         }
     }
     with open(path, "w", encoding="utf-8") as f:

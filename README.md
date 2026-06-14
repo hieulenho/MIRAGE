@@ -18,7 +18,7 @@
 
 **Hệ thống Phòng thủ Chủ động (Active Defense) dựa trên AI, Game Theory và POMDP**
 
-![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)
 ![License](https://img.shields.io/badge/License-MIT-green)
 ![Version](https://img.shields.io/badge/Version-2.0.0-orange)
 ![Framework](https://img.shields.io/badge/Framework-Production--oriented-purple)
@@ -63,6 +63,7 @@
 ### Research simulator invariants
 
 - `decoy_sites` là slot tiềm năng; chỉ `active_decoy_sites` mới được tính là decoy outcome.
+- Action `deploy_decoy_*` chỉ được target decoy slot, không biến tài sản thật thành decoy.
 - Clean no-defense graph không có transition đi vào decoy slot.
 - Portfolio rỗng tạo đúng cùng runtime graph và kết quả với no-defense.
 - Reward intervention chỉ đổi bait reward; edge-cost action mới được đổi transition probability.
@@ -134,7 +135,10 @@ MIRAGE/
 │
 ├── run_mirage.py                   # Entry point chính — chạy mọi mode
 ├── test_agents.py                  # Test nhanh attacker agents
+├── config.json                     # Topology, budget, reward/cost và API config
 ├── requirements.txt                # Thư viện phụ thuộc
+├── requirements-dev.txt            # Pytest, Ruff và công cụ phát triển
+├── tests/                          # Unit/integration tests cho các layer
 ├── .gitignore
 │
 └── mirage/                         # Package chính
@@ -147,21 +151,26 @@ MIRAGE/
     ├── graph_parser.py             # Parser MIRAGE/BloodHound/Nmap JSON
     ├── layer3_deception.py         # Layer 3: Deception Fabric
     ├── layer4_decision_engine.py   # Layer 4: Robust Decision Engine
+    ├── mdp_solver.py               # Exact MDP math và scaling utilities
     ├── rl_agent.py                 # Deep Q-Network + Gymnasium environment
+    ├── policy_cache.py             # Cache policy cho đường xử lý online
     ├── layer5_safe_control.py      # Layer 5: Safety Gate
     ├── layer6_evaluation.py        # Layer 6: Benchmark & Evaluation
     ├── api_server.py               # FastAPI REST/WebSocket orchestration
     ├── attacker_mitre.py           # MITRE ATT&CK evasion attacker
     ├── dashboard/                  # Web dashboard
+    ├── utils/
+    │   ├── mdp_model.py            # Portable AttackGraphMDP compatibility model
+    │   └── robust_reward_design.py # In-package bounded reward allocation
     │
-    └── attacker_agents.py          # Mô phỏng 5 loại kẻ tấn công
+    └── attacker_agents.py          # Mô phỏng 6 loại kẻ tấn công
 ```
 
 ---
 
 ## ⚙️ Yêu cầu hệ thống
 
-- **Python**: 3.9 hoặc mới hơn
+- **Python**: 3.10 hoặc mới hơn
 - **OS**: Windows / Linux / macOS
 - **RAM**: Tối thiểu 4 GB (khuyến nghị 8 GB cho benchmark đầy đủ)
 
@@ -255,6 +264,17 @@ Khởi động API:
 python -m mirage.api_server
 ```
 
+ASGI command một process:
+
+```bash
+uvicorn mirage.api_server:create_app --factory --host 0.0.0.0 --port 8000
+```
+
+State telemetry, decision và WebSocket hiện được giữ trong memory của process.
+Không chạy nhiều worker nếu chưa bổ sung Redis/database làm shared state. Khi
+public ra Internet, đặt API sau TLS reverse proxy và cơ chế authentication/RBAC
+thay vì chỉ dựa vào một static API key.
+
 Sau đó mở:
 
 - Dashboard: `http://localhost:8000/dashboard`
@@ -278,7 +298,17 @@ portfolio đều đi qua Safety Gate; action cần human approval hoặc bị bl
 không được deploy và không bị trừ budget.
 
 Thiết lập biến môi trường `MIRAGE_API_KEY` để yêu cầu header `X-API-Key` cho
-các REST endpoint `/api/*`.
+các REST endpoint `/api/*`. Dashboard giữ key trong `sessionStorage` và truyền
+WebSocket credential qua subprotocol, không đưa secret vào URL.
+
+Nếu dashboard hiện `Disconnected`, graph trống và `/api/graph` trả `401`:
+
+1. Cài lại dependency để có WebSocket backend: `pip install -r requirements.txt`.
+2. Nếu không cần API key, xóa biến trước khi chạy:
+   `$env:MIRAGE_API_KEY = $null`.
+3. Nếu dùng API key, nhập cùng giá trị vào ô `API key` ở thanh dưới dashboard
+   rồi nhấn `Apply key`.
+4. Khởi động lại server và hard-refresh trình duyệt bằng `Ctrl+F5`.
 
 ### Configuration
 
@@ -300,6 +330,30 @@ set MIRAGE_CONFIG=C:\path\to\config.json
 }
 ```
 
+Các mode `demo`, `step1`, `step2`, `step3`, benchmark, ablation, graph, API và
+train RL đều dùng topology đã cấu hình. Các giới hạn production quan trọng:
+
+```json
+{
+  "layer1": {
+    "event_history_limit": 1000,
+    "max_tracked_hosts": 10000
+  },
+  "rl": {
+    "backend": "numpy"
+  },
+  "api": {
+    "max_batch_size": 1000,
+    "max_request_bytes": 2097152,
+    "decision_history_limit": 1000,
+    "pending_decision_limit": 100
+  }
+}
+```
+
+`rl.backend` nhận `numpy`, `torch` hoặc `auto`. Model lưu kèm signature của
+graph và action catalog; sau thay đổi topology/catalog cần train lại model.
+
 ### Ví dụ output — `--mode step2`
 
 ```
@@ -307,18 +361,21 @@ set MIRAGE_CONFIG=C:\path\to\config.json
   [🪤 Deception] Fake Database deployed at Node 11 (DB_FAKE_Backup) | Reward bait: +0.9
   [🪤 Deception] Fake Router deployed at Node 12 (Router_FAKE_Gateway) | Edge cost +0.3
   [🍯 Honey] Honey Credential planted at Node 4 (Workstation_Finance) | Trigger reward: +0.5
+  → 3 deception actions deployed (budget remaining: 0.12/6.00)
 
-[Attackers] Simulating 4 attacker types (100 episodes each)...
-  random              : Hit True Goal=20.0%  |  Decoy Hit=20.0%  |  Avg Steps=3.6
+[Attackers] Simulating 6 attacker types (100 episodes each)...
+  random              : Hit True Goal=18.0%  |  Decoy Hit=21.0%  |  Avg Steps=3.6
   greedy              : Hit True Goal=47.0%  |  Decoy Hit=53.0%  |  Avg Steps=4.9
-  shortest_path       : Hit True Goal=88.0%  |  Decoy Hit=12.0%  |  Avg Steps=4.9
-  stealthy            : Hit True Goal=53.0%  |  Decoy Hit=40.0%  |  Avg Steps=4.7
+  shortest_path       : Hit True Goal=87.0%  |  Decoy Hit=13.0%  |  Avg Steps=4.9
+  stealthy            : Hit True Goal=50.0%  |  Decoy Hit=41.0%  |  Avg Steps=4.7
+  deception_aware     : Hit True Goal=62.0%  |  Decoy Hit=38.0%  |  Avg Steps=5.0
+  mitre_evasion       : Hit True Goal=62.0%  |  Decoy Hit=37.0%  |  Avg Steps=4.8
 
 Quick Comparison (3 methods):
   Method                    |   Intercept% |     Pess.Val
-  no_defense                |       33.0% |     -1.4875
-  static_honeypot           |       32.0% |     -1.3675
-  robust_mirage             |       38.5% |     -1.3075 ← MIRAGE
+  no_defense                |        0.0% |     -1.9695
+  static_honeypot           |       29.7% |     -1.4275
+  robust_mirage             |       28.0% |     -1.4275 ← MIRAGE
 ```
 
 ### Output files (thư mục `results/`)
@@ -472,7 +529,7 @@ print(f"Deployed: {decoy.decoy_id}")
 
 1. Nhận `belief_state` từ Layer 2
 2. Lấy danh sách `available_actions` từ Layer 3
-3. Simulate mỗi action với **4 loại kẻ tấn công**
+3. Simulate mỗi action với **6 loại kẻ tấn công**
 4. Tính `pessimistic_value = min(defender_values)` ← Robust criterion
 5. Sắp xếp theo pessimistic value, chọn action tốt nhất qua Safety Gate
 
@@ -532,11 +589,11 @@ So sánh hiệu quả của **6 phương pháp phòng thủ**:
 | Phương pháp | Mô tả |
 |-------------|-------|
 | `no_defense` | Không có biện pháp phòng thủ nào |
+| `random_deception` | Triển khai deception ngẫu nhiên |
 | `static_honeypot` | Honeypot tĩnh truyền thống |
+| `greedy_top_k` | Chọn các mục tiêu deception có giá trị cao |
+| `standard_rl` | Tối ưu expected value bằng cùng decision engine |
 | `robust_mirage` | MIRAGE với Robust Optimization ✅ |
-| `random_deception` | Triển khai ngẫu nhiên |
-| `greedy_deception` | Chọn action có expected value cao nhất |
-| `milp_optimal` | MILP Optimization lý tưởng |
 
 **Metrics đánh giá:**
 - `interception_rate` — Tỷ lệ kẻ tấn công bị dẫn vào decoy
@@ -548,7 +605,7 @@ So sánh hiệu quả của **6 phương pháp phòng thủ**:
 
 ## 🤺 Mô phỏng Kẻ tấn công (`attacker_agents.py`)
 
-4 loại kẻ tấn công với chiến thuật khác nhau:
+6 loại kẻ tấn công với chiến thuật khác nhau:
 
 | Loại | Chiến thuật | Đặc điểm |
 |------|-------------|----------|
@@ -556,34 +613,44 @@ So sánh hiệu quả của **6 phương pháp phòng thủ**:
 | `greedy` | Chọn action có reward cao nhất ngay lập tức | Tham lam, dễ bị bẫy decoy reward |
 | `shortest_path` | Đi đường ngắn nhất đến true goal | Nguy hiểm nhất với defense truyền thống |
 | `stealthy` | Né tránh các node có nhiều traffic | Khó phát hiện, tốn nhiều bước |
+| `deception_aware` | Đánh giá realism và dấu hiệu giả mạo | Chủ động né deception dễ nhận biết |
+| `mitre_evasion` | Kết hợp kỹ thuật MITRE ATT&CK evasion | Thích nghi với telemetry và bẫy đang hoạt động |
 
 ---
 
 ## 📊 Kết quả Benchmark
 
-Kết quả từ simulation thực tế (100-500 episodes):
+Benchmark A, seed `42`, 500 episodes/method:
 
 ```
-Method                    |   Intercept% |     Pess.Val
-----------------------------------------------------------
-no_defense                |       33.0% |     -1.4875
-static_honeypot           |       32.0% |     -1.3675
-robust_mirage             |       38.5% |     -1.3075 ← MIRAGE ✅
+Method              Intercept   Hit True Goal   Pess.Val   FP Cost   Total Cost
+no_defense              0.0%          84.5%      -1.9696     0.000        0.0
+random_deception       28.5%          58.8%      -1.5333     0.068        2.0
+static_honeypot        32.3%          56.6%      -1.5333     0.332        4.4
+greedy_top_k           28.5%          58.8%      -1.5333     0.408        3.9
+standard_rl            37.6%          51.0%      -1.5333     0.399        4.9
+robust_mirage          26.7%          60.6%      -1.5333     0.068        2.0
 ```
 
-**Ablation Study — Đóng góp của từng thành phần:**
+Kết quả này được giữ nguyên trung thực: `standard_rl` có interception tốt nhất
+trong seed trên; `robust_mirage` chọn portfolio rẻ và false-positive thấp hơn.
+Các phương pháp deception cùng bị chặn ở pessimistic value `-1.5333` bởi profile
+`shortest_path`, nên chưa thể kết luận MIRAGE thắng tuyệt đối từ một seed.
+
+**Ablation Study (`--mode ablation`, seed `42`, 75 evaluation episodes/variant):**
 
 ```
-Component                 |   Pess.Val |   Intercept%
-Full MIRAGE               |    -1.1288 |       30.0%  ← FULL ✅
-- Robust Term             |    -1.1288 |       32.0%
-- Stage Modeling          |    -1.1288 |       28.0%
-- Deception Variety       |    -1.1288 |       28.0%
-- Safety Cost             |    -1.3653 |       25.0%
-No Components             |    -1.1288 |       32.0%
+Variant                 Cost    Pess.Val    Robustness Gap
+full_mirage             3.625    -1.0034        0.5643
+no_robust_objective     5.650    -1.0358        0.6736
+no_belief               2.030    -1.0358        0.5916
+no_edge_cost            2.030    -1.0358        0.5916
+no_deception_variety    2.030    -1.0358        0.5916
+no_cost_model           5.795    -1.0463        0.6283
+no_deception_aware      3.625    -1.0034        0.5643
 ```
 
-> **Nhận xét:** Safety Cost (Layer 5) đóng góp lớn nhất — loại bỏ Safety Cost làm giảm Intercept Rate từ 30% xuống còn 25%.
+Chạy `--mode multi_seed` trước khi dùng các số liệu này cho kết luận nghiên cứu.
 
 ---
 
@@ -602,6 +669,23 @@ max   min  V_D(π*, r + δ)
 s.t.  ||δ||₁ ≤ B        (budget constraint)
       δ(s,a) ≥ 0         (non-negative modifications)
 ```
+
+Các module tương thích đã nằm hoàn toàn trong package, không cần repository
+solver bên ngoài:
+
+```python
+from mirage.layer2_attack_graph import build_enterprise_attack_graph
+from mirage.utils import AttackGraphMDP, solve_max_margin_reward_design
+
+graph = build_enterprise_attack_graph()
+model = AttackGraphMDP.from_mirage_graph(graph)
+result = solve_max_margin_reward_design(model)
+
+print(result.x_ip, result.c_star, result.solver_status)
+```
+
+Solver giới hạn budget, timeout và số objective evaluations. Với action space lớn,
+trạng thái `HEURISTIC_ENUMERATED` được báo rõ thay vì gắn nhãn MILP-optimal.
 
 ### 2. POMDP (Partially Observable MDP)
 
@@ -629,7 +713,7 @@ Mọi hành động của AI đều qua **Safety Gate** với 7 guardrails. Hàn
 
 ## 🗺️ Mô hình đồ thị tấn công
 
-Chi tiết topology của Enterprise Attack Graph v1:
+Chi tiết topology dựng sẵn của Enterprise Attack Graph v2:
 
 | Node | Tên | Layer | Giá trị | Ghi chú |
 |------|-----|-------|---------|---------|

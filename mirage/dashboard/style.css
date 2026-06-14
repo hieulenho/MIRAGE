@@ -171,6 +171,12 @@ body {
   animation: none;
 }
 
+.indicator__dot.auth-required {
+  background: var(--accent-amber);
+  animation: none;
+  box-shadow: 0 0 8px var(--accent-amber);
+}
+
 @keyframes dot-blink {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.3; }
@@ -178,6 +184,29 @@ body {
 
 .indicator__text {
   color: var(--text-secondary);
+}
+
+.api-key-control {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.api-key-input {
+  width: 170px;
+  padding: 6px 9px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  outline: none;
+}
+
+.api-key-input:focus {
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 0 2px hsla(185, 85%, 55%, 0.12);
 }
 
 .topbar__metric {

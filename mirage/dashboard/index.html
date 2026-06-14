@@ -5,9 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="MIRAGE — Real-time Cyber Deception Dashboard for Attack Graph Monitoring">
   <title>MIRAGE — Cyber Deception Dashboard</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/dashboard-static/style.css">
 </head>
 <body>
@@ -107,8 +104,19 @@
       <button class="btn btn--secondary" id="btn-refresh-graph">🔄 Refresh Graph</button>
     </div>
     <div class="bottombar__info">
+      <div class="api-key-control">
+        <input
+          class="api-key-input"
+          id="api-key-input"
+          type="password"
+          placeholder="API key (optional)"
+          autocomplete="off"
+          aria-label="MIRAGE API key"
+        >
+        <button class="btn btn--sm" id="btn-save-api-key">Apply key</button>
+      </div>
       <span id="uptime-display">Uptime: —</span>
-      <span id="api-url">API: <code>localhost:8000</code></span>
+      <span id="api-url">API: <code></code></span>
     </div>
   </footer>
 

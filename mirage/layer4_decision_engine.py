@@ -9,8 +9,9 @@ portfolio optimizer with MDP/game-theoretic value estimates inspired by the
 Robust Reward Design paper.
 
 Thuật toán:
-  - Kế thừa Robust Reward Design từ codebase gốc (max-margin MILP)
-  - Ánh xạ x_alloc → DeceptionAction thực tế
+  - Tối ưu portfolio bằng exact MDP và robust multi-attacker simulation
+  - Cung cấp reward-design compatibility solver nội bộ tại mirage.utils
+  - Ánh xạ reward allocation → DeceptionAction thực tế
   - Output có cấu trúc: action plan với giải thích, risk, confidence
 
 Workflow tại mỗi time step:
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+import math
 import time
 
 from mirage.layer2_attack_graph import MIRAGEAttackGraph
@@ -169,14 +171,14 @@ class RobustDecisionEngine:
     """
 
     # Six attacker profiles shared by optimization and evaluation.
-    ALL_ATTACKER_TYPES = [
+    ALL_ATTACKER_TYPES = (
         "random",
         "greedy",
         "shortest_path",
         "stealthy",
         "deception_aware",
         "mitre_evasion",
-    ]
+    )
 
     def __init__(
         self,
@@ -192,10 +194,11 @@ class RobustDecisionEngine:
         attacker_types: Optional[List[str]] = None,
         approximate_mode: bool = False,
         cost_model_enabled: bool = True,
+        verbose: bool = True,
     ):
         self.graph = graph
         self.fabric = fabric
-        self.n_attacker_samples = n_attacker_samples
+        self.n_attacker_samples = int(n_attacker_samples)
         # Kept for API compatibility. The external MILP package was removed;
         # exact MDP math and robust simulation are now fully in-package.
         self.use_robust_milp = False
@@ -205,8 +208,21 @@ class RobustDecisionEngine:
         self.expected_value_weight = expected_value_weight
         self.margin_weight = margin_weight
         self.attacker_types = list(attacker_types or self.ALL_ATTACKER_TYPES)
+        if self.n_attacker_samples < 1:
+            raise ValueError("n_attacker_samples must be at least 1")
+        if not self.attacker_types:
+            raise ValueError("attacker_types cannot be empty")
+        for name, value in (
+            ("operational_cost_weight", operational_cost_weight),
+            ("false_positive_weight", false_positive_weight),
+            ("expected_value_weight", expected_value_weight),
+            ("margin_weight", margin_weight),
+        ):
+            if not math.isfinite(float(value)) or float(value) < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
         self.approximate_mode = approximate_mode
         self.cost_model_enabled = cost_model_enabled
+        self.verbose = verbose
         self._decision_history: List[ActionPlan] = []
         self._evaluation_cache: Dict[Tuple, Dict] = {}
         
@@ -239,14 +255,14 @@ class RobustDecisionEngine:
 
         # Defender value function:
         # +1 nếu attacker đến decoy, -2 nếu attacker đến true goal
-        attacker_types = self.ALL_ATTACKER_TYPES
+        attacker_types = self.attacker_types
         defender_values = []
         runtime_graph = build_runtime_graph(self.graph, actions=[action])
 
         for atype in attacker_types:
             result = run_simulation(
                 runtime_graph, atype,
-                n_episodes=n_episodes // len(attacker_types),
+                n_episodes=max(1, n_episodes // len(attacker_types)),
                 reward_interventions=reward_interventions,
                 seed=self.seed,
             )
@@ -268,7 +284,9 @@ class RobustDecisionEngine:
             "optimistic_value":  max(defender_values),
             "pessimistic_value": min(defender_values),   # Worst-case!
             "expected_value":    sum(defender_values) / len(defender_values),
-            "per_attacker":      dict(zip(attacker_types, defender_values)),
+            "per_attacker": dict(
+                zip(attacker_types, defender_values, strict=True)
+            ),
             "reward_interventions": reward_interventions,
         }
 
@@ -291,7 +309,7 @@ class RobustDecisionEngine:
     def _merge_interventions(
         self, actions: List[DeceptionAction],
         belief_state: Optional[Dict[int, float]] = None
-    ) -> Dict:
+    ) -> Tuple[Dict, List[Tuple[int, int, float]]]:
         """
         Kết hợp reward interventions từ nhiều actions thành một dict dùng cho simulation.
 
@@ -303,7 +321,7 @@ class RobustDecisionEngine:
           Không còn model bằng reward nhỏ nữa — tác động trực tiếp lên xác suất.
         """
         merged: Dict = {}
-        self._edge_cost_edits: List[Tuple] = []  # [(src, dst, delta), ...]
+        edge_cost_edits: List[Tuple[int, int, float]] = []
 
         for action in actions:
             atype = action.action_type
@@ -326,12 +344,17 @@ class RobustDecisionEngine:
                 # Ghi nhận cảnh cần giảm xác suất — sẽ được apply trong _evaluate_portfolio
                 if action.target_edge:
                     src, dst = action.target_edge
-                    self._edge_cost_edits.append((src, dst, action.edge_cost_delta))
+                    edge_cost_edits.append(
+                        (src, dst, action.edge_cost_delta)
+                    )
 
         # Scale by occupancy measure (Robust Reward Design paper)
-        return self.mdp_solver.allocate_reward_by_occupancy(
-            raw_interventions=merged,
-            start_distribution=belief_state
+        return (
+            self.mdp_solver.allocate_reward_by_occupancy(
+                raw_interventions=merged,
+                start_distribution=belief_state,
+            ),
+            edge_cost_edits,
         )
 
     def _evaluate_portfolio(
@@ -371,8 +394,10 @@ class RobustDecisionEngine:
         if cache_key in self._evaluation_cache:
             return self._evaluation_cache[cache_key]
 
-        combined = self._merge_interventions(actions, belief_state=belief_state)
-        edge_cost_edits = getattr(self, "_edge_cost_edits", [])
+        combined, edge_cost_edits = self._merge_interventions(
+            actions,
+            belief_state=belief_state,
+        )
         graph_copy = build_runtime_graph(
             self.graph,
             actions=actions,
@@ -494,7 +519,7 @@ class RobustDecisionEngine:
         else:
             raise ValueError(
                 "criterion must be one of: expected, pure_pessimistic, "
-                "cost_aware_robust"
+                "optimistic, cost_aware_robust"
             )
 
         evaluation = {
@@ -507,7 +532,7 @@ class RobustDecisionEngine:
             "margin_guarantee":  margin_guarantee,
             "per_attacker":      defender_values,
             "combined_interventions": combined,
-            "edge_cost_edits":   self._edge_cost_edits.copy(),
+            "edge_cost_edits": list(edge_cost_edits),
             "total_cost":        total_cost,
             "false_positive_cost": fp_cost,
             "cost_breakdown":    cost_report,
@@ -540,6 +565,15 @@ class RobustDecisionEngine:
 
         Algorithms: Greedy forward + Local swap.
         """
+        budget = float(budget)
+        if not math.isfinite(budget) or budget < 0:
+            raise ValueError("budget must be finite and non-negative")
+        if min_actions < 0:
+            raise ValueError("min_actions cannot be negative")
+        if max_candidates is not None and max_candidates < 1:
+            raise ValueError("max_candidates must be at least 1")
+        if max_portfolio_size is not None and max_portfolio_size < 1:
+            raise ValueError("max_portfolio_size must be at least 1")
         available = self.fabric.get_available_actions(budget)
 
         # Lọc theo loại action (cho ablation study)
@@ -587,7 +621,7 @@ class RobustDecisionEngine:
             )
 
         # Độ phân giải episodes: đủ để phân biệt portfolios mà không quá chậm
-        # Với 5 attacker types cần nhiều episodes hơn để có signal đủ mạnh
+        # Multiple attacker profiles need enough episodes for a stable signal.
         if self.approximate_mode:
             eps_per_eval = max(6, min(12, self.n_attacker_samples // 8))
         elif len(self.graph.states) > 120:
@@ -595,9 +629,10 @@ class RobustDecisionEngine:
         else:
             eps_per_eval = max(60, self.n_attacker_samples // 2)
 
-        print(f"\n[INFO] [Portfolio Optimizer] {len(available)} candidate actions, "
-              f"budget={budget:.1f}, {eps_per_eval} eps/eval, criterion={criterion}"
-              + (" | belief-conditioned" if belief_state else " | from entry point"))
+        if self.verbose:
+            print(f"\n[INFO] [Portfolio Optimizer] {len(available)} candidate actions, "
+                  f"budget={budget:.1f}, {eps_per_eval} eps/eval, criterion={criterion}"
+                  + (" | belief-conditioned" if belief_state else " | from entry point"))
 
         # --------------- Pha 1: Greedy forward ----------------
         portfolio: List[DeceptionAction] = []
@@ -643,18 +678,21 @@ class RobustDecisionEngine:
                 candidates.remove(best_candidate)
                 remaining_budget -= self._action_cost(best_candidate)
                 current_result = best_result
-                print(f"  + Add: {best_candidate.action_type.value} @ Node {best_candidate.target_node} "
-                      f"| sel={best_result['selection_value']:+.4f} "
-                      f"| pess={best_result['pessimistic_value']:+.4f} "
-                      f"| budget_left={remaining_budget:.1f}")
+                if self.verbose:
+                    print(f"  + Add: {best_candidate.action_type.value} @ Node {best_candidate.target_node} "
+                          f"| sel={best_result['selection_value']:+.4f} "
+                          f"| pess={best_result['pessimistic_value']:+.4f} "
+                          f"| budget_left={remaining_budget:.1f}")
             else:
                 candidates.remove(best_candidate)
-                print(f"  ~ Skip: {best_candidate.action_type.value} @ Node {best_candidate.target_node} "
-                      f"(sel={best_result['selection_value']:+.4f} <= current {current_result['selection_value']:+.4f})")
+                if self.verbose:
+                    print(f"  ~ Skip: {best_candidate.action_type.value} @ Node {best_candidate.target_node} "
+                          f"(sel={best_result['selection_value']:+.4f} <= current {current_result['selection_value']:+.4f})")
 
         # --------------- Pha 2: Local swap ----------------
-        print(f"  Phase 2: Local swap on portfolio of {len(portfolio)} actions "
-              f"(criterion={criterion})...")
+        if self.verbose:
+            print(f"  Phase 2: Local swap on portfolio of {len(portfolio)} actions "
+                  f"(criterion={criterion})...")
         outside = [a for a in available if a not in portfolio]
         improved = True
         while improved:
@@ -677,9 +715,10 @@ class RobustDecisionEngine:
                         outside[outside.index(out_action)] = in_action
                         current_result = trial_result
                         improved = True
-                        print(f"  ~ Swap: {in_action.action_type.value} -> "
-                              f"{out_action.action_type.value} @ Node {out_action.target_node} "
-                              f"| pess={trial_result['pessimistic_value']:+.4f}")
+                        if self.verbose:
+                            print(f"  ~ Swap: {in_action.action_type.value} -> "
+                                  f"{out_action.action_type.value} @ Node {out_action.target_node} "
+                                  f"| pess={trial_result['pessimistic_value']:+.4f}")
                         break
                 if improved:
                     break
@@ -696,10 +735,11 @@ class RobustDecisionEngine:
             final_result = current_result
 
         total_cost = float(self._portfolio_cost_report(portfolio)["total"])
-        print(f"  [OK] Optimal portfolio: {len(portfolio)} actions, "
-              f"cost={total_cost:.1f}/{budget:.1f}, "
-              f"pess={final_result['pessimistic_value']:+.4f}, "
-              f"opt={final_result['optimistic_value']:+.4f}")
+        if self.verbose:
+            print(f"  [OK] Optimal portfolio: {len(portfolio)} actions, "
+                  f"cost={total_cost:.1f}/{budget:.1f}, "
+                  f"pess={final_result['pessimistic_value']:+.4f}, "
+                  f"opt={final_result['optimistic_value']:+.4f}")
 
         return portfolio, final_result
 
@@ -725,7 +765,8 @@ class RobustDecisionEngine:
         Returns:
             ActionPlan với portfolio đầy đủ, hoặc None nếu không có action an toàn
         """
-        print("\n[*] [Decision Engine] Running portfolio optimization...")
+        if self.verbose:
+            print("\n[*] [Decision Engine] Running portfolio optimization...")
 
         # Log belief state nếu có — cho thấy thông tin đã được dùng
         if belief_state:
@@ -734,7 +775,8 @@ class RobustDecisionEngine:
                 f"Node{s}({self.graph.label(s)})={p:.1%}"
                 for s, p in top_nodes if p > 0.01
             )
-            print(f"  [>] Belief state (top nodes): {belief_summary}")
+            if self.verbose:
+                print(f"  [>] Belief state (top nodes): {belief_summary}")
 
         # ---- Chạy portfolio optimizer với belief_state ----
         # belief_state được dùng làm start_distribution trong simulation:
@@ -749,7 +791,8 @@ class RobustDecisionEngine:
         )
 
         if not portfolio:
-            print("  [!] No feasible portfolio found within budget.")
+            if self.verbose:
+                print("  [!] No feasible portfolio found within budget.")
             return None
 
         # ---- Chọn primary action (action quan trọng nhất trong portfolio) ----
@@ -769,7 +812,6 @@ class RobustDecisionEngine:
 
         # ---- Xây dựng evidence & reasoning ----
         evidence = self._build_evidence(belief_state, stage_context, primary_action)
-        milp_result = None
         cost_report = portfolio_result.get("cost_breakdown") or self._portfolio_cost_report(portfolio)
         false_positive_cost = float(cost_report.get("false_positive_cost", 0.0))
         total_operational_cost = float(cost_report.get("total", portfolio_result.get("total_cost", 0.0)))
@@ -794,7 +836,7 @@ class RobustDecisionEngine:
             confidence=confidence,
             required_approval=needs_approval,
             reasoning=self._build_reasoning(
-                primary_action, portfolio_result, belief_state, milp_result,
+                primary_action, portfolio_result, belief_state,
                 portfolio_size=len(portfolio),
             ),
             evidence=evidence,
@@ -813,13 +855,15 @@ class RobustDecisionEngine:
         if safety_filter is not None:
             safe, warning = safety_filter(plan)
             if not safe:
-                print(f"  [BLOCKED] Portfolio blocked by Safety Gate: {warning}")
+                if self.verbose:
+                    print(f"  [BLOCKED] Portfolio blocked by Safety Gate: {warning}")
                 return None
 
         self._decision_history.append(plan)
-        print(f"  [OK] Portfolio selected: {len(portfolio)} actions "
-              f"| total_cost={plan.portfolio_cost:.1f} "
-              f"| Pess.Val={portfolio_result['pessimistic_value']:+.4f}")
+        if self.verbose:
+            print(f"  [OK] Portfolio selected: {len(portfolio)} actions "
+                  f"| total_cost={plan.portfolio_cost:.1f} "
+                  f"| Pess.Val={portfolio_result['pessimistic_value']:+.4f}")
         return plan
 
     def _build_evidence(
@@ -864,7 +908,6 @@ class RobustDecisionEngine:
         action: DeceptionAction,
         result: Dict,
         belief_state: Dict[int, float],
-        milp_result: Optional[Dict],
         portfolio_size: int = 1,
     ) -> str:
         """Xây dựng giải thích bằng tiếng Anh cho SOC analyst."""
@@ -881,9 +924,6 @@ class RobustDecisionEngine:
             reasoning += "Positive pessimistic value means this action is beneficial even against adversarial attackers. "
         else:
             reasoning += "Action limits damage even in worst-case scenarios. "
-
-        if milp_result:
-            reasoning += f"MILP robust optimization confirmed with margin c*={milp_result.get('c_star', 0):.4f}. "
 
         # Chỉ ra attacker type nguy hiểm nhất
         per_atk = result.get("per_attacker", {})

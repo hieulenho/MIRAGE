@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import random
 import copy
+import math
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -124,9 +125,9 @@ ACTIONS = [
 @dataclass
 class MIRAGEAttackGraph:
     """
-    Đồ thị tấn công mạng doanh nghiệp 15 node cho MIRAGE Version 1.
+    Đồ thị tấn công dùng chung cho topology dựng sẵn và topology động.
     
-    Tương thích với AttackGraphMDP từ codebase cũ.
+    Tương thích với ``mirage.utils.mdp_model.AttackGraphMDP``.
     Bổ sung thêm: node metadata, belief state, edge cost.
     """
     states: List[int]
@@ -150,7 +151,7 @@ class MIRAGEAttackGraph:
 
     @property
     def name(self) -> str:
-        return "mirage_enterprise_graph_v1"
+        return "mirage_enterprise_graph_v2"
 
     def label(self, state: int) -> str:
         return self.state_labels.get(state, str(state))
@@ -224,12 +225,18 @@ class MIRAGEAttackGraph:
         if not self.belief_state:
             # Khởi tạo uniform
             n = len(self.states) - 1  # Loại sink
+            if n <= 0:
+                raise ValueError("Attack graph must contain a non-sink state")
             self.belief_state = {s: 1.0/n for s in self.states if s != self.sink_state}
 
         # Bayes update: b'(s) ∝ P(obs|s) * b(s)
         new_belief = {}
         for s in self.belief_state:
-            likelihood = observation.get(s, 0.1)  # Default likelihood thấp
+            likelihood = float(observation.get(s, 0.1))
+            if not math.isfinite(likelihood) or likelihood < 0:
+                raise ValueError(
+                    "Belief likelihoods must be finite and non-negative"
+                )
             new_belief[s] = self.belief_state[s] * likelihood
 
         total = sum(new_belief.values())
@@ -254,7 +261,7 @@ class MIRAGEAttackGraph:
 
     def to_mdp_dict(self) -> Dict:
         """
-        Chuyển sang format tương thích với AttackGraphMDP của codebase cũ.
+        Chuyển sang format tương thích với AttackGraphMDP nội bộ.
         """
         return {
             "name": self.name,
@@ -285,11 +292,15 @@ def _normalize_distribution(
     distribution: Dict[int, float],
     sink_state: int,
 ) -> Dict[int, float]:
-    positive = {
-        state: max(0.0, float(prob))
-        for state, prob in distribution.items()
-        if prob > 0
-    }
+    positive = {}
+    for state, raw_probability in distribution.items():
+        probability = float(raw_probability)
+        if not math.isfinite(probability) or probability < 0:
+            raise ValueError(
+                "Transition probabilities must be finite and non-negative"
+            )
+        if probability > 0:
+            positive[state] = probability
     total = sum(positive.values())
     if total <= 0:
         return {sink_state: 1.0}
@@ -348,6 +359,10 @@ def build_runtime_graph(
         action_type = getattr(getattr(action, "action_type", None), "value", "")
         if action_type in deploy_types:
             node = int(getattr(action, "target_node"))
+            if node not in runtime.decoy_sites:
+                raise ValueError(
+                    f"Deploy action target {node} is not a configured decoy slot"
+                )
             active.add(node)
             action_by_node[node] = action
         target_edge = getattr(action, "target_edge", None)
@@ -449,6 +464,15 @@ def build_enterprise_attack_graph(
         discount = config.get("general", {}).get("discount_factor", 0.95)
     if decoy_realism is None:
         decoy_realism = config.get("layer2", {}).get("decoy_realism", 0.8)
+    budget = float(budget)
+    discount = float(discount)
+    decoy_realism = float(decoy_realism)
+    if not math.isfinite(budget) or budget < 0:
+        raise ValueError("budget must be finite and non-negative")
+    if not math.isfinite(discount) or not 0 <= discount < 1:
+        raise ValueError("discount must satisfy 0 <= discount < 1")
+    if not math.isfinite(decoy_realism) or not 0 <= decoy_realism <= 1:
+        raise ValueError("decoy_realism must satisfy 0 <= value <= 1")
 
     states = list(range(15))
 
@@ -655,6 +679,18 @@ def build_synthetic_enterprise_graph(
 
     if n_nodes < 30:
         raise ValueError("n_nodes must be >= 30 for the synthetic scaling graph")
+    budget = float(budget)
+    discount = float(discount)
+    decoy_fraction = float(decoy_fraction)
+    if not math.isfinite(budget) or budget < 0:
+        raise ValueError("budget must be finite and non-negative")
+    if not math.isfinite(discount) or not 0 <= discount < 1:
+        raise ValueError("discount must satisfy 0 <= discount < 1")
+    if (
+        not math.isfinite(decoy_fraction)
+        or not 0 < decoy_fraction < 0.5
+    ):
+        raise ValueError("decoy_fraction must satisfy 0 < value < 0.5")
 
     rng = random.Random(seed)
     states = list(range(n_nodes))
@@ -924,7 +960,7 @@ def build_configured_attack_graph(config: Optional[Dict] = None) -> MIRAGEAttack
 def print_graph_summary(graph: MIRAGEAttackGraph) -> None:
     """In tóm tắt đồ thị tấn công."""
     print("=" * 70)
-    print("MIRAGE Enterprise Attack Graph — Version 1")
+    print("MIRAGE Enterprise Attack Graph — Version 2")
     print("=" * 70)
     print(f"Total nodes: {len(graph.states)}")
     print(f"True Goal: Node {graph.true_goals[0]} ({graph.label(graph.true_goals[0])})")

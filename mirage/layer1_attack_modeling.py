@@ -60,7 +60,7 @@ MITRE_TACTIC_MAP = {
 
 @dataclass
 class TelemetryEvent:
-    """Sự kiện telemetry đầu vào từ mạng (được giả lập trong Version 1)."""
+    """Sự kiện telemetry chuẩn hóa từ API, SIEM hoặc bộ mô phỏng."""
     timestamp: float
     source_host: str
     dest_host: str
@@ -97,48 +97,48 @@ class AttackStageClassifier:
     Lớp 1: Phân loại giai đoạn tấn công dựa trên luật (rule-based).
     
     Approach: rule + scoring theo chuỗi sự kiện.
-    Version 1 dùng IF/ELSE đơn giản, mở rộng về sau với HMM hoặc sequence model.
+    Đây là classifier fallback có thể kết hợp với HMM sequence classifier.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        event_history_limit: int = 1000,
+        max_tracked_hosts: int = 10000,
+    ):
+        if event_history_limit < 1:
+            raise ValueError("event_history_limit must be at least 1")
+        if max_tracked_hosts < 1:
+            raise ValueError("max_tracked_hosts must be at least 1")
+        self.event_history_limit = int(event_history_limit)
+        self.max_tracked_hosts = int(max_tracked_hosts)
         # Bộ đếm sự kiện theo host
         self._host_counters: Dict[str, Dict[str, int]] = {}
         # Lịch sử sự kiện
         self._event_history: Dict[str, List[TelemetryEvent]] = {}
         # Stage estimate hiện tại
         self._stage_estimates: Dict[str, StageEstimate] = {}
+        self._last_seen: Dict[str, float] = {}
 
-    def process_event(self, event: TelemetryEvent) -> StageEstimate:
-        """
-        Xử lý một sự kiện telemetry và cập nhật stage estimate.
-        """
-        host = event.source_host
+    @staticmethod
+    def _new_counters() -> Dict[str, int]:
+        return {
+            "port_scans": 0,
+            "login_attempts": 0,
+            "login_failures": 0,
+            "smb_connects": 0,
+            "rdp_connects": 0,
+            "dns_queries": 0,
+            "file_accesses": 0,
+            "data_transfers": 0,
+            "credential_uses": 0,
+            "external_connections": 0,
+            "honey_credential_uses": 0,
+            "decoy_touches": 0,
+        }
 
-        # Khởi tạo nếu chưa có
-        if host not in self._host_counters:
-            self._host_counters[host] = {
-                "port_scans": 0,
-                "login_attempts": 0,
-                "login_failures": 0,
-                "smb_connects": 0,
-                "rdp_connects": 0,
-                "dns_queries": 0,
-                "file_accesses": 0,
-                "data_transfers": 0,
-                "credential_uses": 0,
-                "external_connections": 0,
-                "honey_credential_uses": 0,
-                "decoy_touches": 0,
-            }
-            self._event_history[host] = []
-
-        counters = self._host_counters[host]
-        history = self._event_history[host]
-        history.append(event)
-
-        # ----- CẬP NHẬT COUNTERS THEO LOẠI SỰ KIỆN -----
+    @staticmethod
+    def _count_event(counters: Dict[str, int], event: TelemetryEvent) -> None:
         etype = event.event_type.lower()
-
         if etype == "port_scan":
             counters["port_scans"] += 1
         elif etype == "login_attempt":
@@ -164,6 +164,33 @@ class AttackStageClassifier:
             counters["credential_uses"] += 1
         elif etype == "decoy_touch":
             counters["decoy_touches"] += 1
+
+    def process_event(self, event: TelemetryEvent) -> StageEstimate:
+        """
+        Xử lý một sự kiện telemetry và cập nhật stage estimate.
+        """
+        host = event.source_host
+
+        # Khởi tạo nếu chưa có
+        if host not in self._host_counters:
+            if len(self._host_counters) >= self.max_tracked_hosts:
+                oldest = min(self._last_seen, key=self._last_seen.get)
+                self.reset_host(oldest)
+            self._host_counters[host] = self._new_counters()
+            self._event_history[host] = []
+        self._last_seen[host] = time.monotonic()
+
+        counters = self._host_counters[host]
+        history = self._event_history[host]
+        history.append(event)
+        if len(history) > self.event_history_limit:
+            del history[:-self.event_history_limit]
+            counters = self._new_counters()
+            for retained_event in history:
+                self._count_event(counters, retained_event)
+            self._host_counters[host] = counters
+        else:
+            self._count_event(counters, event)
 
         # ----- RULE-BASED STAGE SCORING -----
         scores: Dict[AttackStage, float] = {s: 0.0 for s in AttackStage}
@@ -292,6 +319,7 @@ class AttackStageClassifier:
         self._host_counters.pop(host, None)
         self._event_history.pop(host, None)
         self._stage_estimates.pop(host, None)
+        self._last_seen.pop(host, None)
 
     def summary(self) -> str:
         """In tóm tắt trạng thái hiện tại."""
@@ -315,7 +343,7 @@ class AttackStageClassifier:
 def simulate_attack_telemetry(scenario: str = "lateral_movement") -> List[TelemetryEvent]:
     """
     Tạo chuỗi sự kiện telemetry giả lập cho demo.
-    Dùng trong Version 1 thay vì đọc log thật.
+    Production ingestion sử dụng API/webhook trong ``mirage.api_server``.
     """
     t = time.time()
     events: List[TelemetryEvent] = []

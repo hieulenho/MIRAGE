@@ -1,4 +1,8 @@
-from mirage.layer5_safe_control import create_safety_gate, RiskLevel
+from mirage.layer5_safe_control import (
+    RiskLevel,
+    create_safety_gate,
+    make_safety_filter,
+)
 from mirage.layer3_deception import DeceptionAction, DeceptionActionType
 
 class MockPlan:
@@ -58,3 +62,34 @@ def test_safety_gate_honors_plan_approval_flag():
     assert allowed
     assert decision.requires_human_approval is True
     assert gate.budget_spent == 0
+
+
+def test_safety_filter_never_auto_executes_pending_approval():
+    gate = create_safety_gate("results")
+    action = DeceptionAction(
+        action_type=DeceptionActionType.SCATTER_HONEY_CREDENTIAL,
+        target_node=5,
+        risk_score=0.05,
+    )
+    plan = MockPlan(action, 5, "NormalNode", 0.2, 0.9)
+    plan.required_approval = True
+
+    executable, message = make_safety_filter(gate)(plan)
+
+    assert executable is False
+    assert "approval" in message.lower()
+
+
+def test_fail_safe_rejection_is_audited():
+    gate = create_safety_gate("results")
+    gate.enter_fail_safe("test")
+    action = DeceptionAction(
+        action_type=DeceptionActionType.SCATTER_HONEY_CREDENTIAL,
+        target_node=5,
+        risk_score=0.05,
+    )
+    plan = MockPlan(action, 5, "NormalNode", 0.2, 0.9)
+
+    gate.check_action_plan(plan)
+
+    assert gate.audit_entries[-1].decision == "BLOCKED"

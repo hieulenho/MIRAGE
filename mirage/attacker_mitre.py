@@ -159,7 +159,10 @@ class MITREEvasionAttacker(DeceptionAwareAttacker):
                 self.active_techniques[tid] = MITRE_TECHNIQUES[tid]
             else:
                 import warnings
-                warnings.warn(f"Unknown MITRE technique '{tid}', skipping.")
+                warnings.warn(
+                    f"Unknown MITRE technique '{tid}', skipping.",
+                    stacklevel=2,
+                )
 
         # Compute effective thresholds from cumulative evasion effects
         susp_delta = sum(t.suspicion_threshold_delta for t in self.active_techniques.values())
@@ -266,6 +269,7 @@ def run_mitre_simulation(
     reward_interventions=None,
     seed: int = 42,
     max_steps: int = 30,
+    start_distribution: Optional[Dict[int, float]] = None,
 ) -> Dict:
     """
     Run a simulation with MITREEvasionAttacker and return results.
@@ -273,6 +277,10 @@ def run_mitre_simulation(
     Signature matches run_simulation() in attacker_agents.py for
     drop-in compatibility.
     """
+    if n_episodes < 1:
+        raise ValueError("n_episodes must be at least 1")
+    if max_steps < 1:
+        raise ValueError("max_steps must be at least 1")
     attacker = create_mitre_attacker(graph, seed=seed, techniques=techniques)
     hits_true_goal = 0
     hits_decoy = 0
@@ -283,6 +291,7 @@ def run_mitre_simulation(
         hit_true, hit_decoy, steps = attacker.run_episode(
             max_steps=max_steps,
             reward_interventions=reward_interventions,
+            start_distribution=start_distribution,
         )
         if hit_true:
             hits_true_goal += 1

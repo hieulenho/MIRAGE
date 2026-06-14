@@ -44,7 +44,7 @@ class BaseAttacker(ABC):
     def __init__(self, graph, seed: int = 42):
         self.graph = graph
         self.rng = random.Random(seed)
-        self.current_state: int = list(graph.start_distribution.keys())[0]
+        self.current_state: int = self._sample_start_state(graph.start_distribution)
         self.trajectory: List[AttackerStep] = []
         self.total_reward: float = 0.0
         self.steps_taken: int = 0
@@ -56,7 +56,40 @@ class BaseAttacker(ABC):
     @abstractmethod
     def choose_action(self, state: int, reward_interventions: Dict[Tuple[int, str], float] = None) -> str:
         """Chọn action tại state hiện tại."""
-        pass
+        raise NotImplementedError
+
+    def _sample_start_state(
+        self,
+        distribution: Optional[Dict[int, float]],
+    ) -> int:
+        """Validate, normalize, and sample a non-terminal graph state."""
+        source = distribution or self.graph.start_distribution
+        valid_states = set(self.graph.states)
+        sink = self.graph.sink_state
+        filtered: Dict[int, float] = {}
+        for raw_state, raw_probability in source.items():
+            state = int(raw_state)
+            probability = float(raw_probability)
+            if state not in valid_states:
+                raise ValueError(
+                    f"Start distribution references unknown state {state}"
+                )
+            if not math.isfinite(probability) or probability < 0:
+                raise ValueError(
+                    "Start distribution probabilities must be finite and non-negative"
+                )
+            if state != sink and probability > 0:
+                filtered[state] = filtered.get(state, 0.0) + probability
+
+        total = sum(filtered.values())
+        if total <= 0:
+            raise ValueError(
+                "Start distribution must assign positive probability to a "
+                "non-sink state"
+            )
+        states = list(filtered)
+        weights = [filtered[state] / total for state in states]
+        return self.rng.choices(states, weights=weights, k=1)[0]
 
     def get_effective_reward(
         self,
@@ -74,7 +107,13 @@ class BaseAttacker(ABC):
     def step(self, reward_interventions: Dict[Tuple[int, str], float] = None) -> AttackerStep:
         """Thực hiện một bước tấn công."""
         state = self.current_state
+        if state not in self.graph.available_actions:
+            raise ValueError(f"Attacker is at unknown graph state {state}")
         action = self.choose_action(state, reward_interventions)
+        if action not in self.graph.transitions.get(state, {}):
+            raise ValueError(
+                f"Attacker selected unavailable action {action!r} at state {state}"
+            )
 
         # Sample next state
         trans = self.graph.transitions[state][action]
@@ -114,6 +153,8 @@ class BaseAttacker(ABC):
         Returns:
             (hit_true_goal, hit_decoy, steps)
         """
+        if max_steps < 1:
+            raise ValueError("max_steps must be at least 1")
         self.reset(start_distribution=start_distribution)
         for _ in range(max_steps):
             step = self.step(reward_interventions)
@@ -133,21 +174,7 @@ class BaseAttacker(ABC):
                                  (tức là belief state từ Layer 1/2).
                                  Nếu None, dùng graph.start_distribution (entry point mặc định).
         """
-        if start_distribution:
-            # Lọc bỏ sink state và normalize
-            sink = self.graph.sink_state
-            filtered = {s: p for s, p in start_distribution.items()
-                        if s != sink and p > 0.0}
-            if filtered:
-                total = sum(filtered.values())
-                states_list = list(filtered.keys())
-                weights = [filtered[s] / total for s in states_list]
-                self.current_state = self.rng.choices(states_list, weights=weights, k=1)[0]
-            else:
-                # Fallback nếu tất cả bị lọc
-                self.current_state = list(self.graph.start_distribution.keys())[0]
-        else:
-            self.current_state = list(self.graph.start_distribution.keys())[0]
+        self.current_state = self._sample_start_state(start_distribution)
         self.trajectory = []
         self.total_reward = 0.0
         self.steps_taken = 0
@@ -476,7 +503,13 @@ class DeceptionAwareAttacker(BaseAttacker):
     """
 
     # Từ khóa trong label gây nghi ngờ (attacker đọc network banner)
-    SUSPICIOUS_LABEL_KEYWORDS = ["fake", "backup", "gateway", "decoy", "honey"]
+    SUSPICIOUS_LABEL_KEYWORDS = (
+        "fake",
+        "backup",
+        "gateway",
+        "decoy",
+        "honey",
+    )
 
     def __init__(
         self,
@@ -609,7 +642,7 @@ class DeceptionAwareAttacker(BaseAttacker):
 
         # Lọc: nếu action nguy hiểm (danger > threshold) → giảm điểm mạnh
         action_scores = []
-        for action, val, danger in action_evals:
+        for _action, val, danger in action_evals:
             if danger > self.suspicion_threshold:
                 # Né mạnh: score âm, tỷ lệ thuận với mức nghi ngờ
                 score = -danger * 2.0
@@ -625,7 +658,7 @@ class DeceptionAwareAttacker(BaseAttacker):
         chosen = self.rng.choices(actions, weights=weights, k=1)[0]
 
         # Cập nhật suspicion cho các node bị né (reinforcement của prior)
-        for i, (action, val, danger) in enumerate(action_evals):
+        for i, (action, _val, _danger) in enumerate(action_evals):
             if action_scores[i] < 0:
                 trans = self.graph.transitions[state][action]
                 for ns in trans:
@@ -678,13 +711,17 @@ def run_simulation(
     Returns:
         Dict với các metrics: hit_rate, interception_rate, avg_steps, etc.
     """
+    if n_episodes < 1:
+        raise ValueError("n_episodes must be at least 1")
+    if max_steps < 1:
+        raise ValueError("max_steps must be at least 1")
     attacker = create_attacker(attacker_type, graph, seed=seed)
     hits_true_goal = 0
     hits_decoy = 0
     total_steps = 0
     total_reward = 0.0
 
-    for ep in range(n_episodes):
+    for _ in range(n_episodes):
         hit_true, hit_decoy, steps = attacker.run_episode(
             max_steps=max_steps,
             reward_interventions=reward_interventions,

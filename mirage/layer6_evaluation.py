@@ -74,33 +74,24 @@ class MIRAGEEvaluator:
     Tự động chạy benchmark, tính metrics, vẽ biểu đồ và xuất bảng so sánh.
     """
 
-    METHODS = [
+    METHODS = (
         "no_defense",
         "random_deception",
         "static_honeypot",
         "greedy_top_k",
         "standard_rl",
         "robust_mirage",
-    ]
+    )
 
     # Six attacker profiles, including deception-aware and MITRE evasion.
-    ATTACKER_TYPES = [
+    ATTACKER_TYPES = (
         "random",
         "greedy",
         "shortest_path",
         "stealthy",
         "deception_aware",
         "mitre_evasion",
-    ]
-
-    # Belief state cố định cho Benchmark B (mid-network intrusion scenario)
-    BENCHMARK_B_BELIEF = {
-        4: 0.35,   # WS_Finance — most likely (lateral movement hướng vào finance)
-        6: 0.25,   # SMB_FileShare
-        9: 0.20,   # ServiceAcct_Credential
-        8: 0.10,   # Admin_Credential
-        3: 0.10,   # WS_Engineering
-    }
+    )
 
     def __init__(
         self,
@@ -111,12 +102,73 @@ class MIRAGEEvaluator:
         results_dir: str = "results",
     ):
         self.graph = graph
-        self.n_episodes = n_episodes
-        self.max_steps = max_steps
+        self.n_episodes = int(n_episodes)
+        self.max_steps = int(max_steps)
         self.seed = seed
         self.results_dir = results_dir
+        if self.n_episodes < 1:
+            raise ValueError("n_episodes must be at least 1")
+        if self.max_steps < 1:
+            raise ValueError("max_steps must be at least 1")
         os.makedirs(results_dir, exist_ok=True)
         self.results: Dict[str, MethodResult] = {}
+
+    def benchmark_b_belief(self) -> Dict[int, float]:
+        """Build a topology-aware mid-network incident belief."""
+        candidates = []
+        preferred_layers = {
+            "internal": 3,
+            "services": 2,
+            "credentials": 1,
+        }
+        for node in self.graph.states:
+            if (
+                node == self.graph.sink_state
+                or node in self.graph.true_goals
+                or node in self.graph.decoy_sites
+            ):
+                continue
+            metadata = self.graph.node_metadata.get(node, {}) or {}
+            layer = metadata.get("layer")
+            if layer not in preferred_layers:
+                continue
+            value = float(metadata.get("value", 0.0) or 0.0)
+            criticality = float(
+                metadata.get("business_criticality", value) or 0.0
+            )
+            candidates.append(
+                (
+                    preferred_layers[layer],
+                    max(value, criticality),
+                    -node,
+                    node,
+                )
+            )
+
+        candidates.sort(reverse=True)
+        nodes = [item[-1] for item in candidates[:5]]
+        if not nodes:
+            nodes = [
+                node
+                for node in self.graph.states
+                if (
+                    node != self.graph.sink_state
+                    and node not in self.graph.true_goals
+                    and node not in self.graph.decoy_sites
+                )
+            ][:5]
+        if not nodes:
+            raise ValueError(
+                "Benchmark B requires at least one non-terminal real node"
+            )
+
+        template = [0.35, 0.25, 0.20, 0.10, 0.10]
+        weights = template[:len(nodes)]
+        total = sum(weights)
+        return {
+            node: weight / total
+            for node, weight in zip(nodes, weights, strict=True)
+        }
 
     def _build_clean_graph_no_defense(self):
         """
@@ -155,10 +207,22 @@ class MIRAGEEvaluator:
         for action in fabric.action_catalog:
             if action.action_type.value == action_type and action.target_node == target_node:
                 return action
-        for action in fabric.action_catalog:
-            if action.target_node == target_node:
-                return action
         return None
+
+    def _fit_actions_to_budget(self, actions: List, limit: int = 2) -> List:
+        """Select actions in order without exceeding the graph budget."""
+        from mirage.mdp_solver import compute_composite_cost
+
+        selected = []
+        spent = 0.0
+        for action in actions:
+            cost = compute_composite_cost(action, self.graph).total
+            if spent + cost <= self.graph.budget + 1e-9:
+                selected.append(action)
+                spent += cost
+            if len(selected) >= limit:
+                break
+        return selected
 
     def _effects_for_actions(self, actions: List) -> Tuple[Dict, List[Tuple[int, int, float]]]:
         from mirage.layer3_deception import DeceptionActionType
@@ -202,42 +266,50 @@ class MIRAGEEvaluator:
                                  giúp so sánh standard_rl vs robust_mirage công bằng
                                  vì cả hai đều optimize dưới cùng belief.
         """
-        from mirage.layer2_attack_graph import DB_FAKE, RTR_FAKE, WS_FIN, SMB_SHARE, SVC_CRED
+        from mirage.layer3_deception import DeceptionFabric
+        from mirage.mdp_solver import rank_action_candidates
+
         rng = random.Random(self.seed)
+        fabric = DeceptionFabric(self.graph)
+        catalog = fabric.get_available_actions(self.graph.budget)
 
         if method == "no_defense":
             return {}, [], self._empty_cost_model(), []
 
         elif method == "random_deception":
-            # Đặt decoy ngẫu nhiên
-            possible_nodes = [DB_FAKE, RTR_FAKE, WS_FIN, SMB_SHARE, SVC_CRED]
-            chosen = rng.choice(possible_nodes)
-            action = (
-                self._catalog_action("deploy_decoy_database", chosen)
-                or self._catalog_action("scatter_honey_credential", chosen)
-                or self._catalog_action("deploy_decoy_router", chosen)
-            )
-            actions = [action] if action else []
+            candidates = [
+                action
+                for action in catalog
+                if action.action_type.value in {
+                    "deploy_decoy_database",
+                    "deploy_decoy_router",
+                    "scatter_honey_credential",
+                }
+            ]
+            actions = [rng.choice(candidates)] if candidates else []
             rewards, edge_edits = self._effects_for_actions(actions)
             return rewards, edge_edits, self._cost_model_for_actions(actions), actions
 
         elif method == "static_honeypot":
-            actions = [
-                a for a in [
-                    self._catalog_action("deploy_decoy_database", DB_FAKE),
-                    self._catalog_action("deploy_decoy_router", RTR_FAKE),
-                ] if a
+            candidates = [
+                action
+                for action in catalog
+                if action.action_type.value in {
+                    "deploy_decoy_database",
+                    "deploy_decoy_router",
+                }
             ]
+            actions = self._fit_actions_to_budget(candidates)
             rewards, edge_edits = self._effects_for_actions(actions)
             return rewards, edge_edits, self._cost_model_for_actions(actions), actions
 
         elif method == "greedy_top_k":
-            actions = [
-                a for a in [
-                    self._catalog_action("deploy_decoy_database", DB_FAKE),
-                    self._catalog_action("scatter_honey_credential", SVC_CRED),
-                ] if a
-            ]
+            ranked = rank_action_candidates(
+                catalog,
+                self.graph,
+                belief_state=start_distribution,
+            )
+            actions = self._fit_actions_to_budget(ranked)
             rewards, edge_edits = self._effects_for_actions(actions)
             return rewards, edge_edits, self._cost_model_for_actions(actions), actions
 
@@ -473,7 +545,7 @@ class MIRAGEEvaluator:
         self.results = {}  # Reset
         return self.run_full_benchmark(
             verbose=verbose,
-            start_distribution=self.BENCHMARK_B_BELIEF,
+            start_distribution=self.benchmark_b_belief(),
             benchmark_label="B",
         )
 
@@ -691,6 +763,9 @@ class MIRAGEEvaluator:
 
     def plot_results(self, save: bool = True) -> None:
         """Vẽ biểu đồ so sánh."""
+        matplotlib_cache = os.path.join(self.results_dir, ".matplotlib")
+        os.makedirs(matplotlib_cache, exist_ok=True)
+        os.environ.setdefault("MPLCONFIGDIR", matplotlib_cache)
         try:
             import matplotlib
             matplotlib.use("Agg")
@@ -716,7 +791,7 @@ class MIRAGEEvaluator:
         }
 
         fig, axes = plt.subplots(2, 3, figsize=(18, 11))
-        fig.suptitle("MIRAGE v1 Research Simulator — Benchmark Results",
+        fig.suptitle("MIRAGE v2 Production-Oriented Platform — Benchmark Results",
                      fontsize=16, fontweight="bold", y=0.98)
         fig.patch.set_facecolor("#1a1a2e")
         for ax in axes.flat:
@@ -1030,7 +1105,7 @@ class MIRAGEEvaluator:
         from mirage.layer3_deception import DeceptionFabric
         from mirage.layer4_decision_engine import RobustDecisionEngine
 
-        belief = dict(self.BENCHMARK_B_BELIEF)
+        belief = self.benchmark_b_belief()
         optimization_episodes = max(30, self.n_episodes // 5)
         evaluation_episodes = max(40, self.n_episodes // 4)
         all_types = list(self.ATTACKER_TYPES)

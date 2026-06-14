@@ -29,8 +29,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
+import logging
+import math
 import os
+import secrets
 import sys
 import threading
 import time
@@ -53,7 +57,7 @@ try:
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse, FileResponse
     from fastapi.staticfiles import StaticFiles
-    from pydantic import BaseModel, Field
+    from pydantic import BaseModel, Field, ValidationError
     HAS_FASTAPI = True
 except ImportError:
     HAS_FASTAPI = False
@@ -64,6 +68,9 @@ from mirage.layer2_attack_graph import MIRAGEAttackGraph, build_configured_attac
 from mirage.layer3_deception import DeceptionFabric
 from mirage.layer5_safe_control import create_safety_gate
 from mirage.config import load_config, resolve_project_path
+from mirage import __version__
+
+LOGGER = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -73,13 +80,16 @@ from mirage.config import load_config, resolve_project_path
 if HAS_FASTAPI:
     class TelemetryEventPayload(BaseModel):
         """Telemetry event from SIEM."""
-        timestamp: Optional[float] = None
-        source_host: str
-        dest_host: str
-        event_type: str
-        protocol: Optional[str] = None
-        port: Optional[int] = None
-        username: Optional[str] = None
+        timestamp: Optional[float] = Field(
+            default=None,
+            allow_inf_nan=False,
+        )
+        source_host: str = Field(min_length=1, max_length=255)
+        dest_host: str = Field(min_length=1, max_length=255)
+        event_type: str = Field(min_length=1, max_length=100)
+        protocol: Optional[str] = Field(default=None, max_length=32)
+        port: Optional[int] = Field(default=None, ge=0, le=65535)
+        username: Optional[str] = Field(default=None, max_length=255)
         success: bool = True
         extra: Dict[str, Any] = Field(default_factory=dict)
 
@@ -90,9 +100,9 @@ if HAS_FASTAPI:
     class DecisionRequest(BaseModel):
         """Manual decision trigger."""
         belief_override: Optional[Dict[str, float]] = None
-        budget_remaining: Optional[float] = None
-        attacker_stage: Optional[str] = None
-        backend: Optional[str] = None
+        budget_remaining: Optional[float] = Field(default=None, ge=0)
+        attacker_stage: Optional[str] = Field(default=None, max_length=100)
+        backend: Optional[str] = Field(default=None, max_length=20)
         deploy: Optional[bool] = None
 
     class ApprovalRequest(BaseModel):
@@ -103,16 +113,45 @@ def _parse_timestamp(value: Any) -> float:
     if value is None:
         return time.time()
     if isinstance(value, (int, float)):
-        return float(value)
+        timestamp = float(value)
+        return timestamp if math.isfinite(timestamp) else time.time()
     text = str(value).strip()
     try:
-        return float(text)
+        timestamp = float(text)
+        return timestamp if math.isfinite(timestamp) else time.time()
     except ValueError:
         pass
     try:
         return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return time.time()
+
+
+def _parse_port(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid destination port: {value!r}") from exc
+    if not 0 <= port <= 65535:
+        raise ValueError(f"Destination port out of range: {port}")
+    return port
+
+
+def _parse_success(value: Any, fallback_text: str = "") -> bool:
+    if value is None:
+        return "failed" not in fallback_text.lower()
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "success", "succeeded", "ok"}:
+        return True
+    if text in {"false", "0", "no", "failure", "failed", "error"}:
+        return False
+    return bool(text)
 
 
 def _event_type_from_raw(raw: Dict[str, Any]) -> str:
@@ -197,6 +236,8 @@ def normalize_siem_payload(payload: Dict[str, Any], source: str) -> Dict[str, An
             outcome = str(event_obj.get("outcome", "")).lower()
         text = json.dumps(raw, ensure_ascii=False).lower()
         success = outcome not in {"failure", "failed"} and "failed" not in text
+    else:
+        success = _parse_success(success)
 
     timestamp = (
         raw.get("timestamp")
@@ -209,9 +250,9 @@ def normalize_siem_payload(payload: Dict[str, Any], source: str) -> Dict[str, An
         "dest_host": str(dest_host),
         "event_type": _event_type_from_raw(raw),
         "protocol": raw.get("protocol") or data.get("protocol"),
-        "port": int(port) if port not in (None, "") else None,
+        "port": _parse_port(port),
         "username": raw.get("username") or user.get("name") or data.get("srcuser"),
-        "success": bool(success),
+        "success": success,
         "extra": {
             "siem_source": source,
             "raw_id": raw.get("id") or wrapper.get("event_id"),
@@ -241,21 +282,38 @@ class MIRAGEStateManager:
               f"goals={self.graph.true_goals}, decoys={self.graph.decoy_sites}")
 
         # Layer 1: Telemetry classifiers
-        hmm_weight = float(self.config.get("layer1", {}).get("hmm_weight", 0.6))
-        self.ensemble_classifier = EnsembleTelemetryClassifier(hmm_weight=hmm_weight)
+        layer1_config = self.config.get("layer1", {})
+        hmm_weight = float(layer1_config.get("hmm_weight", 0.6))
+        self.ensemble_classifier = EnsembleTelemetryClassifier(
+            hmm_weight=hmm_weight,
+            event_history_limit=int(
+                layer1_config.get("event_history_limit", 1000)
+            ),
+            max_tracked_hosts=int(
+                layer1_config.get("max_tracked_hosts", 10000)
+            ),
+        )
 
         # Layers 3 and 5
-        self.fabric = DeceptionFabric(self.graph)
+        self.fabric = DeceptionFabric(self.graph, verbose=False)
         self.safety_gate = create_safety_gate(
             "results",
             budget_limit=float(
                 self.config.get("general", {}).get("budget_limit", 6.0)
             ),
+            verbose=False,
         )
 
         # Decision history
         self.decision_history: List[Dict] = []
         self.pending_decisions: Dict[str, Any] = {}
+        api_config = self.config.get("api", {})
+        self.decision_history_limit = int(
+            api_config.get("decision_history_limit", 1000)
+        )
+        self.pending_decision_limit = int(
+            api_config.get("pending_decision_limit", 100)
+        )
         self._rl_bridge = None
 
         # Metrics
@@ -264,6 +322,7 @@ class MIRAGEStateManager:
 
         # WebSocket connections
         self.ws_connections: List[WebSocket] = []
+        self._ws_broadcast_lock = asyncio.Lock()
 
         print("[MIRAGE API] Engine ready.")
 
@@ -334,68 +393,129 @@ class MIRAGEStateManager:
 
     def get_graph_json(self) -> Dict:
         """Serialize graph topology for frontend visualization."""
-        active_nodes = {
-            deployment.action.target_node
-            for deployment in self.fabric.active_decoys.values()
-        }
-        nodes = []
-        for s in self.graph.states:
-            meta = self.graph.node_metadata.get(s, {})
-            belief = self.graph.belief_state.get(s, 0.0)
-            nodes.append({
-                "id": s,
-                "label": self.graph.label(s),
-                "layer": meta.get("layer", "unknown"),
-                "asset_type": meta.get("asset_type", "workstation"),
-                "is_real": meta.get("is_real", True),
-                "value": meta.get("value", 0.0),
-                "belief": round(belief, 4),
-                "is_goal": s in self.graph.true_goals,
-                "is_decoy": s in self.graph.active_decoy_sites,
-                "is_decoy_slot": s in self.graph.decoy_sites,
-                "has_active_defense": s in active_nodes,
-                "is_sink": s == self.graph.sink_state,
-            })
+        with self._lock:
+            active_nodes = {
+                deployment.action.target_node
+                for deployment in self.fabric.active_decoys.values()
+            }
+            nodes = []
+            for s in self.graph.states:
+                meta = self.graph.node_metadata.get(s, {})
+                belief = self.graph.belief_state.get(s, 0.0)
+                nodes.append({
+                    "id": s,
+                    "label": self.graph.label(s),
+                    "layer": meta.get("layer", "unknown"),
+                    "asset_type": meta.get("asset_type", "workstation"),
+                    "is_real": meta.get("is_real", True),
+                    "value": meta.get("value", 0.0),
+                    "belief": round(belief, 4),
+                    "is_goal": s in self.graph.true_goals,
+                    "is_decoy": s in self.graph.active_decoy_sites,
+                    "is_decoy_slot": s in self.graph.decoy_sites,
+                    "has_active_defense": s in active_nodes,
+                    "is_sink": s == self.graph.sink_state,
+                })
 
-        edges = []
-        seen = set()
-        for src in self.graph.states:
-            for action, dist in self.graph.transitions.get(src, {}).items():
-                if action in ("end", "noop"):
-                    continue
-                for dst, prob in dist.items():
-                    key = (src, dst, action)
-                    if key not in seen and prob > 0.01:
-                        seen.add(key)
-                        edges.append({
-                            "source": src,
-                            "target": dst,
-                            "action": action,
-                            "probability": round(prob, 3),
-                        })
+            edges = []
+            seen = set()
+            for src in self.graph.states:
+                for action, dist in self.graph.transitions.get(src, {}).items():
+                    if action in ("end", "noop"):
+                        continue
+                    for dst, prob in dist.items():
+                        key = (src, dst, action)
+                        if key not in seen and prob > 0.01:
+                            seen.add(key)
+                            edges.append({
+                                "source": src,
+                                "target": dst,
+                                "action": action,
+                                "probability": round(prob, 3),
+                            })
 
-        return {
-            "nodes": nodes,
-            "edges": edges,
-            "active_defenses": self.get_active_decoys(),
-        }
+            return {
+                "nodes": nodes,
+                "edges": edges,
+                "active_defenses": self.get_active_decoys(),
+            }
 
     def get_active_decoys(self) -> List[Dict]:
         """Serialize deployed deception actions for API/dashboard clients."""
-        deployments = []
-        for decoy_id, deployment in self.fabric.active_decoys.items():
-            action = deployment.action
-            deployments.append({
-                "decoy_id": decoy_id,
-                "action_type": action.action_type.value,
-                "target_node": action.target_node,
-                "target_label": self.graph.label(action.target_node),
-                "status": deployment.status.value,
-                "deployed_at": deployment.deployed_at,
-                "engagement_count": deployment.engagement_count,
-                "cost": action.cost,
-            })
-        return sorted(deployments, key=lambda item: item["deployed_at"], reverse=True)
+        with self._lock:
+            deployments = []
+            for decoy_id, deployment in self.fabric.active_decoys.items():
+                action = deployment.action
+                deployments.append({
+                    "decoy_id": decoy_id,
+                    "action_type": action.action_type.value,
+                    "target_node": action.target_node,
+                    "target_label": self.graph.label(action.target_node),
+                    "status": deployment.status.value,
+                    "deployed_at": deployment.deployed_at,
+                    "engagement_count": deployment.engagement_count,
+                    "cost": action.cost,
+                })
+            return sorted(
+                deployments,
+                key=lambda item: item["deployed_at"],
+                reverse=True,
+            )
+
+    def _normalize_belief_override(
+        self,
+        belief_override: Optional[Dict[str, float]],
+    ) -> Dict[int, float]:
+        source = (
+            belief_override
+            if belief_override is not None
+            else self.graph.belief_state
+        )
+        valid_states = set(self.graph.states)
+        belief: Dict[int, float] = {}
+        for raw_state, raw_probability in source.items():
+            try:
+                state = int(raw_state)
+                probability = float(raw_probability)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid belief entry {raw_state!r}: {raw_probability!r}"
+                ) from exc
+            if state not in valid_states:
+                raise ValueError(f"Belief references unknown state {state}")
+            if state == self.graph.sink_state:
+                continue
+            if not math.isfinite(probability) or probability < 0:
+                raise ValueError(
+                    "Belief probabilities must be finite and non-negative"
+                )
+            if probability > 0:
+                belief[state] = belief.get(state, 0.0) + probability
+        total = sum(belief.values())
+        if total <= 0:
+            raise ValueError(
+                "Belief must assign positive probability to a non-sink state"
+            )
+        return {
+            state: probability / total
+            for state, probability in belief.items()
+        }
+
+    def _append_decision(self, record: Dict) -> None:
+        """Bound history without evicting records awaiting approval."""
+        self.decision_history.append(record)
+        while len(self.decision_history) > self.decision_history_limit:
+            removable_index = next(
+                (
+                    index
+                    for index, item in enumerate(self.decision_history)
+                    if item.get("decision_id") not in self.pending_decisions
+                ),
+                None,
+            )
+            if removable_index is None:
+                break
+            self.decision_history.pop(removable_index)
 
     def run_decision(self, request) -> Dict:
         """Run a configured decision backend, safety-check, and optionally deploy."""
@@ -406,19 +526,21 @@ class MIRAGEStateManager:
         if backend not in {"robust", "rl"}:
             raise ValueError("backend must be 'robust' or 'rl'")
 
-        belief = (
-            {int(key): float(value) for key, value in request.belief_override.items()}
-            if request.belief_override
-            else dict(self.graph.belief_state)
+        belief = self._normalize_belief_override(request.belief_override)
+        available_budget = max(
+            0.0,
+            self.safety_gate.budget_limit - self.safety_gate.budget_spent,
         )
-        budget_remaining = float(
+        requested_budget = float(
             request.budget_remaining
             if request.budget_remaining is not None
-            else max(
-                0.0,
-                self.safety_gate.budget_limit - self.safety_gate.budget_spent,
-            )
+            else available_budget
         )
+        if not math.isfinite(requested_budget) or requested_budget < 0:
+            raise ValueError(
+                "budget_remaining must be finite and non-negative"
+            )
+        budget_remaining = min(requested_budget, available_budget)
         deploy_requested = (
             request.deploy
             if request.deploy is not None
@@ -459,6 +581,7 @@ class MIRAGEStateManager:
                     self.fabric,
                     n_attacker_samples=int(api_config.get("decision_samples", 60)),
                     use_robust_milp=False,
+                    verbose=False,
                 )
                 plan = engine.decide(
                     belief_state=belief,
@@ -477,7 +600,7 @@ class MIRAGEStateManager:
                     "deployed": False,
                     "reasoning": "Decision backend recommends no action.",
                 }
-                self.decision_history.append(record)
+                self._append_decision(record)
                 return record
 
             allowed, safety = self.safety_gate.check_action_plan(
@@ -492,6 +615,11 @@ class MIRAGEStateManager:
             elif safety.requires_human_approval:
                 status = "pending_approval" if deploy_requested else "approval_required"
                 if deploy_requested:
+                    if len(self.pending_decisions) >= self.pending_decision_limit:
+                        raise ValueError(
+                            "Pending decision limit reached; resolve existing "
+                            "approvals before creating another."
+                        )
                     self.pending_decisions[decision_id] = plan
             elif deploy_requested:
                 for action in plan.portfolio or [plan.action]:
@@ -515,7 +643,7 @@ class MIRAGEStateManager:
                     "warning": safety.warning_message,
                 },
             }
-            self.decision_history.append(record)
+            self._append_decision(record)
             return record
 
     def approve_decision(self, decision_id: str, approved_by: str) -> Dict:
@@ -572,36 +700,45 @@ class MIRAGEStateManager:
 
     def get_status(self) -> Dict:
         """System status summary."""
-        uptime = time.time() - self.start_time
-        return {
-            "status": "running",
-            "uptime_seconds": round(uptime, 1),
-            "total_events_processed": self.total_events_processed,
-            "tracked_hosts": len(self.ensemble_classifier.hmm_clf.get_all_beliefs()),
-            "graph_nodes": len(self.graph.states),
-            "active_decoys": len(self.fabric.active_decoys),
-            "decisions_made": len(self.decision_history),
-            "pending_approvals": len(self.pending_decisions),
-            "ws_connections": len(self.ws_connections),
-            "decision_backend": self.config.get("api", {}).get(
-                "decision_backend", "robust"
-            ),
-            "budget_spent": round(self.safety_gate.budget_spent, 3),
-            "budget_limit": self.safety_gate.budget_limit,
-            "timestamp": datetime.now().isoformat(),
-        }
+        with self._lock:
+            uptime = time.time() - self.start_time
+            return {
+                "status": "running",
+                "uptime_seconds": round(uptime, 1),
+                "total_events_processed": self.total_events_processed,
+                "tracked_hosts": len(
+                    self.ensemble_classifier.hmm_clf.get_all_beliefs()
+                ),
+                "graph_nodes": len(self.graph.states),
+                "active_decoys": len(self.fabric.active_decoys),
+                "decisions_made": len(self.decision_history),
+                "pending_approvals": len(self.pending_decisions),
+                "ws_connections": len(self.ws_connections),
+                "decision_backend": self.config.get("api", {}).get(
+                    "decision_backend", "robust"
+                ),
+                "budget_spent": round(self.safety_gate.budget_spent, 3),
+                "budget_limit": self.safety_gate.budget_limit,
+                "timestamp": datetime.now().isoformat(),
+            }
 
     async def broadcast_ws(self, message: Dict):
         """Broadcast a message to all connected WebSocket clients."""
-        dead = []
         text = json.dumps(message)
-        for ws in self.ws_connections:
-            try:
-                await ws.send_text(text)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.ws_connections.remove(ws)
+        async with self._ws_broadcast_lock:
+            connections = list(self.ws_connections)
+            results = await asyncio.gather(
+                *(ws.send_text(text) for ws in connections),
+                return_exceptions=True,
+            )
+            dead = [
+                ws
+                for ws, result in zip(connections, results, strict=True)
+                if isinstance(result, Exception)
+            ]
+            for ws in dead:
+                if ws in self.ws_connections:
+                    self.ws_connections.remove(ws)
 
 
 # ============================================================
@@ -624,7 +761,7 @@ def create_app() -> Any:
             "Multi-stage Intelligent Robust Adaptive Graph-based Engagement — "
             "Real-time log ingestion and deception orchestration API."
         ),
-        version="3.0.0",
+        version=__version__,
     )
 
     # CORS — allow dashboard frontend
@@ -638,19 +775,53 @@ def create_app() -> Any:
 
     api_key_env = str(api_config.get("api_key_env", "MIRAGE_API_KEY"))
     configured_api_key = os.environ.get(api_key_env)
+    max_request_bytes = int(api_config.get("max_request_bytes", 2097152))
 
     @app.middleware("http")
     async def api_key_guard(request: Request, call_next):
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                declared_size = int(content_length)
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": "Invalid Content-Length header."},
+                )
+            if declared_size > max_request_bytes:
+                return JSONResponse(
+                    status_code=413,
+                    content={
+                        "detail": (
+                            "Request body exceeds "
+                            f"max_request_bytes={max_request_bytes}."
+                        )
+                    },
+                )
+        supplied_key = request.headers.get("X-API-Key", "")
         if (
             configured_api_key
             and request.url.path.startswith("/api/")
-            and request.headers.get("X-API-Key") != configured_api_key
+            and not secrets.compare_digest(supplied_key, configured_api_key)
         ):
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Missing or invalid X-API-Key."},
             )
-        return await call_next(request)
+        response = await call_next(request)
+        if request.url.path == "/dashboard":
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; "
+                "script-src 'self'; "
+                "style-src 'self' 'unsafe-inline'; "
+                "connect-src 'self' ws: wss:; "
+                "img-src 'self' data:; "
+                "font-src 'self'; "
+                "base-uri 'none'; frame-ancestors 'none'"
+            )
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["Referrer-Policy"] = "no-referrer"
+        return response
 
     # Serve dashboard static files
     dashboard_dir = os.path.join(os.path.dirname(__file__), "dashboard")
@@ -669,6 +840,7 @@ def create_app() -> Any:
     # Initialize MIRAGE state
     state = MIRAGEStateManager()
     app.state.mirage_state = state
+    decision_lock = asyncio.Lock()
 
     # ---- REST Endpoints ----
 
@@ -676,7 +848,7 @@ def create_app() -> Any:
     async def root():
         return {
             "name": "MIRAGE API",
-            "version": "3.0.0",
+            "version": __version__,
             "docs": "/docs",
             "endpoints": [
                 "POST /api/telemetry",
@@ -765,8 +937,14 @@ def create_app() -> Any:
         for raw in raw_events:
             if not isinstance(raw, dict):
                 raise HTTPException(status_code=422, detail="Each SIEM event must be an object.")
-            normalized = normalize_siem_payload(raw, source)
-            event_payload = TelemetryEventPayload.model_validate(normalized)
+            try:
+                normalized = normalize_siem_payload(raw, source)
+                event_payload = TelemetryEventPayload.model_validate(normalized)
+            except (TypeError, ValueError, ValidationError) as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Invalid {source} event: {exc}",
+                ) from exc
             results.append(state.process_event(event_payload))
 
         await state.broadcast_ws({
@@ -812,10 +990,13 @@ def create_app() -> Any:
     @app.get("/api/decisions")
     async def get_decisions():
         """Get recent decision history."""
-        return {
-            "decisions": state.decision_history[-50:],
-            "total": len(state.decision_history),
-        }
+        with state._lock:
+            return {
+                "decisions": [
+                    dict(item) for item in state.decision_history[-50:]
+                ],
+                "total": len(state.decision_history),
+            }
 
     @app.post("/api/decide")
     async def trigger_decision(request: DecisionRequest):
@@ -825,7 +1006,11 @@ def create_app() -> Any:
         Returns an ActionPlan recommendation.
         """
         try:
-            decision_record = await asyncio.to_thread(state.run_decision, request)
+            async with decision_lock:
+                decision_record = await asyncio.to_thread(
+                    state.run_decision,
+                    request,
+                )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except ValueError as exc:
@@ -882,7 +1067,43 @@ def create_app() -> Any:
           - Belief states change significantly
           - Decisions are made by the engine
         """
-        await websocket.accept()
+        offered_protocols = [
+            value.strip()
+            for value in websocket.headers.get(
+                "sec-websocket-protocol",
+                "",
+            ).split(",")
+            if value.strip()
+        ]
+        protocol_key = None
+        for protocol in offered_protocols:
+            if not protocol.startswith("mirage-key."):
+                continue
+            encoded = protocol.removeprefix("mirage-key.")
+            try:
+                padding = "=" * (-len(encoded) % 4)
+                protocol_key = base64.urlsafe_b64decode(
+                    encoded + padding
+                ).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                protocol_key = None
+            break
+        supplied_key = (
+            protocol_key
+            or websocket.query_params.get("api_key")
+            or ""
+        )
+        accepted_protocol = (
+            "mirage" if "mirage" in offered_protocols else None
+        )
+        await websocket.accept(subprotocol=accepted_protocol)
+        if (
+            configured_api_key
+            and not secrets.compare_digest(supplied_key, configured_api_key)
+        ):
+            await websocket.close(code=4401, reason="Invalid API key")
+            return
+
         state.ws_connections.append(websocket)
         print(f"[WS] Client connected. Total: {len(state.ws_connections)}")
 
@@ -920,6 +1141,10 @@ def create_app() -> Any:
                     })
 
         except WebSocketDisconnect:
+            pass
+        except Exception:
+            LOGGER.exception("Unexpected MIRAGE WebSocket client error")
+        finally:
             if websocket in state.ws_connections:
                 state.ws_connections.remove(websocket)
             print(f"[WS] Client disconnected. Total: {len(state.ws_connections)}")
