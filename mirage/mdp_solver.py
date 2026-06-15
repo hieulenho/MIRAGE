@@ -549,7 +549,7 @@ class MDPSolver:
         gamma = self._discount
         V = np.zeros(n)
 
-        for iteration in range(max_iters):
+        for _iteration in range(max_iters):
             V_new = np.full(n, -1e10)
 
             for s in self.graph.states:
@@ -763,7 +763,7 @@ def prune_action_space(
             for s_next in graph.transitions.get(s_pred, {}).get(a_pred, {}):
                 predecessors.setdefault(s_next, []).append(s_pred)
 
-    for s, p in sorted_states[:top_k_states]:
+    for s, _probability in sorted_states[:top_k_states]:
         hotspots.add(s)
         # Add 1-hop neighbors (states reachable from s)
         for a in graph.available_actions.get(s, []):

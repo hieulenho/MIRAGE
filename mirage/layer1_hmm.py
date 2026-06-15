@@ -451,7 +451,7 @@ class HMMTelemetryClassifier:
 
     def summary(self) -> str:
         lines = ["=" * 60, "MIRAGE Layer 1 HMM — Belief State Summary", "=" * 60]
-        for host, belief in self._last_belief.items():
+        for belief in self._last_belief.values():
             lines.append(str(belief))
             lines.append("")
         return "\n".join(lines)

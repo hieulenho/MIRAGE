@@ -376,7 +376,7 @@ class ReplayBuffer:
 
     def sample(self, batch_size: int) -> Tuple:
         batch = self.rng.sample(list(self.buffer), min(batch_size, len(self.buffer)))
-        states, actions, rewards, next_states, dones = zip(*batch)
+        states, actions, rewards, next_states, dones = zip(*batch, strict=True)
         return (
             np.array(states, dtype=np.float32),
             np.array(actions, dtype=np.int64),
@@ -672,11 +672,16 @@ class DQNAgent:
             gradients = [grad_W1, grad_b1, grad_W2, grad_b2, grad_W3, grad_b3]
             total_norm = math.sqrt(sum(float(np.sum(g * g)) for g in gradients))
             scale = min(1.0, 1.0 / max(total_norm, 1e-8))
-            for parameter, gradient in zip(
-                [self._W1, self._b1, self._W2, self._b2, self._W3, self._b3],
-                gradients,
-            ):
-                parameter -= self._lr * gradient * scale
+            parameters = (
+                self._W1,
+                self._b1,
+                self._W2,
+                self._b2,
+                self._W3,
+                self._b3,
+            )
+            for index, gradient in enumerate(gradients):
+                parameters[index] -= self._lr * gradient * scale
 
     def _update_target_network(self):
         """Copy Q-network weights to target network."""

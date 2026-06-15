@@ -91,6 +91,18 @@ def test_deploy_catalog_targets_only_real_decoy_slots():
         build_runtime_graph(graph, actions=[invalid])
 
 
+def test_fabric_rejects_deploy_action_for_wrong_decoy_asset_type():
+    graph = build_enterprise_attack_graph()
+    fabric = DeceptionFabric(graph)
+    invalid = DeceptionAction(
+        action_type=DeceptionActionType.DEPLOY_DECOY_DATABASE,
+        target_node=12,
+    )
+
+    with pytest.raises(ValueError, match="cannot target asset type"):
+        fabric.deploy_action(invalid)
+
+
 def test_retiring_one_action_keeps_other_reward_and_engagement_history():
     graph = build_enterprise_attack_graph()
     fabric = DeceptionFabric(graph)

@@ -582,6 +582,28 @@ class DeceptionFabric:
             raise ValueError(
                 f"Deploy target {action.target_node} is not a decoy slot"
             )
+        if action.action_type in {
+            DeceptionActionType.DEPLOY_DECOY_DATABASE,
+            DeceptionActionType.DEPLOY_DECOY_ROUTER,
+        }:
+            expected_asset_type = {
+                DeceptionActionType.DEPLOY_DECOY_DATABASE: "decoy_db",
+                DeceptionActionType.DEPLOY_DECOY_ROUTER: "decoy_router",
+            }[action.action_type]
+            actual_asset_type = str(
+                self.graph.node_metadata.get(action.target_node, {}).get(
+                    "asset_type",
+                    "",
+                )
+            )
+            if (
+                actual_asset_type in {"decoy_db", "decoy_router"}
+                and actual_asset_type != expected_asset_type
+            ):
+                raise ValueError(
+                    f"{action.action_type.value} cannot target asset type "
+                    f"{actual_asset_type!r}"
+                )
 
         decoy_id = str(uuid.uuid4())[:8]
         from mirage.mdp_solver import compute_composite_cost

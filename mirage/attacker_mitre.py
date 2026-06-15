@@ -214,7 +214,7 @@ class MITREEvasionAttacker(DeceptionAwareAttacker):
         if self._noise_prob > 0 and self._evasion_rng.random() < self._noise_prob:
             # Choose uniformly but avoid "end" if other options exist
             non_terminal = [a for a in actions if a not in ("end", "noop")]
-            pool = non_terminal if non_terminal else actions
+            pool = non_terminal or actions
             return self._evasion_rng.choice(pool)
 
         # Otherwise, use DeceptionAwareAttacker's sophisticated logic

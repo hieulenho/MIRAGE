@@ -679,7 +679,7 @@ class MIRAGEEvaluator:
                 json.dump(results, f, indent=2)
             if verbose:
                 print(f"\nScaling results saved to: {out_path}")
-        except Exception as e:
+        except (OSError, TypeError, ValueError) as e:
             print(f"Could not save scaling results: {e}")
 
         return results
@@ -699,7 +699,8 @@ class MIRAGEEvaluator:
 
         def fmt_row(cols):
             return "│ " + " │ ".join(
-                str(c).ljust(w) for c, w in zip(cols, COL_WIDTHS)
+                str(c).ljust(w)
+                for c, w in zip(cols, COL_WIDTHS, strict=True)
             ) + " │"
 
         def sep_row():
@@ -815,7 +816,7 @@ class MIRAGEEvaluator:
         ax.set_title("Interception Rate ↑", fontsize=12, fontweight="bold")
         ax.set_ylabel("Rate", color="white")
         ax.set_ylim(0, 1.1)
-        for bar, v in zip(bars, vals):
+        for bar, v in zip(bars, vals, strict=True):
             ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
                     f"{v:.1%}", ha="center", va="bottom", fontsize=9, color="white")
         ax.axhline(y=vals[-1], color="#9b59b6", linestyle="--", alpha=0.5, label="MIRAGE")
@@ -827,7 +828,7 @@ class MIRAGEEvaluator:
         ax.set_title("Hit True Goal Rate ↓ (Lower = Better)", fontsize=12, fontweight="bold")
         ax.set_ylabel("Rate", color="white")
         ax.set_ylim(0, 1.1)
-        for bar, v in zip(bars, vals):
+        for bar, v in zip(bars, vals, strict=True):
             ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
                     f"{v:.1%}", ha="center", va="bottom", fontsize=9, color="white")
 
@@ -838,7 +839,7 @@ class MIRAGEEvaluator:
         ax.set_title("Pessimistic Value ↑ (Robust Metric) ★", fontsize=12, fontweight="bold")
         ax.set_ylabel("Value", color="white")
         ax.axhline(y=0, color="gray", linestyle="-", alpha=0.5)
-        for bar, v in zip(bars, vals):
+        for bar, v in zip(bars, vals, strict=True):
             ypos = bar.get_height() + 0.01 if v >= 0 else bar.get_height() - 0.05
             ax.text(bar.get_x() + bar.get_width()/2, ypos,
                     f"{v:+.4f}", ha="center", va="bottom", fontsize=8, color="white")
@@ -886,7 +887,7 @@ class MIRAGEEvaluator:
         bars = ax.bar(method_labels, vals, color=clrs, alpha=0.85, edgecolor="#333")
         ax.set_title("Avg Steps to Compromise ↑\n(Higher = Harder for Attacker)", fontsize=11, fontweight="bold")
         ax.set_ylabel("Steps", color="white")
-        for bar, v in zip(bars, vals):
+        for bar, v in zip(bars, vals, strict=True):
             ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
                     f"{v:.1f}", ha="center", va="bottom", fontsize=9, color="white")
 
@@ -1096,7 +1097,7 @@ class MIRAGEEvaluator:
                         ])
             if verbose:
                 print(f"\n✅ Multi-seed results saved to: {out_path}")
-        except Exception as e:
+        except (OSError, TypeError, ValueError) as e:
             print(f"⚠️  Could not save JSON: {e}")
 
         return aggregated

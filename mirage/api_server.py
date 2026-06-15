@@ -40,7 +40,7 @@ import threading
 import time
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 # Add project root to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -920,7 +920,10 @@ def create_app() -> Any:
         }
 
     @app.post("/api/ingest/{source}")
-    async def ingest_siem_payload(source: str, payload: Any = Body(...)):
+    async def ingest_siem_payload(
+        source: str,
+        payload: Annotated[Any, Body()],
+    ):
         """Ingest native-ish Splunk HEC, Elastic, or Wazuh payloads."""
         source = source.lower()
         if source not in {"splunk", "elastic", "wazuh"}:

@@ -358,7 +358,7 @@ def build_runtime_graph(
     for action in actions:
         action_type = getattr(getattr(action, "action_type", None), "value", "")
         if action_type in deploy_types:
-            node = int(getattr(action, "target_node"))
+            node = int(action.target_node)
             if node not in runtime.decoy_sites:
                 raise ValueError(
                     f"Deploy action target {node} is not a configured decoy slot"
@@ -860,7 +860,7 @@ def build_synthetic_enterprise_graph(
             total = sum(weights)
             transitions[node][action] = {
                 target: weight / total
-                for target, weight in zip(targets, weights)
+                for target, weight in zip(targets, weights, strict=True)
             }
 
     # Ensure at least one clear path from entry to the true goal.
@@ -869,7 +869,7 @@ def build_synthetic_enterprise_graph(
         if tiers[tier]:
             spine.append(tiers[tier][0])
     spine.append(true_goal)
-    for src, dst in zip(spine, spine[1:]):
+    for src, dst in zip(spine, spine[1:], strict=True):
         action = available_actions[src][0]
         trans = transitions[src].setdefault(action, {})
         trans[dst] = max(trans.get(dst, 0.0), 0.45)

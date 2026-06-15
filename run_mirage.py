@@ -262,7 +262,9 @@ def run_step3_safety():
 
     # --- Layer 5: Safety Gate Tests ---
     print("\n[Layer 5] Testing Safety Gate with different risk levels...")
-    gate = create_safety_gate("results", budget_limit=5.0)
+    # Keep enough headroom so Test 3 reaches the protected-node guardrail
+    # instead of being rejected earlier by the composite budget check.
+    gate = create_safety_gate("results", budget_limit=10.0)
 
     # Tạo mock plans với risk levels khác nhau
     class MockAction:
