@@ -63,12 +63,12 @@ def run_step1_mvp():
     print("BƯỚC 1: Khung xương MVP (Layer 2 + Layer 4)")
     print("─" * 70)
 
-    from mirage.layer2_attack_graph import (
+    from mirage.layer2_graph_engine.attack_graph import (
         build_configured_attack_graph,
         print_graph_summary,
     )
-    from mirage.layer3_deception import DeceptionFabric
-    from mirage.layer4_decision_engine import RobustDecisionEngine
+    from mirage.layer3_deception.deception_fabric import DeceptionFabric
+    from mirage.layer4_decision.decision_engine import RobustDecisionEngine
 
     # Layer 2: Xây dựng đồ thị
     print("\n[Layer 2] Xây dựng Enterprise Attack Graph (15 nodes)...")
@@ -87,7 +87,7 @@ def run_step1_mvp():
     )
 
     # Belief state: attacker có thể ở Workstation Finance (node 4)
-    from mirage.layer6_evaluation import MIRAGEEvaluator
+    from mirage.layer6_twin.evaluation import MIRAGEEvaluator
 
     belief_state = MIRAGEEvaluator(
         graph,
@@ -127,10 +127,10 @@ def run_step2_full_layers():
     print("BƯỚC 2: Đắp thịt — Layer 3 + Attackers + Evaluation")
     print("─" * 70)
 
-    from mirage.layer2_attack_graph import build_configured_attack_graph
-    from mirage.layer3_deception import DeceptionFabric, DeceptionActionType
-    from mirage.attacker_agents import run_simulation
-    from mirage.mdp_solver import compute_composite_cost
+    from mirage.layer2_graph_engine.attack_graph import build_configured_attack_graph
+    from mirage.layer3_deception.deception_fabric import DeceptionFabric, DeceptionActionType
+    from mirage.shared.attacker_agents import run_simulation
+    from mirage.layer2_graph_engine.mdp_solver import compute_composite_cost
 
     graph = build_configured_attack_graph()
     fabric = DeceptionFabric(graph)
@@ -200,7 +200,7 @@ def run_step2_full_layers():
 
     # --- Layer 6: Quick Benchmark ---
     print("\n[Layer 6] Running benchmark (3 methods for speed)...")
-    from mirage.layer6_evaluation import MIRAGEEvaluator
+    from mirage.layer6_twin.evaluation import MIRAGEEvaluator
     evaluator = MIRAGEEvaluator(graph, n_episodes=150, seed=42)
 
     # Chạy 3 phương pháp để demo nhanh; _get_reward_interventions_for_method
@@ -236,12 +236,12 @@ def run_step3_safety():
     print("BƯỚC 3: Gắn Mắt và Phanh — Layer 1 + Layer 5")
     print("─" * 70)
 
-    from mirage.layer1_attack_modeling import (
+    from mirage.layer1_contextual_ai.attack_modeling import (
         AttackStageClassifier, simulate_attack_telemetry
     )
-    from mirage.layer2_attack_graph import build_configured_attack_graph
-    from mirage.layer3_deception import DeceptionActionType
-    from mirage.layer5_safe_control import create_safety_gate
+    from mirage.layer2_graph_engine.attack_graph import build_configured_attack_graph
+    from mirage.layer3_deception.deception_fabric import DeceptionActionType
+    from mirage.layer5_safe_control.safe_control import create_safety_gate
     graph = build_configured_attack_graph()
 
     # --- Layer 1: Attack Stage Classification ---
@@ -406,13 +406,13 @@ def run_full_demo():
     print("MIRAGE END-TO-END DEMO")
     print("─" * 70)
 
-    from mirage.layer1_attack_modeling import simulate_attack_telemetry
-    from mirage.layer1_hmm import EnsembleTelemetryClassifier
-    from mirage.layer2_attack_graph import build_configured_attack_graph
-    from mirage.layer3_deception import DeceptionFabric
-    from mirage.layer4_decision_engine import RobustDecisionEngine
-    from mirage.layer5_safe_control import create_safety_gate, make_safety_filter
-    from mirage.layer6_evaluation import MIRAGEEvaluator
+    from mirage.layer1_contextual_ai.attack_modeling import simulate_attack_telemetry
+    from mirage.layer1_contextual_ai.hmm_classifier import EnsembleTelemetryClassifier
+    from mirage.layer2_graph_engine.attack_graph import build_configured_attack_graph
+    from mirage.layer3_deception.deception_fabric import DeceptionFabric
+    from mirage.layer4_decision.decision_engine import RobustDecisionEngine
+    from mirage.layer5_safe_control.safe_control import create_safety_gate, make_safety_filter
+    from mirage.layer6_twin.evaluation import MIRAGEEvaluator
 
     print("\n📡 [Layer 1] Processing real-time telemetry...")
     classifier = EnsembleTelemetryClassifier()
@@ -428,7 +428,7 @@ def run_full_demo():
         dominant_stage, confidence = classifier.get_dominant_stage(
             dominant_host
         )
-        from mirage.layer1_attack_modeling import STAGE_NAMES
+        from mirage.layer1_contextual_ai.attack_modeling import STAGE_NAMES
         stage_ctx = {
             "stage": STAGE_NAMES[dominant_stage],
             "confidence": confidence,
@@ -497,8 +497,8 @@ def run_full_demo():
 
 def run_full_benchmark():
     """Chạy benchmark đầy đủ với tất cả 6 phương pháp."""
-    from mirage.layer2_attack_graph import build_configured_attack_graph
-    from mirage.layer6_evaluation import MIRAGEEvaluator
+    from mirage.layer2_graph_engine.attack_graph import build_configured_attack_graph
+    from mirage.layer6_twin.evaluation import MIRAGEEvaluator
 
     graph = build_configured_attack_graph()
     evaluator = MIRAGEEvaluator(graph, n_episodes=500, seed=42, results_dir="results")
@@ -521,8 +521,8 @@ def run_full_benchmark():
 
 def run_benchmark_a():
     """Chạy Benchmark A: Attacker bắt đầu từ Internet/Entry Point."""
-    from mirage.layer2_attack_graph import build_configured_attack_graph
-    from mirage.layer6_evaluation import MIRAGEEvaluator
+    from mirage.layer2_graph_engine.attack_graph import build_configured_attack_graph
+    from mirage.layer6_twin.evaluation import MIRAGEEvaluator
 
     graph = build_configured_attack_graph()
     evaluator = MIRAGEEvaluator(graph, n_episodes=500, seed=42, results_dir="results")
@@ -541,8 +541,8 @@ def run_benchmark_a():
 
 def run_benchmark_b():
     """Chạy Benchmark B: Attacker đã bị nghi ở mid-network (post-intrusion)."""
-    from mirage.layer2_attack_graph import build_configured_attack_graph
-    from mirage.layer6_evaluation import MIRAGEEvaluator
+    from mirage.layer2_graph_engine.attack_graph import build_configured_attack_graph
+    from mirage.layer6_twin.evaluation import MIRAGEEvaluator
 
     graph = build_configured_attack_graph()
     evaluator = MIRAGEEvaluator(graph, n_episodes=500, seed=42, results_dir="results")
@@ -562,8 +562,8 @@ def run_benchmark_b():
 
 def run_multi_seed():
     """Chạy Multi-Seed Benchmark để lấy mean ± std."""
-    from mirage.layer2_attack_graph import build_configured_attack_graph
-    from mirage.layer6_evaluation import MIRAGEEvaluator
+    from mirage.layer2_graph_engine.attack_graph import build_configured_attack_graph
+    from mirage.layer6_twin.evaluation import MIRAGEEvaluator
 
     graph = build_configured_attack_graph()
     evaluator = MIRAGEEvaluator(graph, n_episodes=300, seed=42, results_dir="results")
@@ -591,8 +591,8 @@ def run_multi_seed():
 
 def run_scaling_benchmark():
     """Run scaling benchmark on synthetic 100/500/1000-node graphs."""
-    from mirage.layer2_attack_graph import build_enterprise_attack_graph
-    from mirage.layer6_evaluation import MIRAGEEvaluator
+    from mirage.layer2_graph_engine.attack_graph import build_enterprise_attack_graph
+    from mirage.layer6_twin.evaluation import MIRAGEEvaluator
 
     graph = build_enterprise_attack_graph()
     evaluator = MIRAGEEvaluator(graph, n_episodes=120, seed=42, results_dir="results")
@@ -606,9 +606,9 @@ def run_scaling_benchmark():
 
 def run_train_rl(episodes: int = 200, model_path: str = "models/mirage_dqn.npz"):
     """Train the Deep RL defender and persist a reusable model."""
-    from mirage.layer2_attack_graph import build_configured_attack_graph
-    from mirage.layer3_deception import DeceptionFabric
-    from mirage.rl_agent import RLDecisionBridge
+    from mirage.layer2_graph_engine.attack_graph import build_configured_attack_graph
+    from mirage.layer3_deception.deception_fabric import DeceptionFabric
+    from mirage.layer4_decision.rl_agent import RLDecisionBridge
 
     graph = build_configured_attack_graph()
     fabric = DeceptionFabric(graph)
@@ -635,7 +635,7 @@ def run_train_rl(episodes: int = 200, model_path: str = "models/mirage_dqn.npz")
 
 def show_graph_info():
     """Hiển thị thông tin đồ thị."""
-    from mirage.layer2_attack_graph import (
+    from mirage.layer2_graph_engine.attack_graph import (
         build_configured_attack_graph,
         print_graph_summary,
     )
@@ -699,8 +699,8 @@ def main():
     elif args.mode == "train_rl":
         run_train_rl(args.episodes, args.model_path)
     elif args.mode == "ablation":
-        from mirage.layer2_attack_graph import build_configured_attack_graph
-        from mirage.layer6_evaluation import MIRAGEEvaluator
+        from mirage.layer2_graph_engine.attack_graph import build_configured_attack_graph
+        from mirage.layer6_twin.evaluation import MIRAGEEvaluator
         graph = build_configured_attack_graph()
         evaluator = MIRAGEEvaluator(graph, n_episodes=300, seed=42)
         evaluator.run_ablation_study()
