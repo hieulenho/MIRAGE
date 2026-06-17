@@ -917,3 +917,176 @@ Known limitations:
   produce warnings instead of automatic merges.
 - Persistent storage, real connectors, stronger auth/RBAC, GNN, contextual AI,
   and MARL are planned for later milestones.
+
+## Milestone 2: Contextual Detection V1
+
+MIRAGE now includes a deterministic, explainable detection and belief layer on
+top of canonical `SecurityEvent` ingestion and Digital Twin V1:
+
+```text
+SecurityEvent stream
+  -> entity timelines
+  -> explainable feature extraction
+  -> high-precision rules
+  -> temporal correlation
+  -> probabilistic attack-stage scoring
+  -> entity belief and attacker-location distribution
+  -> attack graph contextual-risk metadata
+  -> CLI and API audit output
+```
+
+### What Contextual Detection V1 Does
+
+- Stores multi-entity timelines for assets, identities, credentials,
+  communications, sessions, and incidents.
+- Extracts named single-event, temporal-window, and simple baseline-deviation
+  features without storing full command lines as feature values.
+- Evaluates 10 deterministic rules: suspicious script, discovery burst, SMB
+  lateral pattern, auth spray, success after failures, identity fan-out,
+  credential-to-remote, deception interaction, critical-asset approach, and
+  benign admin suppression.
+- Correlates local evidence into partial stage progressions such as execution
+  -> discovery -> credential access -> lateral movement.
+- Estimates attack-stage probabilities over stable stage names from priors,
+  weighted evidence, decay, suppression, and soft transition hints.
+- Maintains `EntityBelief`, `IncidentBelief`, `BeliefSnapshot`, evidence,
+  uncertainty, and an attacker-location distribution that always keeps
+  `unknown` probability mass.
+- Propagates graph risk only one configurable hop by default, marks propagated
+  evidence as inferred, and keeps direct evidence distinguishable.
+- Preserves the original research simulator, static attack graph, HMM
+  classifier, MDP solver, dashboard, and decision pipeline behavior.
+
+### CLI
+
+```bash
+python -m mirage detect \
+  --events examples/events/contextual_discovery_lateral.jsonl \
+  --belief-out artifacts/belief_snapshot.json \
+  --detections-out artifacts/detections.jsonl
+```
+
+Example output:
+
+```text
+MIRAGE contextual detection replay complete
+  events processed:          9
+  rule matches:              19
+  correlations created:      37
+  suspicious entities:       20
+  highest compromise:       1.0000
+  most likely stage:        lateral_movement
+  deception interactions:    0
+  invalid events:            0
+  final belief version:      51
+```
+
+Use `--verbose` to print rule/evidence explanations. The default audit output
+does not include raw command lines, passwords, tokens, or raw credentials.
+
+### API
+
+Start the API:
+
+```bash
+python -m mirage.api_server
+```
+
+Contextual Detection V1 endpoints:
+
+```text
+POST /api/v1/detection/events
+POST /api/v1/detection/events/batch
+GET  /api/v1/detection/entities/{entity_id}
+GET  /api/v1/detection/entities/{entity_id}/timeline
+GET  /api/v1/detection/entities/{entity_id}/evidence
+GET  /api/v1/detection/suspicious
+GET  /api/v1/detection/incidents
+GET  /api/v1/detection/incidents/{incident_id}
+GET  /api/v1/belief/snapshot
+POST /api/v1/belief/recompute
+```
+
+Example event:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/detection/events \
+  -H "Content-Type: application/json" \
+  -d '{"event_id":"evt-detect-1","event_time":"2026-06-17T10:00:00Z","ingest_time":"2026-06-17T10:00:01Z","source":"docs","event_type":"deception_interaction","asset_id":"asset:decoy:fake-db","user_id":"identity:user:mallory","credential_id":"honey-token","src_ip":"10.10.20.45","dst_ip":"10.10.99.10","confidence":0.99,"attributes":{"hostname":"fake-db","asset_type":"decoy_db","is_decoy":true}}'
+```
+
+### Synthetic Scenarios
+
+The repository includes deterministic synthetic JSONL datasets:
+
+- `examples/events/contextual_benign_admin.jsonl`
+- `examples/events/contextual_discovery_lateral.jsonl`
+- `examples/events/contextual_auth_spray.jsonl`
+- `examples/events/contextual_deception.jsonl`
+- `examples/events/contextual_stale_evidence.jsonl`
+
+Expected behavior:
+
+- benign admin maintenance is suppressed below the compromise threshold;
+- discovery and lateral movement raise discovery/lateral stage probabilities;
+- auth spray creates credential-access/initial-access evidence;
+- deception interaction creates high-confidence evidence;
+- stale evidence remains auditable while active risk decays or is capped by
+  later benign context.
+
+### Evaluation
+
+Use `mirage.detection.evaluation.evaluate_scenarios(...)` for synthetic-only
+metrics: rule precision/recall, stage accuracy, macro-F1 style summary, Brier
+score, detection latency, false positives per benign scenario, evidence
+coverage, deterministic consistency, correlated events, and processing time.
+These metrics validate implementation behavior on synthetic data only. They
+are not production detection-accuracy claims.
+
+### Configuration
+
+`config.json` has a `detection` section for retention, windows, rule weights,
+stage priors, evidence decay/TTL, correlation windows, compromise thresholds,
+allowlists, approved service accounts, graph propagation, and API timeline
+limits. Override via `MIRAGE_CONFIG` as with earlier milestones.
+
+### Method Notes
+
+Stage estimation uses a deterministic score model:
+
+```text
+stage_score = prior + decayed(rule_score * confidence) + soft transition hints
+posterior   = softmax(stage_score)
+uncertainty = normalized entropy(posterior)
+```
+
+Compromise probability uses bounded evidence accumulation:
+
+```text
+P(compromise) = 1 - exp(-(direct + 0.5 * inferred - suppression))
+```
+
+Deception interaction can raise probability to a high-confidence configured
+floor. Benign administrative suppression cannot hide deception evidence and
+caps non-deception compromise below the configured suspicious threshold.
+
+### Limitations and Migration Notes
+
+- This is an explainable baseline, not a trained AI model.
+- No zero-day detection, LLM, Transformer, GNN, deep RL, or MARL is claimed in
+  this milestone.
+- Probabilities depend on configured priors, evidence quality, and incomplete
+  Digital Twin data.
+- Timeline, evidence, and belief state are in memory; use snapshots for replay
+  and audit.
+- High-risk response actions are not automated by this detection layer.
+- The old research-simulator HMM/stage classifier remains available for the
+  original dashboard and decision flow; Contextual Detection V1 is additive.
+
+Recommended Milestone 3:
+
+```text
+Dynamic Local Subgraph Retrieval
++ Attack-Path Risk Engine
++ Candidate Defense Action Generation
+```

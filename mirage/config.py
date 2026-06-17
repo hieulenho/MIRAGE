@@ -83,6 +83,176 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "allow_provisional_entities": True,
         "logging_level": "INFO",
     },
+    "detection": {
+        "timeline_retention_seconds": 86400,
+        "windows": [60, 300, 900, 3600],
+        "rules": {
+            "R001_SUSPICIOUS_SCRIPT": {"enabled": True, "score": 0.65},
+            "R002_INTERNAL_DISCOVERY_BURST": {"enabled": True, "score": 0.55},
+            "R003_SMB_LATERAL_PATTERN": {"enabled": True, "score": 0.65},
+            "R004_AUTH_SPRAY": {"enabled": True, "score": 0.7},
+            "R005_SUCCESS_AFTER_FAILURES": {"enabled": True, "score": 0.75},
+            "R006_IDENTITY_FANOUT": {"enabled": True, "score": 0.55},
+            "R007_CREDENTIAL_TO_REMOTE": {"enabled": True, "score": 0.7},
+            "R008_DECEPTION_INTERACTION": {"enabled": True, "score": 0.98},
+            "R009_CRITICAL_ASSET_APPROACH": {"enabled": True, "score": 0.68},
+            "R010_BENIGN_ADMIN_SUPPRESSION": {"enabled": True, "score": -0.45},
+        },
+        "stage_priors": {
+            "normal": 0.7,
+            "reconnaissance": 0.02,
+            "initial_access": 0.04,
+            "execution": 0.04,
+            "credential_access": 0.04,
+            "discovery": 0.05,
+            "lateral_movement": 0.04,
+            "collection": 0.03,
+        },
+        "stage_transition_weight": 0.15,
+        "evidence_decay_seconds": 3600,
+        "evidence_ttl_seconds": 3600,
+        "correlation_window_seconds": 3600,
+        "compromise_threshold": 0.35,
+        "high_confidence_deception_threshold": 0.85,
+        "approved_admin_hosts": ["admin-jump-01"],
+        "approved_service_accounts": ["svc-backup", "svc-monitor"],
+        "maintenance_windows": [],
+        "graph_propagation_depth": 1,
+        "graph_propagation_decay": 0.45,
+        "api_timeline_limit": 100,
+    },
+    "analysis": {
+        "seed_selection": {
+            "minimum_compromise_probability": 0.30,
+            "minimum_attacker_location_probability": 0.20,
+            "maximum_seeds": 20,
+            "uncertainty_penalty": 0.20,
+            "deception_event_priority": 0.25,
+            "neighborhood_deduplication": True,
+        },
+        "subgraph": {
+            "default_max_hops": 3,
+            "max_nodes": 80,
+            "max_edges": 160,
+            "minimum_edge_confidence": 0.10,
+            "freshness_threshold": 86400,
+            "relationship_allowlist": [],
+            "criticality_threshold": 0.80,
+        },
+        "paths": {
+            "maximum_path_length": 6,
+            "maximum_paths_per_target": 3,
+            "maximum_total_paths": 60,
+            "enabled_path_types": [
+                "shortest_to_critical_asset",
+                "highest_success_probability",
+                "highest_risk",
+                "credential_driven",
+                "recently_observed",
+                "decoy_path",
+                "unprotected_path",
+                "high_blast_radius",
+            ],
+            "observed_edge_bonus": 0.12,
+            "inferred_edge_penalty": 0.25,
+            "stale_edge_penalty": 0.20,
+            "uncertainty_penalty": 0.20,
+        },
+        "risk_scoring": {
+            "source_compromise_weight": 1.0,
+            "path_success_weight": 1.0,
+            "target_criticality_weight": 1.0,
+            "stage_compatibility_weight": 0.8,
+            "evidence_recency_weight": 0.8,
+            "relationship_confidence_weight": 0.8,
+            "credential_feasibility_weight": 0.6,
+            "exposure_weight": 0.5,
+            "probability_floor": 0.01,
+            "probability_ceiling": 0.99,
+        },
+        "candidate_actions": {
+            "enabled_action_types": [
+                "increase_endpoint_logging",
+                "increase_network_telemetry",
+                "enable_limited_packet_capture",
+                "enable_auth_auditing",
+                "create_soc_ticket",
+                "request_analyst_review",
+                "deploy_decoy_database",
+                "deploy_fake_share",
+                "scatter_honey_credential",
+                "add_decoy_service",
+                "throttle_edge",
+                "restrict_smb",
+                "require_mfa",
+                "temporary_segmentation",
+                "block_egress",
+                "isolate_host",
+            ],
+            "default_ttl_seconds": 3600,
+            "action_costs": {
+                "increase_endpoint_logging": 0.2,
+                "increase_network_telemetry": 0.3,
+                "enable_limited_packet_capture": 0.5,
+                "enable_auth_auditing": 0.25,
+                "create_soc_ticket": 0.1,
+                "request_analyst_review": 0.1,
+                "deploy_decoy_database": 1.5,
+                "deploy_fake_share": 0.9,
+                "scatter_honey_credential": 0.8,
+                "add_decoy_service": 1.0,
+                "throttle_edge": 0.5,
+                "restrict_smb": 0.7,
+                "require_mfa": 0.8,
+                "temporary_segmentation": 1.2,
+                "block_egress": 1.0,
+                "isolate_host": 2.0
+            },
+            "business_risks": {
+                "increase_endpoint_logging": 0.05,
+                "increase_network_telemetry": 0.05,
+                "enable_limited_packet_capture": 0.15,
+                "enable_auth_auditing": 0.05,
+                "create_soc_ticket": 0.01,
+                "request_analyst_review": 0.01,
+                "deploy_decoy_database": 0.10,
+                "deploy_fake_share": 0.08,
+                "scatter_honey_credential": 0.05,
+                "add_decoy_service": 0.10,
+                "throttle_edge": 0.20,
+                "restrict_smb": 0.30,
+                "require_mfa": 0.25,
+                "temporary_segmentation": 0.50,
+                "block_egress": 0.55,
+                "isolate_host": 0.75
+            },
+            "information_gain_weights": {
+                "observe": 0.8,
+                "deception": 0.7,
+                "control": 0.3
+            },
+        },
+        "constraints": {
+            "protected_asset_ids": [],
+            "protected_asset_types": ["database", "dc", "domain_controller"],
+            "required_confidence_threshold": 0.35,
+            "twin_freshness_threshold": 0.35,
+            "graph_coverage_threshold": 0.20,
+            "blast_radius_limit": 5,
+            "action_budget": 6.0,
+            "active_decoy_limit": 20,
+            "deny_action_types": ["delete_credentials", "block_all_traffic"],
+        },
+        "ranking": {
+            "risk_reduction_weight": 1.0,
+            "information_gain_weight": 0.4,
+            "path_coverage_weight": 0.3,
+            "operational_cost_weight": 0.15,
+            "deployment_cost_weight": 0.15,
+            "business_risk_weight": 0.4,
+            "uncertainty_weight": 0.3,
+        },
+    },
 }
 
 
@@ -229,6 +399,72 @@ def _validate_config(config: Dict[str, Any]) -> None:
         "CRITICAL",
     }:
         raise ValueError("twin.logging_level must be a standard log level")
+
+    detection = config["detection"]
+    if int(detection["timeline_retention_seconds"]) < 1:
+        raise ValueError("detection.timeline_retention_seconds must be at least 1")
+    if not isinstance(detection["windows"], list) or not detection["windows"]:
+        raise ValueError("detection.windows must be a non-empty list")
+    for window in detection["windows"]:
+        if int(window) < 1:
+            raise ValueError("detection.windows values must be at least 1")
+    for key in (
+        "stage_transition_weight",
+        "evidence_decay_seconds",
+        "evidence_ttl_seconds",
+        "correlation_window_seconds",
+        "compromise_threshold",
+        "high_confidence_deception_threshold",
+        "graph_propagation_decay",
+    ):
+        value = float(detection[key])
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"detection.{key} must be finite and non-negative")
+    if not 0 <= float(detection["compromise_threshold"]) <= 1:
+        raise ValueError("detection.compromise_threshold must be in [0, 1]")
+    if not 0 <= float(detection["high_confidence_deception_threshold"]) <= 1:
+        raise ValueError(
+            "detection.high_confidence_deception_threshold must be in [0, 1]"
+        )
+    if int(detection["graph_propagation_depth"]) < 0:
+        raise ValueError("detection.graph_propagation_depth must be >= 0")
+    if int(detection["api_timeline_limit"]) < 1:
+        raise ValueError("detection.api_timeline_limit must be at least 1")
+
+    analysis = config["analysis"]
+    seed = analysis["seed_selection"]
+    if int(seed["maximum_seeds"]) < 1:
+        raise ValueError("analysis.seed_selection.maximum_seeds must be at least 1")
+    for key in (
+        "minimum_compromise_probability",
+        "minimum_attacker_location_probability",
+        "uncertainty_penalty",
+        "deception_event_priority",
+    ):
+        value = float(seed[key])
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"analysis.seed_selection.{key} must be >= 0")
+    subgraph = analysis["subgraph"]
+    for key in ("default_max_hops", "max_nodes", "max_edges"):
+        if int(subgraph[key]) < 0:
+            raise ValueError(f"analysis.subgraph.{key} must be >= 0")
+    if int(subgraph["max_nodes"]) < 1:
+        raise ValueError("analysis.subgraph.max_nodes must be at least 1")
+    for key in ("minimum_edge_confidence", "criticality_threshold"):
+        value = float(subgraph[key])
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError(f"analysis.subgraph.{key} must be in [0, 1]")
+    paths = analysis["paths"]
+    for key in ("maximum_path_length", "maximum_paths_per_target", "maximum_total_paths"):
+        if int(paths[key]) < 1:
+            raise ValueError(f"analysis.paths.{key} must be at least 1")
+    constraints = analysis["constraints"]
+    for key in ("required_confidence_threshold", "twin_freshness_threshold", "graph_coverage_threshold"):
+        value = float(constraints[key])
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError(f"analysis.constraints.{key} must be in [0, 1]")
+    if float(constraints["action_budget"]) < 0:
+        raise ValueError("analysis.constraints.action_budget must be >= 0")
 
 
 def get_config_path(path: Optional[os.PathLike | str] = None) -> Path:

@@ -69,6 +69,7 @@ from mirage.layer2_graph_engine.attack_graph import MIRAGEAttackGraph, build_con
 from mirage.layer3_deception.deception_fabric import DeceptionFabric
 from mirage.layer5_safe_control.safe_control import create_safety_gate
 from mirage.config import load_config, resolve_project_path
+from mirage.detection.pipeline import ContextualDetectionPipeline
 from mirage.domain.schemas import SecurityEvent
 from mirage.ingestion.normalizer import EventNormalizer
 from mirage.layer6_twin.digital_twin import DigitalTwin
@@ -118,6 +119,11 @@ if HAS_FASTAPI:
         events: Optional[List[Dict[str, Any]]] = None
         preserve_file_order: bool = False
         strict: bool = False
+
+    class BeliefRecomputeRequest(BaseModel):
+        """Request to recompute one contextual entity belief."""
+        entity_id: str = Field(min_length=1)
+        reference_time: Optional[datetime] = None
 
 
 def _parse_timestamp(value: Any) -> float:
@@ -335,6 +341,7 @@ class MIRAGEStateManager:
             ),
         )
         self.event_normalizer = EventNormalizer()
+        self.detection_pipeline = self._build_detection_pipeline(self.twin)
 
         # Metrics
         self.total_events_processed = 0
@@ -345,6 +352,17 @@ class MIRAGEStateManager:
         self._ws_broadcast_lock = asyncio.Lock()
 
         print("[MIRAGE API] Engine ready.")
+
+    def _build_detection_pipeline(
+        self,
+        twin: DigitalTwin,
+    ) -> ContextualDetectionPipeline:
+        """Create a contextual detection pipeline bound to the API twin."""
+        return ContextualDetectionPipeline(
+            twin=twin,
+            attack_graph=self.graph,
+            config=self.config.get("detection", {}),
+        )
 
     def process_event(self, payload) -> Dict:
         """Process a single telemetry event and return belief update."""
@@ -413,6 +431,83 @@ class MIRAGEStateManager:
         with self._lock:
             return self.twin.create_snapshot().model_dump(mode="json")
 
+    def process_detection_event(self, raw_event: Any) -> Dict:
+        """Normalize and process one event through Contextual Detection V1."""
+        event = (
+            raw_event
+            if isinstance(raw_event, SecurityEvent)
+            else self.event_normalizer.normalize(raw_event)
+        )
+        with self._lock:
+            result = self.detection_pipeline.process_event(event)
+            return result.model_dump(mode="json")
+
+    def get_detection_entity(self, entity_id: str) -> Dict:
+        """Return contextual belief for one entity."""
+        with self._lock:
+            belief = self.detection_pipeline.belief_engine.get_entity_belief(entity_id)
+        if belief is None:
+            raise KeyError(entity_id)
+        return belief.model_dump(mode="json")
+
+    def get_detection_timeline(self, entity_id: str, limit: int) -> List[Dict]:
+        """Return a bounded sanitized timeline for one entity."""
+        with self._lock:
+            events = self.detection_pipeline.get_entity_timeline(
+                entity_id,
+                limit=limit,
+            )
+        return [event.model_dump(mode="json") for event in events]
+
+    def get_detection_evidence(self, entity_id: str) -> List[Dict]:
+        """Return evidence touching one entity."""
+        with self._lock:
+            evidence = self.detection_pipeline.get_entity_evidence(entity_id)
+        return [item.model_dump(mode="json") for item in evidence]
+
+    def get_suspicious_entities(self, limit: int) -> List[Dict]:
+        """Return top suspected entities."""
+        with self._lock:
+            beliefs = self.detection_pipeline.belief_engine.get_top_suspected_entities(
+                limit=limit,
+            )
+        return [belief.model_dump(mode="json") for belief in beliefs]
+
+    def get_incidents(self, limit: int = 10) -> List[Dict]:
+        """Return current incident beliefs."""
+        with self._lock:
+            incidents = self.detection_pipeline.list_incidents(limit=limit)
+        return [incident.model_dump(mode="json") for incident in incidents]
+
+    def get_incident(self, incident_id: str) -> Dict:
+        """Return one incident belief by ID."""
+        for incident in self.get_incidents(limit=50):
+            if incident["incident_id"] == incident_id:
+                return incident
+        raise KeyError(incident_id)
+
+    def get_belief_snapshot(self) -> Dict:
+        """Return contextual belief snapshot."""
+        with self._lock:
+            return self.detection_pipeline.belief_engine.create_snapshot().model_dump(
+                mode="json"
+            )
+
+    def recompute_belief(self, entity_id: str, reference_time: datetime | None) -> Dict:
+        """Recompute one entity belief from retained evidence."""
+        with self._lock:
+            if reference_time is None:
+                reference_time = (
+                    self.detection_pipeline.belief_engine.last_updated
+                    or self.twin.last_event_time
+                    or datetime.now().astimezone()
+                )
+            belief = self.detection_pipeline.recompute_entity(
+                entity_id,
+                reference_time,
+            )
+        return belief.model_dump(mode="json")
+
     def get_belief_all(self) -> Dict:
         """Get belief states for all tracked hosts."""
         with self._lock:
@@ -472,6 +567,10 @@ class MIRAGEStateManager:
                                 "target": dst,
                                 "action": action,
                                 "probability": round(prob, 3),
+                                "contextual_risk": self.graph.edge_metadata.get(
+                                    key,
+                                    {},
+                                ),
                             })
 
             return {
@@ -754,6 +853,13 @@ class MIRAGEStateManager:
                 "decisions_made": len(self.decision_history),
                 "pending_approvals": len(self.pending_decisions),
                 "ws_connections": len(self.ws_connections),
+                "detection_events": self.detection_pipeline.timeline_store.event_count(),
+                "detection_belief_version": (
+                    self.detection_pipeline.belief_engine.version
+                ),
+                "detection_evidence": len(
+                    self.detection_pipeline.belief_engine.evidence
+                ),
                 "decision_backend": self.config.get("api", {}).get(
                     "decision_backend", "robust"
                 ),
@@ -909,6 +1015,16 @@ def create_app() -> Any:
                 "GET  /api/v1/twin/assets/{asset_id}",
                 "GET  /api/v1/twin/subgraph",
                 "POST /api/v1/twin/replay",
+                "POST /api/v1/detection/events",
+                "POST /api/v1/detection/events/batch",
+                "GET  /api/v1/detection/entities/{entity_id}",
+                "GET  /api/v1/detection/entities/{entity_id}/timeline",
+                "GET  /api/v1/detection/entities/{entity_id}/evidence",
+                "GET  /api/v1/detection/suspicious",
+                "GET  /api/v1/detection/incidents",
+                "GET  /api/v1/detection/incidents/{incident_id}",
+                "GET  /api/v1/belief/snapshot",
+                "POST /api/v1/belief/recompute",
                 "WS   /ws",
             ],
         }
@@ -1286,6 +1402,9 @@ def create_app() -> Any:
             summary.invalid_events = len(invalid)
             with state._lock:
                 state.twin = fresh_twin
+                state.detection_pipeline = state._build_detection_pipeline(
+                    fresh_twin
+                )
             snapshot = fresh_twin.create_snapshot().model_dump(mode="json")
             response = {
                 "summary": summary.model_dump(mode="json"),
@@ -1296,6 +1415,165 @@ def create_app() -> Any:
             return response
         except (OSError, TypeError, ValueError, ValidationError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post(
+        "/api/v1/detection/events",
+        summary="Process one event through Contextual Detection V1",
+        description=(
+            "Normalizes one canonical or generic event, updates entity "
+            "timelines, rules, evidence, correlations, belief, and graph risk."
+        ),
+    )
+    async def ingest_detection_event(payload: Annotated[Any, Body()]):
+        """Process one event through contextual detection."""
+        try:
+            result = await asyncio.to_thread(state.process_detection_event, payload)
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        await state.broadcast_ws({"type": "detection_update", "data": result})
+        return result
+
+    @app.post(
+        "/api/v1/detection/events/batch",
+        summary="Process a batch through Contextual Detection V1",
+        description="Reports per-event failures without failing the full batch.",
+    )
+    async def ingest_detection_event_batch(payload: Annotated[Any, Body()]):
+        """Process a list of events through contextual detection."""
+        if not isinstance(payload, list):
+            raise HTTPException(
+                status_code=422,
+                detail="Batch payload must be a list of event objects.",
+            )
+        max_batch_size = int(api_config.get("max_batch_size", 1000))
+        if len(payload) > max_batch_size:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Batch exceeds api.max_batch_size={max_batch_size}.",
+            )
+        results = []
+        failures = []
+        for index, raw_event in enumerate(payload):
+            try:
+                result = await asyncio.to_thread(
+                    state.process_detection_event,
+                    raw_event,
+                )
+                results.append({"index": index, "result": result})
+            except (TypeError, ValueError, ValidationError) as exc:
+                failures.append({"index": index, "error": str(exc)})
+        response = {
+            "processed": len(results),
+            "failed": len(failures),
+            "results": results,
+            "failures": failures,
+        }
+        if results:
+            await state.broadcast_ws(
+                {"type": "detection_batch_update", "data": response}
+            )
+        return response
+
+    @app.get(
+        "/api/v1/detection/entities/{entity_id}",
+        summary="Get contextual belief for one entity",
+    )
+    async def get_detection_entity(entity_id: str):
+        """Return one EntityBelief or 404."""
+        try:
+            return state.get_detection_entity(entity_id)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Entity '{entity_id}' was not found in belief state.",
+            ) from exc
+
+    @app.get(
+        "/api/v1/detection/entities/{entity_id}/timeline",
+        summary="Get sanitized entity timeline",
+    )
+    async def get_detection_entity_timeline(
+        entity_id: str,
+        limit: Annotated[int, Query(ge=1, le=1000)] = int(
+            config.get("detection", {}).get("api_timeline_limit", 100)
+        ),
+    ):
+        """Return bounded timeline entries without raw sensitive payloads."""
+        return {
+            "entity_id": entity_id,
+            "events": state.get_detection_timeline(entity_id, limit),
+        }
+
+    @app.get(
+        "/api/v1/detection/entities/{entity_id}/evidence",
+        summary="Get evidence for one entity",
+    )
+    async def get_detection_entity_evidence(entity_id: str):
+        """Return explainable evidence items for one entity."""
+        return {
+            "entity_id": entity_id,
+            "evidence": state.get_detection_evidence(entity_id),
+        }
+
+    @app.get(
+        "/api/v1/detection/suspicious",
+        summary="Get top suspected entities",
+    )
+    async def get_detection_suspicious(
+        limit: Annotated[int, Query(ge=1, le=1000)] = 20,
+    ):
+        """Return top entity beliefs ordered by compromise probability."""
+        return {"entities": state.get_suspicious_entities(limit)}
+
+    @app.get(
+        "/api/v1/detection/incidents",
+        summary="Get current incident beliefs",
+    )
+    async def get_detection_incidents(
+        limit: Annotated[int, Query(ge=1, le=100)] = 10,
+    ):
+        """Return current incident-level beliefs."""
+        return {"incidents": state.get_incidents(limit)}
+
+    @app.get(
+        "/api/v1/detection/incidents/{incident_id}",
+        summary="Get one incident belief",
+    )
+    async def get_detection_incident(incident_id: str):
+        """Return one IncidentBelief or 404."""
+        try:
+            return state.get_incident(incident_id)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Incident '{incident_id}' was not found.",
+            ) from exc
+
+    @app.get(
+        "/api/v1/belief/snapshot",
+        summary="Get Contextual Belief V1 snapshot",
+    )
+    async def get_contextual_belief_snapshot():
+        """Return a serializable BeliefSnapshot."""
+        return state.get_belief_snapshot()
+
+    @app.post(
+        "/api/v1/belief/recompute",
+        summary="Recompute contextual belief for one entity",
+    )
+    async def recompute_contextual_belief(request: BeliefRecomputeRequest):
+        """Recompute one entity from retained evidence."""
+        try:
+            return await asyncio.to_thread(
+                state.recompute_belief,
+                request.entity_id,
+                request.reference_time,
+            )
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Entity '{request.entity_id}' was not found.",
+            ) from exc
 
     # ---- WebSocket ----
 

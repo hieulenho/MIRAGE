@@ -148,6 +148,7 @@ class MIRAGEAttackGraph:
     belief_state: Dict[int, float] = field(default_factory=dict)  # P(attacker at node s)
     active_decoy_sites: List[int] = field(default_factory=list)
     decoy_transition_templates: Dict[Tuple[int, str], Dict[int, float]] = field(default_factory=dict)
+    edge_metadata: Dict[Tuple[int, int, str], Dict] = field(default_factory=dict)
 
     @classmethod
     def from_twin_snapshot(cls, snapshot) -> "MIRAGEAttackGraph":
@@ -251,6 +252,85 @@ class MIRAGEAttackGraph:
         total = sum(new_belief.values())
         if total > 0:
             self.belief_state = {s: v / total for s, v in new_belief.items()}
+
+    def apply_belief_snapshot(self, belief_snapshot) -> None:
+        """Attach contextual detection risk without rewriting topology."""
+        entity_to_belief = dict(belief_snapshot.entity_beliefs)
+        contextual_distribution: Dict[int, float] = {}
+        for state in sorted(self.states):
+            metadata = self.node_metadata.setdefault(state, {})
+            entity_id = metadata.get("source_entity_id")
+            if not entity_id or entity_id not in entity_to_belief:
+                continue
+            belief = entity_to_belief[entity_id]
+            direct_count = 0
+            inferred_count = 0
+            for evidence_id in belief.evidence_ids:
+                evidence = belief_snapshot.evidence.get(evidence_id)
+                if evidence is None:
+                    continue
+                if evidence.attributes.get("inferred"):
+                    inferred_count += 1
+                else:
+                    direct_count += 1
+            metadata.update({
+                "compromise_probability": belief.compromise_probability,
+                "stage_distribution": dict(belief.stage_distribution),
+                "most_likely_stage": belief.most_likely_stage,
+                "belief_confidence": belief.confidence,
+                "belief_uncertainty": belief.uncertainty,
+                "last_belief_update": belief.last_updated.isoformat(),
+                "direct_evidence_count": direct_count,
+                "inferred_evidence_count": inferred_count,
+            })
+            if state != self.sink_state:
+                contextual_distribution[state] = (
+                    belief.candidate_attacker_location_probability
+                )
+
+        total = sum(contextual_distribution.values())
+        if total > 0:
+            for state, value in contextual_distribution.items():
+                self.belief_state[state] = value / total
+
+        for source in sorted(self.transitions):
+            source_entity = self.node_metadata.get(source, {}).get("source_entity_id")
+            source_belief = entity_to_belief.get(source_entity)
+            for action in sorted(self.transitions.get(source, {})):
+                for target in sorted(self.transitions[source][action]):
+                    target_entity = self.node_metadata.get(target, {}).get(
+                        "source_entity_id"
+                    )
+                    target_belief = entity_to_belief.get(target_entity)
+                    source_risk = (
+                        source_belief.compromise_probability
+                        if source_belief is not None
+                        else 0.0
+                    )
+                    target_risk = (
+                        target_belief.compromise_probability
+                        if target_belief is not None
+                        else 0.0
+                    )
+                    active_risk = max(source_risk * 0.4, target_risk)
+                    if active_risk <= 0:
+                        continue
+                    self.edge_metadata[(source, target, action)] = {
+                        "active_risk": active_risk,
+                        "recently_observed": bool(source_belief or target_belief),
+                        "relationship_confidence": self.transitions[source][action][target],
+                        "lateral_movement_likelihood": (
+                            active_risk
+                            if action in {
+                                "connects_to",
+                                "authenticated_to",
+                                "smb_move",
+                                "rdp_move",
+                            }
+                            else active_risk * 0.5
+                        ),
+                        "last_observed": belief_snapshot.timestamp.isoformat(),
+                    }
 
     def increase_edge_cost(self, src: int, dst: int, cost_delta: float) -> None:
         """Tăng chi phí di chuyển trên một edge cụ thể (Deception action)."""
@@ -445,6 +525,7 @@ def apply_runtime_graph_in_place(
     graph.transitions = runtime.transitions
     graph.active_decoy_sites = runtime.active_decoy_sites
     graph.edge_costs = runtime.edge_costs
+    graph.edge_metadata = runtime.edge_metadata
     graph.node_metadata = runtime.node_metadata
     graph.defender_reward = runtime.defender_reward
     return graph
