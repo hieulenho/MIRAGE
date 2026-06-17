@@ -13,6 +13,7 @@ env/
 .uv-cache/
 .pytest_cache/
 .ruff_cache/
+tmp_pytest/
 .env/
 
 # Distribution / packaging
@@ -36,6 +37,7 @@ Desktop.ini
 # Results (generated at runtime)
 results/
 models/
+artifacts/
 
 # Logs
 *.log

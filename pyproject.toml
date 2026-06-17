@@ -1,0 +1,11 @@
+[tool.ruff]
+exclude = [
+    ".git",
+    ".python",
+    ".ruff_cache",
+    ".venv",
+    ".venv-dev",
+    "__pycache__",
+    "tmp_pytest",
+]
+

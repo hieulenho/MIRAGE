@@ -760,3 +760,160 @@ Dự án này được phát hành theo giấy phép **MIT License**.
 **MIRAGE Research Team**
 
 > *"The best defense is a good deception."*
+---
+
+## Milestone 1: Digital Twin V1 and Canonical Events
+
+MIRAGE now includes the first production-oriented event foundation while
+preserving the original static research simulator. The new flow is:
+
+```text
+Telemetry JSONL
+  -> event normalization
+  -> entity resolution
+  -> asset and identity registry
+  -> Digital Twin state update
+  -> current MIRAGE attack graph export
+  -> JSON snapshot storage
+  -> deterministic replay
+```
+
+### What Digital Twin V1 Does
+
+- Defines canonical Pydantic schemas for `SecurityEvent`, `Asset`,
+  `Identity`, `Relationship`, and `TwinSnapshot`.
+- Streams local JSONL events without loading the full file into memory.
+- Supports tolerant and strict ingestion modes.
+- Resolves assets and identities deterministically using explicit IDs first,
+  then agent/cloud IDs, hostname/domain, IP, and provisional IDs.
+- Updates an in-memory twin registry with versioning, duplicate-event
+  handling, relationship TTL/expiry, warnings, and JSON snapshots.
+- Exports active twin relationships into the existing `MIRAGEAttackGraph`
+  representation via `MIRAGEAttackGraph.from_twin_snapshot(snapshot)`.
+- Adds FastAPI endpoints under `/api/v1/*` for canonical event ingestion,
+  twin status, snapshots, assets, subgraphs, and replay.
+
+### What It Does Not Do Yet
+
+- No Kafka, SIEM, EDR, cloud, Neo4j, Redis, or Kubernetes connectors.
+- No production authentication/RBAC for the new twin API beyond any existing
+  deployment wrapper. Put the API behind trusted controls before real use.
+- No LLM, GNN, contextual-AI upgrade, or MARL implementation in this milestone.
+- The twin is in-memory by design; snapshots are JSON files.
+- The twin may be incomplete or stale because it only knows what ingested
+  events say.
+
+### Canonical JSONL Example
+
+```json
+{"event_id":"evt-001","event_time":"2026-06-17T08:00:00Z","ingest_time":"2026-06-17T08:00:01Z","source":"synthetic-edr","event_type":"asset_discovered","asset_id":"asset:host:ws-fin-01","src_ip":"10.10.20.15","confidence":0.98,"attributes":{"hostname":"ws-fin-01","asset_type":"workstation","environment":"finance"}}
+```
+
+Supported generic event mappings include `process_start`,
+`authentication_success`, `authentication_failure`, `network_connection`,
+`dns_query`, `file_access`, `credential_use`, `deception_interaction`,
+`asset_discovered`, and `vulnerability_observed`.
+
+### Replay CLI
+
+```bash
+python -m mirage replay \
+  --events examples/events/sample_attack.jsonl \
+  --snapshot-out artifacts/twin_snapshot.json \
+  --graph-out artifacts/twin_attack_graph.json
+```
+
+Example output:
+
+```text
+MIRAGE Digital Twin replay complete
+  events processed:          10
+  invalid events:            0
+  assets created/updated:    6/10
+  identities created/updated: 2/2
+  relationships created/updated: 10/0
+  expired relationships:     0
+  final twin version:        10
+```
+
+Replay ordering defaults to `(event_time, event_id)` for deterministic output.
+Use `--preserve-file-order` when file order is intentional.
+
+### API Examples
+
+Start the API:
+
+```bash
+python -m mirage.api_server
+```
+
+Ingest one canonical event:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/events \
+  -H "Content-Type: application/json" \
+  -d '{"event_id":"evt-doc-1","event_time":"2026-06-17T08:00:00Z","ingest_time":"2026-06-17T08:00:01Z","source":"docs","event_type":"asset_discovered","asset_id":"asset:host:doc-ws","confidence":0.9,"attributes":{"hostname":"doc-ws","asset_type":"workstation"}}'
+```
+
+Example response:
+
+```json
+{
+  "event_id": "evt-doc-1",
+  "event_type": "asset_discovered",
+  "duplicate": false,
+  "assets_created": ["asset:host:doc-ws"],
+  "twin_version": 1
+}
+```
+
+Check status:
+
+```bash
+curl http://localhost:8000/api/v1/twin/status
+```
+
+### Configuration
+
+Digital Twin V1 uses the existing `config.json` and `mirage.config` loader:
+
+```json
+"twin": {
+  "relationship_ttls": {
+    "connects_to": 3600,
+    "authenticated_to": 86400
+  },
+  "snapshot_path": "artifacts/twin_snapshot.json",
+  "ingestion_strict": false,
+  "max_batch_size": 1000,
+  "replay_ordering": "event_time",
+  "allow_provisional_entities": true,
+  "logging_level": "INFO"
+}
+```
+
+### Migration Notes
+
+- Static topology remains the default path through `build_configured_attack_graph()`.
+- Twin-based topology is opt-in through replay/API and graph export.
+- Existing Layer 1-6 simulator behavior and benchmarks are not replaced.
+- Use the twin graph for event-derived topology; use the static graph for
+  reproducible research benchmarks.
+
+### Tests
+
+```bash
+python -m pytest -q
+python -m ruff check .
+python -m compileall -q mirage run_mirage.py tests
+node --check mirage/dashboard/app.js
+```
+
+Known limitations:
+
+- In-memory API state is not shared across multiple workers.
+- Relationship TTL defaults are simple heuristics.
+- Entity resolution is deterministic but conservative; ambiguous IP matches
+  produce warnings instead of automatic merges.
+- Persistent storage, real connectors, stronger auth/RBAC, GNN, contextual AI,
+  and MARL are planned for later milestones.

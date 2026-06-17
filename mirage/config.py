@@ -64,6 +64,25 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "auto_deploy": True,
         "api_key_env": "MIRAGE_API_KEY",
     },
+    "twin": {
+        "relationship_ttls": {
+            "connects_to": 3600,
+            "authenticated_to": 86400,
+            "auth_failed_to": 3600,
+            "uses_credential_on": 86400,
+            "accessed_file_on": 3600,
+            "ran_process_on": 3600,
+            "has_vulnerability": 604800,
+            "interacted_with_decoy": 604800,
+            "resolved_dns_to": 3600,
+        },
+        "snapshot_path": "artifacts/twin_snapshot.json",
+        "ingestion_strict": False,
+        "max_batch_size": 1000,
+        "replay_ordering": "event_time",
+        "allow_provisional_entities": True,
+        "logging_level": "INFO",
+    },
 }
 
 
@@ -191,6 +210,25 @@ def _validate_config(config: Dict[str, Any]) -> None:
         raise ValueError("api.decision_backend must be 'robust' or 'rl'")
     if not isinstance(config["api"]["cors_origins"], list):
         raise ValueError("api.cors_origins must be a list")
+
+    twin = config["twin"]
+    if not isinstance(twin["relationship_ttls"], dict):
+        raise ValueError("twin.relationship_ttls must be an object")
+    for name, ttl in twin["relationship_ttls"].items():
+        if int(ttl) < 0:
+            raise ValueError(f"twin.relationship_ttls.{name} must be >= 0")
+    if int(twin["max_batch_size"]) < 1:
+        raise ValueError("twin.max_batch_size must be at least 1")
+    if str(twin["replay_ordering"]).lower() not in {"event_time", "file"}:
+        raise ValueError("twin.replay_ordering must be 'event_time' or 'file'")
+    if str(twin["logging_level"]).upper() not in {
+        "DEBUG",
+        "INFO",
+        "WARNING",
+        "ERROR",
+        "CRITICAL",
+    }:
+        raise ValueError("twin.logging_level must be a standard log level")
 
 
 def get_config_path(path: Optional[os.PathLike | str] = None) -> Path:

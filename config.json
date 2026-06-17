@@ -79,5 +79,24 @@
     "decision_samples": 60,
     "auto_deploy": true,
     "api_key_env": "MIRAGE_API_KEY"
+  },
+  "twin": {
+    "relationship_ttls": {
+      "connects_to": 3600,
+      "authenticated_to": 86400,
+      "auth_failed_to": 3600,
+      "uses_credential_on": 86400,
+      "accessed_file_on": 3600,
+      "ran_process_on": 3600,
+      "has_vulnerability": 604800,
+      "interacted_with_decoy": 604800,
+      "resolved_dns_to": 3600
+    },
+    "snapshot_path": "artifacts/twin_snapshot.json",
+    "ingestion_strict": false,
+    "max_batch_size": 1000,
+    "replay_ordering": "event_time",
+    "allow_provisional_entities": true,
+    "logging_level": "INFO"
   }
 }

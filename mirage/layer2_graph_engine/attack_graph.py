@@ -149,6 +149,15 @@ class MIRAGEAttackGraph:
     active_decoy_sites: List[int] = field(default_factory=list)
     decoy_transition_templates: Dict[Tuple[int, str], Dict[int, float]] = field(default_factory=dict)
 
+    @classmethod
+    def from_twin_snapshot(cls, snapshot) -> "MIRAGEAttackGraph":
+        """Build a MIRAGE attack graph from a Digital Twin snapshot."""
+        from mirage.layer6_twin.graph_adapter import (
+            attack_graph_from_twin_snapshot,
+        )
+
+        return attack_graph_from_twin_snapshot(snapshot)
+
     @property
     def name(self) -> str:
         return "mirage_enterprise_graph_v2"

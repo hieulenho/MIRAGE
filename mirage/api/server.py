@@ -50,6 +50,7 @@ try:
         Body,
         FastAPI,
         HTTPException,
+        Query,
         Request,
         WebSocket,
         WebSocketDisconnect,
@@ -68,6 +69,9 @@ from mirage.layer2_graph_engine.attack_graph import MIRAGEAttackGraph, build_con
 from mirage.layer3_deception.deception_fabric import DeceptionFabric
 from mirage.layer5_safe_control.safe_control import create_safety_gate
 from mirage.config import load_config, resolve_project_path
+from mirage.domain.schemas import SecurityEvent
+from mirage.ingestion.normalizer import EventNormalizer
+from mirage.layer6_twin.digital_twin import DigitalTwin
 from mirage import __version__
 
 LOGGER = logging.getLogger(__name__)
@@ -107,6 +111,13 @@ if HAS_FASTAPI:
 
     class ApprovalRequest(BaseModel):
         approved_by: str = Field(min_length=1, max_length=100)
+
+    class TwinReplayRequest(BaseModel):
+        """Replay request for Digital Twin V1."""
+        events_path: Optional[str] = None
+        events: Optional[List[Dict[str, Any]]] = None
+        preserve_file_order: bool = False
+        strict: bool = False
 
 
 def _parse_timestamp(value: Any) -> float:
@@ -316,6 +327,15 @@ class MIRAGEStateManager:
         )
         self._rl_bridge = None
 
+        twin_config = self.config.get("twin", {})
+        self.twin = DigitalTwin(
+            relationship_ttls=twin_config.get("relationship_ttls", {}),
+            allow_provisional_entities=bool(
+                twin_config.get("allow_provisional_entities", True)
+            ),
+        )
+        self.event_normalizer = EventNormalizer()
+
         # Metrics
         self.total_events_processed = 0
         self.start_time = time.time()
@@ -372,6 +392,26 @@ class MIRAGEStateManager:
         }
 
         return result
+
+    def apply_canonical_event(self, event: SecurityEvent) -> Dict:
+        """Apply one canonical event to the Digital Twin."""
+        with self._lock:
+            result = self.twin.apply_event(event)
+            return result.model_dump(mode="json")
+
+    def get_twin_status(self) -> Dict:
+        """Return Digital Twin health metadata."""
+        with self._lock:
+            status = self.twin.health()
+            status["coverage_score"] = self.twin.coverage_score()
+            status["freshness_score"] = self.twin.freshness_score()
+            status["warnings"] = list(self.twin.warnings[-20:])
+            return status
+
+    def get_twin_snapshot(self) -> Dict:
+        """Return a JSON-serializable Digital Twin snapshot."""
+        with self._lock:
+            return self.twin.create_snapshot().model_dump(mode="json")
 
     def get_belief_all(self) -> Dict:
         """Get belief states for all tracked hosts."""
@@ -862,6 +902,13 @@ def create_app() -> Any:
                 "GET  /api/decisions",
                 "POST /api/decide",
                 "POST /api/decisions/{id}/approve",
+                "POST /api/v1/events",
+                "POST /api/v1/events/batch",
+                "GET  /api/v1/twin/status",
+                "GET  /api/v1/twin/snapshot",
+                "GET  /api/v1/twin/assets/{asset_id}",
+                "GET  /api/v1/twin/subgraph",
+                "POST /api/v1/twin/replay",
                 "WS   /ws",
             ],
         }
@@ -1057,6 +1104,198 @@ def create_app() -> Any:
             "graph": state.get_graph_json(),
         })
         return record
+
+    @app.post(
+        "/api/v1/events",
+        summary="Ingest one canonical security event",
+        description=(
+            "Applies one canonical SecurityEvent to the in-memory Digital "
+            "Twin V1. Authentication is not part of Milestone 1; deploy "
+            "behind trusted controls before production use."
+        ),
+    )
+    async def ingest_canonical_event(event: SecurityEvent):
+        """Apply one canonical SecurityEvent to Digital Twin V1."""
+        result = await asyncio.to_thread(state.apply_canonical_event, event)
+        await state.broadcast_ws({"type": "twin_update", "data": result})
+        return result
+
+    @app.post(
+        "/api/v1/events/batch",
+        summary="Ingest a batch of canonical or generic security events",
+        description="Reports per-event failures without failing the full batch.",
+    )
+    async def ingest_canonical_event_batch(payload: Annotated[Any, Body()]):
+        """Apply a batch of canonical or normalizable event dictionaries."""
+        if not isinstance(payload, list):
+            raise HTTPException(
+                status_code=422,
+                detail="Batch payload must be a list of event objects.",
+            )
+        max_batch_size = int(
+            state.config.get("twin", {}).get("max_batch_size", 1000)
+        )
+        if len(payload) > max_batch_size:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Batch exceeds twin.max_batch_size={max_batch_size}.",
+            )
+
+        results = []
+        failures = []
+        for index, raw_event in enumerate(payload):
+            try:
+                event = (
+                    raw_event
+                    if isinstance(raw_event, SecurityEvent)
+                    else state.event_normalizer.normalize(raw_event)
+                )
+                result = await asyncio.to_thread(
+                    state.apply_canonical_event,
+                    event,
+                )
+                results.append({"index": index, "result": result})
+            except (TypeError, ValueError, ValidationError) as exc:
+                failures.append({"index": index, "error": str(exc)})
+
+        response = {
+            "processed": len(results),
+            "failed": len(failures),
+            "results": results,
+            "failures": failures,
+        }
+        if results:
+            await state.broadcast_ws({"type": "twin_batch_update", "data": response})
+        return response
+
+    @app.get(
+        "/api/v1/twin/status",
+        summary="Get Digital Twin V1 status",
+    )
+    async def get_twin_status():
+        """Return in-memory twin health and metadata."""
+        return state.get_twin_status()
+
+    @app.get(
+        "/api/v1/twin/snapshot",
+        summary="Get Digital Twin V1 snapshot",
+    )
+    async def get_twin_snapshot():
+        """Return a serializable TwinSnapshot."""
+        return state.get_twin_snapshot()
+
+    @app.get(
+        "/api/v1/twin/assets/{asset_id}",
+        summary="Get one Digital Twin asset",
+    )
+    async def get_twin_asset(asset_id: str):
+        """Return one canonical asset or 404."""
+        with state._lock:
+            asset = state.twin.get_asset(asset_id)
+        if asset is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Asset '{asset_id}' was not found.",
+            )
+        return asset.model_dump(mode="json")
+
+    @app.get(
+        "/api/v1/twin/subgraph",
+        summary="Get a small Digital Twin relationship neighborhood",
+    )
+    async def get_twin_subgraph(
+        entity_ids: Annotated[
+            str,
+            Query(description="Comma-separated entity IDs."),
+        ],
+        hops: Annotated[int, Query(ge=0, le=5)] = 2,
+    ):
+        """Return a subgraph around one or more entity IDs."""
+        ids = [item.strip() for item in entity_ids.split(",") if item.strip()]
+        if not ids:
+            raise HTTPException(
+                status_code=422,
+                detail="At least one entity_id is required.",
+            )
+        with state._lock:
+            subgraph = state.twin.get_subgraph(ids, hops=hops)
+        return {
+            "entities": subgraph["entities"],
+            "assets": {
+                key: value.model_dump(mode="json")
+                for key, value in subgraph["assets"].items()
+            },
+            "identities": {
+                key: value.model_dump(mode="json")
+                for key, value in subgraph["identities"].items()
+            },
+            "relationships": [
+                relationship.model_dump(mode="json")
+                for relationship in subgraph["relationships"]
+            ],
+        }
+
+    @app.post(
+        "/api/v1/twin/replay",
+        summary="Replay events into a fresh in-memory Digital Twin",
+    )
+    async def replay_twin(request: TwinReplayRequest):
+        """Replay local JSONL or supplied event objects into the API twin."""
+        try:
+            from mirage.replay import sort_events_for_replay
+
+            events = []
+            invalid = []
+            if request.events_path:
+                from mirage.ingestion.jsonl_source import JSONLEventSource
+
+                source = JSONLEventSource(
+                    resolve_project_path(request.events_path),
+                    strict=request.strict,
+                    normalizer=state.event_normalizer,
+                )
+                events.extend(list(source))
+                invalid.extend(
+                    {
+                        "line_number": error.line_number,
+                        "error": error.error,
+                    }
+                    for error in source.errors
+                )
+            if request.events:
+                for index, raw_event in enumerate(request.events):
+                    try:
+                        events.append(state.event_normalizer.normalize(raw_event))
+                    except (TypeError, ValueError, ValidationError) as exc:
+                        if request.strict:
+                            raise
+                        invalid.append({"index": index, "error": str(exc)})
+
+            ordered_events = sort_events_for_replay(
+                events,
+                preserve_file_order=request.preserve_file_order,
+            )
+            twin_config = state.config.get("twin", {})
+            fresh_twin = DigitalTwin(
+                relationship_ttls=twin_config.get("relationship_ttls", {}),
+                allow_provisional_entities=bool(
+                    twin_config.get("allow_provisional_entities", True)
+                ),
+            )
+            summary = fresh_twin.apply_events(ordered_events)
+            summary.invalid_events = len(invalid)
+            with state._lock:
+                state.twin = fresh_twin
+            snapshot = fresh_twin.create_snapshot().model_dump(mode="json")
+            response = {
+                "summary": summary.model_dump(mode="json"),
+                "invalid": invalid,
+                "snapshot": snapshot,
+            }
+            await state.broadcast_ws({"type": "twin_replay", "data": response})
+            return response
+        except (OSError, TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # ---- WebSocket ----
 
