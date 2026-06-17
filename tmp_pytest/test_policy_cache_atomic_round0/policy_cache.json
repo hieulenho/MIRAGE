@@ -1,0 +1,13 @@
+{
+  "Discovery::entry::expected::2.00": {
+    "stage": "Discovery",
+    "belief_key": "entry",
+    "criterion": "expected",
+    "budget": 2.0,
+    "action_ids": [],
+    "metrics": {
+      "expected_value": 0.1
+    },
+    "created_at": 1.0
+  }
+}

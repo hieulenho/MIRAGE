@@ -1,4 +1,4 @@
-from mirage.policy_cache import (
+from mirage.layer4_decision.policy_cache import (
     CachedPolicy,
     OnlinePolicyController,
     PolicyCache,

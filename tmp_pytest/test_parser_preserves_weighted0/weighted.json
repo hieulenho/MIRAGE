@@ -1,0 +1,1 @@
+{"nodes": [{"id": 0, "start_probability": 1}, {"id": 1, "start_probability": 3}, {"id": 2, "goal": true}], "edges": [{"src": 0, "dst": 2, "action": "move", "prob": 1}, {"src": 1, "dst": 2, "action": "move", "prob": 1}]}

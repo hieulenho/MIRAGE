@@ -2,9 +2,9 @@ import json
 
 import pytest
 
-from mirage.graph_parser import load_attack_graph, save_graph_to_json
-from mirage.layer2_attack_graph import build_runtime_graph
-from mirage.layer3_deception import DeceptionFabric
+from mirage.layer2_graph_engine.graph_parser import load_attack_graph, save_graph_to_json
+from mirage.layer2_graph_engine.attack_graph import build_runtime_graph
+from mirage.layer3_deception.deception_fabric import DeceptionFabric
 
 
 def test_dynamic_graph_keeps_decoy_slots_inactive():

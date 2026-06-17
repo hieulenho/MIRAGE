@@ -1,7 +1,7 @@
 import pytest
 
-from mirage.attacker_agents import RandomAttacker, run_simulation
-from mirage.layer2_attack_graph import build_enterprise_attack_graph
+from mirage.shared.attacker_agents import RandomAttacker, run_simulation
+from mirage.layer2_graph_engine.attack_graph import build_enterprise_attack_graph
 
 
 def test_attacker_samples_configured_start_distribution():

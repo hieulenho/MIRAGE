@@ -1,5 +1,5 @@
-from mirage.graph_parser import load_attack_graph
-from mirage.layer6_evaluation import MIRAGEEvaluator
+from mirage.layer2_graph_engine.graph_parser import load_attack_graph
+from mirage.layer6_twin.evaluation import MIRAGEEvaluator
 
 
 def test_dynamic_graph_benchmark_inputs_reference_valid_nodes(tmp_path):

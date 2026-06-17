@@ -824,7 +824,7 @@ def create_app() -> Any:
         return response
 
     # Serve dashboard static files
-    dashboard_dir = os.path.join(os.path.dirname(__file__), "dashboard")
+    dashboard_dir = os.path.join(os.path.dirname(__file__), "..", "dashboard")
     if os.path.isdir(dashboard_dir):
         @app.get("/dashboard")
         async def dashboard_index():

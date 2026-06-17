@@ -1,11 +1,11 @@
 import pytest
-from mirage.layer2_attack_graph import (
+from mirage.layer2_graph_engine.attack_graph import (
     build_configured_attack_graph,
     build_enterprise_attack_graph,
     build_runtime_graph,
 )
 from mirage.config import load_config
-from mirage.layer3_deception import (
+from mirage.layer3_deception.deception_fabric import (
     DeceptionAction,
     DeceptionActionType,
     DeceptionFabric,

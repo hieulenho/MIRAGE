@@ -1,12 +1,12 @@
 import pytest
 
-from mirage.layer1_attack_modeling import (
+from mirage.layer1_contextual_ai.attack_modeling import (
     AttackStage,
     AttackStageClassifier,
     TelemetryEvent,
 )
-from mirage.layer1_hmm import HMMTelemetryClassifier
-from mirage.layer2_attack_graph import build_enterprise_attack_graph
+from mirage.layer1_contextual_ai.hmm_classifier import HMMTelemetryClassifier
+from mirage.layer2_graph_engine.attack_graph import build_enterprise_attack_graph
 
 
 def _event(event_type, success=True):

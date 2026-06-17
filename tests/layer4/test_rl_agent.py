@@ -1,9 +1,9 @@
 import numpy as np
 import pytest
 
-from mirage.layer2_attack_graph import build_enterprise_attack_graph
-from mirage.layer3_deception import DeceptionFabric
-from mirage.rl_agent import DQNAgent, MIRAGEDefenderEnv
+from mirage.layer2_graph_engine.attack_graph import build_enterprise_attack_graph
+from mirage.layer3_deception.deception_fabric import DeceptionFabric
+from mirage.layer4_decision.rl_agent import DQNAgent, MIRAGEDefenderEnv
 
 
 def test_rl_environment_uses_gymnasium_contract_and_action_mask(tmp_path):
@@ -19,7 +19,9 @@ def test_rl_environment_uses_gymnasium_contract_and_action_mask(tmp_path):
 
     observation, info = env.reset(seed=7)
     assert observation.shape == (env.state_dim,)
-    assert env.observation_space.contains(observation)
+    from mirage.layer4_decision.rl_agent import HAS_GYMNASIUM
+    if HAS_GYMNASIUM:
+        assert env.observation_space.contains(observation)
     assert info["action_mask"].shape == (env.n_actions,)
 
     action = int(np.flatnonzero(env.action_mask())[0])

@@ -5,9 +5,9 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from mirage.api_server import create_app
-from mirage.layer4_decision_engine import ActionPlan, RobustDecisionEngine
-from mirage.mdp_solver import compute_composite_cost
+from mirage.api.server import create_app
+from mirage.layer4_decision.decision_engine import ActionPlan, RobustDecisionEngine
+from mirage.layer2_graph_engine.mdp_solver import compute_composite_cost
 
 
 def test_dashboard_and_static_assets_are_served():

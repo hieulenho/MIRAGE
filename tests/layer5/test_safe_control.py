@@ -1,9 +1,9 @@
-from mirage.layer5_safe_control import (
+from mirage.layer5_safe_control.safe_control import (
     RiskLevel,
     create_safety_gate,
     make_safety_filter,
 )
-from mirage.layer3_deception import DeceptionAction, DeceptionActionType
+from mirage.layer3_deception.deception_fabric import DeceptionAction, DeceptionActionType
 
 class MockPlan:
     def __init__(self, action, target_node, label, pess_val, confidence):

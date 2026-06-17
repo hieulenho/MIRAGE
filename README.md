@@ -144,26 +144,39 @@ MIRAGE/
 └── mirage/                         # Package chính
     ├── __init__.py                 # Package metadata (v2.0.0)
     ├── config.py                   # Configuration loader trung tâm
+    ├── dashboard/                  # Web dashboard (index.html, app.js, style.css)
     │
-    ├── layer1_attack_modeling.py   # Layer 1: Phân loại giai đoạn tấn công
-    ├── layer1_hmm.py               # HMM + ensemble telemetry classifier
-    ├── layer2_attack_graph.py      # Layer 2: Đồ thị tấn công POMDP 15 node
-    ├── graph_parser.py             # Parser MIRAGE/BloodHound/Nmap JSON
-    ├── layer3_deception.py         # Layer 3: Deception Fabric
-    ├── layer4_decision_engine.py   # Layer 4: Robust Decision Engine
-    ├── mdp_solver.py               # Exact MDP math và scaling utilities
-    ├── rl_agent.py                 # Deep Q-Network + Gymnasium environment
-    ├── policy_cache.py             # Cache policy cho đường xử lý online
-    ├── layer5_safe_control.py      # Layer 5: Safety Gate
-    ├── layer6_evaluation.py        # Layer 6: Benchmark & Evaluation
-    ├── api_server.py               # FastAPI REST/WebSocket orchestration
-    ├── attacker_mitre.py           # MITRE ATT&CK evasion attacker
-    ├── dashboard/                  # Web dashboard
-    ├── utils/
-    │   ├── mdp_model.py            # Portable AttackGraphMDP compatibility model
-    │   └── robust_reward_design.py # In-package bounded reward allocation
+    ├── layer1_contextual_ai/       # Layer 1: Attack modeling & HMM classifier
+    │   ├── attack_modeling.py      # Phân loại giai đoạn tấn công (8 stages)
+    │   └── hmm_classifier.py      # HMM + Ensemble telemetry classifier
     │
-    └── attacker_agents.py          # Mô phỏng 6 loại kẻ tấn công
+    ├── layer2_graph_engine/        # Layer 2: Attack Graph & MDP core
+    │   ├── attack_graph.py         # Đồ thị tấn công POMDP 15 node
+    │   ├── graph_parser.py         # Parser MIRAGE/BloodHound/Nmap JSON
+    │   └── mdp_solver.py           # Exact MDP math và scaling utilities
+    │
+    ├── layer3_deception/           # Layer 3: Deception Fabric
+    │   └── deception_fabric.py     # Fake DB, Router, Honey Credential
+    │
+    ├── layer4_decision/            # Layer 4: Decision Engine & RL
+    │   ├── decision_engine.py      # Robust Decision Engine
+    │   ├── rl_agent.py             # Deep Q-Network + Gymnasium environment
+    │   └── policy_cache.py         # Cache policy cho đường xử lý online
+    │
+    ├── layer5_safe_control/        # Layer 5: Safety Gate
+    │   └── safe_control.py         # 7 guardrails + audit log + fail-safe
+    │
+    ├── layer6_twin/                # Layer 6: Evaluation & Benchmark
+    │   └── evaluation.py           # So sánh 6 phương pháp + Ablation Study
+    │
+    ├── api/                        # FastAPI REST/WebSocket server
+    │   └── server.py               # Orchestration, ingestion, dashboard serve
+    │
+    └── shared/                     # Shared utilities
+        ├── attacker_agents.py      # Mô phỏng 6 loại kẻ tấn công
+        └── models/
+            ├── mdp_model.py        # Portable AttackGraphMDP model
+            └── robust_reward.py    # Bounded reward allocation solver
 ```
 
 ---
@@ -261,13 +274,13 @@ python run_mirage.py --mode train_rl --episodes 200
 Khởi động API:
 
 ```bash
-python -m mirage.api_server
+python -m mirage.api.server
 ```
 
 ASGI command một process:
 
 ```bash
-uvicorn mirage.api_server:create_app --factory --host 0.0.0.0 --port 8000
+uvicorn mirage.api.server:create_app --factory --host 0.0.0.0 --port 8000
 ```
 
 State telemetry, decision và WebSocket hiện được giữ trong memory của process.
@@ -395,7 +408,7 @@ Quick Comparison (3 methods):
 
 ## 🔬 Chi tiết từng Layer
 
-### Layer 1 — Multi-Stage Attack Modeling (`layer1_attack_modeling.py`, `layer1_hmm.py`)
+### Layer 1 — Multi-Stage Attack Modeling (`layer1_contextual_ai/attack_modeling.py`, `layer1_contextual_ai/hmm_classifier.py`)
 
 Kết hợp classifier rule-based với **Hidden Markov Model** theo chuỗi thời gian.
 Ensemble mặc định dùng trọng số HMM `0.6`, cấu hình tại `layer1.hmm_weight`.
@@ -438,7 +451,7 @@ events = simulate_attack_telemetry("honey_trap")        # Kẻ tấn công dính
 
 ---
 
-### Layer 2 — Enterprise Attack Graph / POMDP (`layer2_attack_graph.py`)
+### Layer 2 — Enterprise Attack Graph / POMDP (`layer2_graph_engine/attack_graph.py`)
 
 Mô hình mạng doanh nghiệp **15 node** dưới dạng **Markov Decision Process (MDP)**.
 
@@ -488,7 +501,7 @@ b'(s) ∝ P(obs | s) × b(s)
 
 ---
 
-### Layer 3 — Deception Fabric (`layer3_deception.py`)
+### Layer 3 — Deception Fabric (`layer3_deception/deception_fabric.py`)
 
 Triển khai và quản lý các tài sản mồi (deception assets).
 
@@ -504,8 +517,8 @@ Triển khai và quản lý các tài sản mồi (deception assets).
 **Ví dụ sử dụng:**
 
 ```python
-from mirage.layer2_attack_graph import build_enterprise_attack_graph
-from mirage.layer3_deception import DeceptionFabric, DeceptionActionType
+from mirage.layer2_graph_engine.attack_graph import build_enterprise_attack_graph
+from mirage.layer3_deception.deception_fabric import DeceptionFabric, DeceptionActionType
 
 graph = build_enterprise_attack_graph()
 fabric = DeceptionFabric(graph)
@@ -521,7 +534,7 @@ print(f"Deployed: {decoy.decoy_id}")
 
 ---
 
-### Layer 4 — Robust Decision Engine (`layer4_decision_engine.py`)
+### Layer 4 — Robust Decision Engine (`layer4_decision/decision_engine.py`)
 
 **"Bộ não"** của MIRAGE — chọn hành động tối ưu theo nguyên tắc **Robust Optimization** (tối đa hóa worst-case defender value).
 
@@ -553,7 +566,7 @@ Approval:    ✅ Auto-approved
 
 ---
 
-### Layer 5 — Safety Gate (`layer5_safe_control.py`)
+### Layer 5 — Safety Gate (`layer5_safe_control/safe_control.py`)
 
 **7 guardrails bắt buộc** kiểm tra trước khi bất kỳ hành động nào được thực thi:
 
@@ -582,7 +595,7 @@ Approval:    ✅ Auto-approved
 
 ---
 
-### Layer 6 — Evaluation & Benchmark (`layer6_evaluation.py`)
+### Layer 6 — Evaluation & Benchmark (`layer6_twin/evaluation.py`)
 
 So sánh hiệu quả của **6 phương pháp phòng thủ**:
 
@@ -603,7 +616,7 @@ So sánh hiệu quả của **6 phương pháp phòng thủ**:
 
 ---
 
-## 🤺 Mô phỏng Kẻ tấn công (`attacker_agents.py`)
+## 🤺 Mô phỏng Kẻ tấn công (`shared/attacker_agents.py`)
 
 6 loại kẻ tấn công với chiến thuật khác nhau:
 
@@ -637,20 +650,20 @@ trong seed trên; `robust_mirage` chọn portfolio rẻ và false-positive thấ
 Các phương pháp deception cùng bị chặn ở pessimistic value `-1.5333` bởi profile
 `shortest_path`, nên chưa thể kết luận MIRAGE thắng tuyệt đối từ một seed.
 
-**Ablation Study (`--mode ablation`, seed `42`, 75 evaluation episodes/variant):**
+**Ablation Study (`--mode ablation`, seed `42`, 75 evaluation episodes/variant, 6 attacker profiles):**
 
 ```
-Variant                 Cost    Pess.Val    Robustness Gap
-full_mirage             3.625    -1.0034        0.5643
-no_robust_objective     5.650    -1.0358        0.6736
-no_belief               2.030    -1.0358        0.5916
-no_edge_cost            2.030    -1.0358        0.5916
-no_deception_variety    2.030    -1.0358        0.5916
-no_cost_model           5.795    -1.0463        0.6283
-no_deception_aware      3.625    -1.0034        0.5643
+Variant                  Cost    Pess.Val    Robustness Gap   Portfolio
+full_mirage              2.030    -1.2311        0.5456       deploy_decoy_database@node11
+no_robust_objective      2.030    -1.2311        0.5456       deploy_decoy_database@node11
+no_belief                2.030    -1.2311        0.5456       deploy_decoy_database@node11
+no_edge_cost             2.030    -1.2311        0.5456       deploy_decoy_database@node11
+no_deception_variety     2.030    -1.2311        0.5456       deploy_decoy_database@node11
+no_cost_model            5.220    -1.2186        0.5912       node11 + edge4->9 + edge6->9
+no_deception_aware       2.030    -1.2311        0.5456       deploy_decoy_database@node11
 ```
 
-Chạy `--mode multi_seed` trước khi dùng các số liệu này cho kết luận nghiên cứu.
+> Số liệu trên từ lần chạy mới nhất với 6 attacker profiles (thêm `mitre_evasion`). `no_cost_model` mở rộng portfolio sang 3 action vì không bị penalise bởi cost model — đây là hành vi kỳ vọng. Chạy `--mode multi_seed` (3 seeds, 200 eps/method) để lấy mean ± std trước khi dùng cho kết luận nghiên cứu.
 
 ---
 
@@ -674,8 +687,9 @@ Các module tương thích đã nằm hoàn toàn trong package, không cần re
 solver bên ngoài:
 
 ```python
-from mirage.layer2_attack_graph import build_enterprise_attack_graph
-from mirage.utils import AttackGraphMDP, solve_max_margin_reward_design
+from mirage.layer2_graph_engine.attack_graph import build_enterprise_attack_graph
+from mirage.shared.models.mdp_model import AttackGraphMDP
+from mirage.shared.models.robust_reward import solve_max_margin_reward_design
 
 graph = build_enterprise_attack_graph()
 model = AttackGraphMDP.from_mirage_graph(graph)

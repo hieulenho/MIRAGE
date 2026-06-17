@@ -1,12 +1,12 @@
 import pytest
 
-from mirage.layer2_attack_graph import build_enterprise_attack_graph
-from mirage.utils.mdp_model import (
+from mirage.layer2_graph_engine.attack_graph import build_enterprise_attack_graph
+from mirage.shared.models.mdp_model import (
     AttackGraphMDP,
     InterventionSite,
     _parse_sa_key,
 )
-from mirage.utils.robust_reward_design import solve_max_margin_reward_design
+from mirage.shared.models.robust_reward import solve_max_margin_reward_design
 
 
 def _build_tiny_reward_design_mdp() -> AttackGraphMDP:
