@@ -1,0 +1,192 @@
+services:
+  mirage-control-plane:
+    image: python:3.11-slim
+    container_name: mirage-control-plane
+    command: ["python", "-m", "http.server", "8080"]
+    working_dir: /workspace
+    volumes:
+      - ../:/workspace:ro
+    networks:
+      - mirage-control
+      - mirage-workload
+      - mirage-decoy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8080), 2).close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+
+  attacker-simulator:
+    image: python:3.11-slim
+    command: ["python", "-c", "import time; print('synthetic attacker ready'); time.sleep(3600)"]
+    networks:
+      - mirage-workload
+    depends_on:
+      workstation:
+        condition: service_healthy
+      application-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "print('ok')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
+  workstation:
+    image: python:3.11-slim
+    command: ["python", "-m", "http.server", "8081"]
+    networks:
+      - mirage-workload
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8081), 2).close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
+  application-server:
+    image: python:3.11-slim
+    command: ["python", "-m", "http.server", "8082"]
+    networks:
+      - mirage-workload
+      - mirage-protected
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8082), 2).close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
+  real-database:
+    image: python:3.11-slim
+    command: ["python", "-m", "http.server", "5432"]
+    networks:
+      - mirage-protected
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 5432), 2).close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
+  decoy-database-template:
+    image: python:3.11-slim
+    command: ["python", "-m", "http.server", "15432"]
+    networks:
+      - mirage-decoy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 15432), 2).close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
+  fake-smb-template:
+    image: python:3.11-slim
+    command: ["python", "-m", "http.server", "1445"]
+    networks:
+      - mirage-decoy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 1445), 2).close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
+  mock-firewall:
+    image: python:3.11-slim
+    command: ["python", "-c", "import time; print('mock firewall ready'); time.sleep(3600)"]
+    networks:
+      - mirage-control
+      - mirage-workload
+      - mirage-decoy
+    healthcheck:
+      test: ["CMD", "python", "-c", "print('ok')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
+  mock-dns:
+    image: python:3.11-slim
+    command: ["python", "-m", "http.server", "5353"]
+    networks:
+      - mirage-control
+      - mirage-workload
+      - mirage-decoy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 5353), 2).close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
+  telemetry-collector:
+    image: python:3.11-slim
+    command: ["python", "-m", "http.server", "9000"]
+    networks:
+      - mirage-control
+      - mirage-workload
+      - mirage-decoy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 9000), 2).close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
+networks:
+  mirage-control:
+    driver: bridge
+    internal: true
+  mirage-workload:
+    driver: bridge
+    internal: true
+  mirage-decoy:
+    driver: bridge
+    internal: true
+  mirage-protected:
+    driver: bridge
+    internal: true

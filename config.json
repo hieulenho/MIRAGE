@@ -268,5 +268,79 @@
       "business_risk_weight": 0.4,
       "uncertainty_weight": 0.3
     }
+  },
+  "execution": {
+    "policy_version": "safety-v1",
+    "action_tiers": {
+      "increase_endpoint_logging": 0,
+      "increase_network_telemetry": 0,
+      "enable_limited_packet_capture": 0,
+      "enable_auth_auditing": 0,
+      "create_soc_ticket": 0,
+      "request_analyst_review": 0,
+      "deploy_decoy_host": 1,
+      "deploy_decoy_database": 1,
+      "deploy_fake_share": 1,
+      "scatter_honey_credential": 1,
+      "add_decoy_service": 1,
+      "create_fake_dns_record": 1,
+      "throttle_edge": 2,
+      "restrict_smb": 2,
+      "temporary_segmentation": 2,
+      "block_egress": 3,
+      "block_flow": 3,
+      "revoke_session": 3,
+      "isolate_host": 3,
+      "isolate_database": 4,
+      "block_subnet": 4,
+      "disable_privileged_identity": 4
+    },
+    "confidence_thresholds": {
+      "low": 0.20,
+      "medium": 0.35,
+      "high": 0.70,
+      "critical": 0.95
+    },
+    "protected_asset_ids": [],
+    "protected_asset_types": ["database", "dc", "domain_controller"],
+    "protected_criticality_threshold": 0.85,
+    "managed_environments": ["lab", "test", "dev", ""],
+    "management_channel_ids": [],
+    "twin_freshness_threshold": 0.35,
+    "graph_coverage_threshold": 0.20,
+    "blast_radius_limit": 5,
+    "action_budget": 6.0,
+    "default_ttl_seconds": 3600,
+    "maximum_ttl_seconds": 14400,
+    "approval_ttl_seconds": 900,
+    "rollback_required_tier": 2,
+    "reversible_required_tier": 2,
+    "tier3_auto_confidence": 0.98,
+    "adapters": {
+      "docker_decoy": true,
+      "mock_firewall": true,
+      "mock_edr": true,
+      "mock_iam": true,
+      "mock_dns": true,
+      "mock_telemetry": true,
+      "mock_ticket": true
+    },
+    "canary_timeout_seconds": 60,
+    "execution_timeout_seconds": 300,
+    "retries": 1,
+    "rollback_retries": 2,
+    "kill_switch": {
+      "default_enabled": false
+    },
+    "audit_path": "artifacts/execution_audit.jsonl",
+    "docker_templates": {
+      "decoy_database": "mirage-decoy-db-template",
+      "fake_smb": "mirage-fake-smb-template"
+    },
+    "lab_networks": {
+      "control": "mirage-control",
+      "workload": "mirage-workload",
+      "decoy": "mirage-decoy"
+    }
   }
 }

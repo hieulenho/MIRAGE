@@ -1306,3 +1306,139 @@ Safety Gate V1
 + Canary Execution
 + Rollback and Audit
 ```
+
+## Milestone 4: Safety Gate V1 and Lab Execution
+
+Milestone 4 converts a ranked `CandidateDefenseAction` and its `ActionMask`
+into a safe, auditable, reversible lab execution workflow:
+
+```text
+Candidate Action + Action Mask + Twin/Belief/Graph versions
+  -> Safety Gate V1
+  -> ExecutionPlan
+  -> prepare
+  -> canary
+  -> execute
+  -> verify
+  -> commit or rollback
+  -> audit + Digital Twin update
+```
+
+### What It Does
+
+- Adds canonical Pydantic models for `SafetyDecision`, `ExecutionPlan`,
+  `ExecutionRecord`, `ApprovalRecord`, kill-switch state, adapter results,
+  health checks, state transitions, and sanitized audit events.
+- Evaluates configurable Safety Gate V1 policies: masks, protected assets,
+  managed environment boundaries, confidence thresholds, Twin freshness,
+  graph coverage, blast radius, rollback/TTL requirements, budget, duplicate
+  active actions, adapter availability, attack-stage compatibility,
+  management-channel protection, and external/hack-back prevention.
+- Supports action tiers:
+  - Tier 0 observe: automatic.
+  - Tier 1 deception: automatic with monitoring.
+  - Tier 2 delay: strong confidence, TTL, rollback.
+  - Tier 3 limited containment: approval required in Milestone 4.
+  - Tier 4 high-risk containment: denied or recommendation-only.
+- Implements a deterministic execution state machine:
+  `PROPOSED -> VALIDATED -> AWAITING_APPROVAL -> PREPARED ->
+  CANARY_RUNNING -> EXECUTING -> VERIFYING -> SUCCEEDED -> EXPIRED`,
+  with failure rollback states `FAILED -> ROLLING_BACK -> ROLLED_BACK`.
+- Adds mock/lab adapters: `DockerDecoyAdapter`, `MockFirewallAdapter`,
+  `MockEDRAdapter`, `MockIAMAdapter`, `MockDNSAdapter`,
+  `MockTelemetryAdapter`, and `MockTicketAdapter`.
+- Runs canary checks before full execution. Canary or verification failure
+  triggers rollback automatically.
+- Adds TTL expiry, rollback manager, global/scoped kill switch, append-only
+  sanitized JSONL audit export, API endpoints, CLI commands, synthetic
+  scenarios, and a Docker Compose lab skeleton.
+- Updates the Digital Twin after successful lab execution and after rollback
+  or expiry. Updates are idempotent and retain provenance.
+
+### What It Does Not Do
+
+- No real firewall, EDR, IAM, Active Directory, cloud, Kubernetes, or Docker
+  daemon enforcement is called by the Python adapters.
+- No automatic high-risk containment.
+- No hack-back or external actions.
+- No Milestone 5 connectors.
+
+### CLI
+
+Evaluate safety:
+
+```bash
+python -m mirage safety-check \
+  --action artifacts/candidate_actions.json \
+  --twin artifacts/m3_twin.json \
+  --belief artifacts/m3_belief.json
+```
+
+Execute in the mock lab:
+
+```bash
+python -m mirage execute-plan \
+  --action artifacts/candidate_actions.json \
+  --twin artifacts/m3_twin.json \
+  --belief artifacts/m3_belief.json \
+  --lab \
+  --audit-out artifacts/execution_audit.jsonl
+```
+
+Status, rollback, and kill switch:
+
+```bash
+python -m mirage execution-status --execution-id <id>
+python -m mirage rollback --execution-id <id>
+python -m mirage kill-switch enable --actor soc --reason "maintenance"
+python -m mirage kill-switch disable --actor soc --reason "resume"
+```
+
+### API
+
+Milestone 4 endpoints:
+
+```text
+POST /api/v1/safety/evaluate
+POST /api/v1/executions/prepare
+POST /api/v1/executions/{id}/approve
+POST /api/v1/executions/{id}/execute
+POST /api/v1/executions/{id}/rollback
+GET  /api/v1/executions/{id}
+GET  /api/v1/executions
+GET  /api/v1/audit
+GET  /api/v1/kill-switch
+POST /api/v1/kill-switch/enable
+POST /api/v1/kill-switch/disable
+```
+
+Approval-required actions cannot execute until a valid non-expired
+`ApprovalRecord` exists. Repeated execute requests are idempotent.
+
+### Docker Lab
+
+The isolated lab is in `lab/docker-compose.yml`:
+
+```bash
+docker compose -f lab/docker-compose.yml up -d
+docker compose -f lab/docker-compose.yml down -v
+```
+
+The lab contains synthetic control-plane, attacker, workload, protected,
+decoy, mock-firewall, mock-DNS, and telemetry services. The decoy network does
+not connect to the protected database network by default.
+
+### Tests
+
+```bash
+python -m pytest -q
+python -m ruff check .
+python -m compileall -q mirage run_mirage.py tests
+node --check mirage/dashboard/app.js
+```
+
+The Milestone 4 test suite covers all verdict classes, protected assets,
+freshness/coverage restrictions, state-machine transitions, idempotency,
+canary failure, adapter failure, rollback failure, TTL expiry, kill switch,
+approval expiry, API, CLI, audit sanitization, and Digital Twin execution
+updates.

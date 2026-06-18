@@ -71,7 +71,18 @@ from mirage.layer5_safe_control.safe_control import create_safety_gate
 from mirage.config import load_config, resolve_project_path
 from mirage.analysis.pipeline import AttackAnalysisPipeline
 from mirage.detection.pipeline import ContextualDetectionPipeline
-from mirage.domain.schemas import AttackAnalysisResult, SecurityEvent
+from mirage.domain.schemas import (
+    ActionMask,
+    ApprovalDecision,
+    CandidateDefenseAction,
+    SafetyVerdict,
+    AttackAnalysisResult,
+    SecurityEvent,
+)
+from mirage.execution.audit import ImmutableAuditStore
+from mirage.execution.kill_switch import KillSwitch
+from mirage.execution.orchestrator import DeceptionOrchestrator
+from mirage.execution.safety import SafetyGate as ExecutionSafetyGate
 from mirage.ingestion.normalizer import EventNormalizer
 from mirage.layer6_twin.digital_twin import DigitalTwin
 from mirage import __version__
@@ -133,6 +144,38 @@ if HAS_FASTAPI:
         max_nodes: Optional[int] = Field(default=None, ge=1)
         max_paths: Optional[int] = Field(default=None, ge=1)
         reference_time: Optional[datetime] = None
+
+    class SafetyEvaluateRequest(BaseModel):
+        """Evaluate one candidate defense action through Safety Gate V1."""
+        action: CandidateDefenseAction
+        mask: Optional[ActionMask] = None
+        analysis_id: Optional[str] = None
+        reference_time: Optional[datetime] = None
+
+    class ExecutionPrepareRequest(BaseModel):
+        """Prepare a lab execution plan from one candidate action."""
+        action: CandidateDefenseAction
+        mask: Optional[ActionMask] = None
+        analysis_id: Optional[str] = None
+        reference_time: Optional[datetime] = None
+
+    class ExecutionExecuteRequest(BaseModel):
+        """Execute a stored plan."""
+        actor: str = Field(default="api", min_length=1, max_length=100)
+
+    class ExecutionApprovalRequest(BaseModel):
+        """Approve or reject an approval-required execution."""
+        approver: str = Field(min_length=1, max_length=100)
+        decision: ApprovalDecision = ApprovalDecision.APPROVED
+        reason: str = Field(default="", max_length=500)
+        ttl_seconds: Optional[int] = Field(default=None, ge=1)
+
+    class KillSwitchRequest(BaseModel):
+        """Enable or disable kill switch scope."""
+        actor: str = Field(default="api", min_length=1, max_length=100)
+        reason: str = Field(default="", max_length=500)
+        action_type: Optional[str] = Field(default=None, max_length=100)
+        environment: Optional[str] = Field(default=None, max_length=100)
 
 
 def _parse_timestamp(value: Any) -> float:
@@ -356,6 +399,35 @@ class MIRAGEStateManager:
             config=self.config.get("analysis", {}),
         )
         self.analysis_history: Dict[str, AttackAnalysisResult] = {}
+        execution_config = self.config.get("execution", {})
+        self.execution_audit_store = ImmutableAuditStore(
+            resolve_project_path(
+                execution_config.get(
+                    "audit_path",
+                    "artifacts/execution_audit.jsonl",
+                )
+            )
+        )
+        self.execution_kill_switch = KillSwitch(
+            default_enabled=bool(
+                execution_config.get("kill_switch", {}).get(
+                    "default_enabled",
+                    False,
+                )
+            ),
+            audit_store=self.execution_audit_store,
+        )
+        self.execution_safety_gate = ExecutionSafetyGate(
+            execution_config,
+            audit_store=self.execution_audit_store,
+            kill_switch=self.execution_kill_switch,
+        )
+        self.execution_orchestrator = DeceptionOrchestrator(
+            config=execution_config,
+            audit_store=self.execution_audit_store,
+            kill_switch=self.execution_kill_switch,
+            twin=self.twin,
+        )
 
         # Metrics
         self.total_events_processed = 0
@@ -543,6 +615,168 @@ class MIRAGEStateManager:
             if analysis_id not in self.analysis_history:
                 raise KeyError(analysis_id)
             return self.analysis_history[analysis_id]
+
+    def _default_execution_mask(
+        self,
+        action: CandidateDefenseAction,
+    ) -> ActionMask:
+        return ActionMask(
+            action_id=action.action_id,
+            allowed=True,
+            approval_required=action.requires_approval,
+            effective_risk_tier=action.risk_tier,
+            mask_reasons=(
+                ["approval_required"] if action.requires_approval else []
+            ),
+            required_conditions=(
+                ["human approval"] if action.requires_approval else []
+            ),
+        )
+
+    def _mask_from_analysis(
+        self,
+        action: CandidateDefenseAction,
+        mask: ActionMask | None,
+        analysis_id: str | None,
+    ) -> ActionMask:
+        if mask is not None:
+            return mask
+        if analysis_id and analysis_id in self.analysis_history:
+            result = self.analysis_history[analysis_id]
+            found = result.candidate_action_set.masks.get(action.action_id)
+            if found:
+                return found
+        return self._default_execution_mask(action)
+
+    def evaluate_execution_safety(self, request) -> Dict:
+        """Evaluate a candidate action through Safety Gate V1."""
+        with self._lock:
+            mask = self._mask_from_analysis(
+                request.action,
+                request.mask,
+                request.analysis_id,
+            )
+            decision = self.execution_safety_gate.evaluate(
+                request.action,
+                mask,
+                self.twin.create_snapshot(),
+                self.detection_pipeline.belief_engine.create_snapshot(),
+                list(self.execution_orchestrator.records.values()),
+                request.reference_time
+                or self.detection_pipeline.belief_engine.last_updated
+                or datetime.now().astimezone(),
+            )
+            return decision.model_dump(mode="json")
+
+    def prepare_execution(self, request) -> Dict:
+        """Safety-check and build a stored lab execution plan."""
+        with self._lock:
+            mask = self._mask_from_analysis(
+                request.action,
+                request.mask,
+                request.analysis_id,
+            )
+            twin_snapshot = self.twin.create_snapshot()
+            belief_snapshot = self.detection_pipeline.belief_engine.create_snapshot()
+            decision = self.execution_safety_gate.evaluate(
+                request.action,
+                mask,
+                twin_snapshot,
+                belief_snapshot,
+                list(self.execution_orchestrator.records.values()),
+                request.reference_time
+                or self.detection_pipeline.belief_engine.last_updated
+                or datetime.now().astimezone(),
+            )
+            if decision.verdict == SafetyVerdict.DENY:
+                return {
+                    "status": "denied",
+                    "safety_decision": decision.model_dump(mode="json"),
+                }
+            plan = self.execution_orchestrator.build_plan(
+                request.action,
+                decision,
+                twin_snapshot=twin_snapshot,
+                belief_snapshot=belief_snapshot,
+                graph_version=str(getattr(self.graph, "name", "mirage_attack_graph")),
+                analysis_id=request.analysis_id,
+            )
+            existing = self.execution_orchestrator._record_for_plan(plan.plan_id)
+            record = existing or self.execution_orchestrator.state_machine.create_record(
+                plan,
+                actor="api",
+            )
+            self.execution_orchestrator.records[record.execution_id] = record
+            return {
+                "status": "prepared",
+                "safety_decision": decision.model_dump(mode="json"),
+                "plan": plan.model_dump(mode="json"),
+                "execution": record.model_dump(mode="json"),
+            }
+
+    def execute_execution(self, execution_id: str, request) -> Dict:
+        """Execute a prepared plan by execution ID."""
+        with self._lock:
+            if execution_id not in self.execution_orchestrator.records:
+                raise KeyError(execution_id)
+            record = self.execution_orchestrator.records[execution_id]
+            plan = self.execution_orchestrator.plans[record.plan_id]
+            updated = self.execution_orchestrator.execute(
+                plan,
+                actor=request.actor,
+            )
+            return updated.model_dump(mode="json")
+
+    def approve_execution(self, execution_id: str, request) -> Dict:
+        """Approve or reject one execution."""
+        with self._lock:
+            if execution_id not in self.execution_orchestrator.records:
+                raise KeyError(execution_id)
+            approval = self.execution_orchestrator.approve(
+                execution_id,
+                approver=request.approver,
+                decision=request.decision,
+                reason=request.reason,
+                ttl_seconds=request.ttl_seconds,
+            )
+            return approval.model_dump(mode="json")
+
+    def rollback_execution(self, execution_id: str) -> Dict:
+        """Rollback one execution."""
+        with self._lock:
+            if execution_id not in self.execution_orchestrator.records:
+                raise KeyError(execution_id)
+            record = self.execution_orchestrator.rollback(
+                execution_id,
+                reason="API rollback",
+            )
+            return record.model_dump(mode="json")
+
+    def get_execution(self, execution_id: str) -> Dict:
+        """Return one execution."""
+        with self._lock:
+            if execution_id not in self.execution_orchestrator.records:
+                raise KeyError(execution_id)
+            return self.execution_orchestrator.records[execution_id].model_dump(
+                mode="json"
+            )
+
+    def list_executions(self) -> List[Dict]:
+        """Return all execution records."""
+        with self._lock:
+            return [
+                record.model_dump(mode="json")
+                for record in sorted(
+                    self.execution_orchestrator.records.values(),
+                    key=lambda item: item.created_at,
+                    reverse=True,
+                )
+            ]
+
+    def get_execution_audit(self) -> List[Dict]:
+        """Return sanitized execution audit events."""
+        with self._lock:
+            return self.execution_audit_store.list_events()
 
     def get_belief_all(self) -> Dict:
         """Get belief states for all tracked hosts."""
@@ -1455,6 +1689,7 @@ def create_app() -> Any:
                     config=state.config.get("analysis", {}),
                 )
                 state.analysis_history = {}
+                state.execution_orchestrator.twin = fresh_twin
             snapshot = fresh_twin.create_snapshot().model_dump(mode="json")
             response = {
                 "summary": summary.model_dump(mode="json"),
@@ -1744,6 +1979,163 @@ def create_app() -> Any:
                 for action_id, mask in result.candidate_action_set.masks.items()
             }
         }
+
+    @app.post(
+        "/api/v1/safety/evaluate",
+        summary="Evaluate a candidate action through Safety Gate V1",
+    )
+    async def evaluate_safety(request: SafetyEvaluateRequest):
+        """Return a typed SafetyDecision without executing anything."""
+        try:
+            return await asyncio.to_thread(state.evaluate_execution_safety, request)
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post(
+        "/api/v1/executions/prepare",
+        summary="Prepare a lab-safe execution plan",
+    )
+    async def prepare_execution(request: ExecutionPrepareRequest):
+        """Run Safety Gate and build a stored execution plan."""
+        try:
+            return await asyncio.to_thread(state.prepare_execution, request)
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post(
+        "/api/v1/executions/{execution_id}/approve",
+        summary="Approve or reject an execution",
+    )
+    async def approve_execution(
+        execution_id: str,
+        request: ExecutionApprovalRequest,
+    ):
+        """Record approval for an approval-required execution."""
+        try:
+            return await asyncio.to_thread(
+                state.approve_execution,
+                execution_id,
+                request,
+            )
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Execution '{execution_id}' was not found.",
+            ) from exc
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post(
+        "/api/v1/executions/{execution_id}/execute",
+        summary="Execute a prepared lab plan",
+    )
+    async def execute_execution(
+        execution_id: str,
+        request: ExecutionExecuteRequest,
+    ):
+        """Execute a prepared plan through canary and verification."""
+        try:
+            record = await asyncio.to_thread(
+                state.execute_execution,
+                execution_id,
+                request,
+            )
+            await state.broadcast_ws({"type": "execution_update", "data": record})
+            return record
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Execution '{execution_id}' was not found.",
+            ) from exc
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post(
+        "/api/v1/executions/{execution_id}/rollback",
+        summary="Rollback a lab execution",
+    )
+    async def rollback_execution(execution_id: str):
+        """Rollback a succeeded, failed, expired, or pending execution."""
+        try:
+            record = await asyncio.to_thread(
+                state.rollback_execution,
+                execution_id,
+            )
+            await state.broadcast_ws({"type": "execution_update", "data": record})
+            return record
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Execution '{execution_id}' was not found.",
+            ) from exc
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get(
+        "/api/v1/executions/{execution_id}",
+        summary="Get one execution record",
+    )
+    async def get_execution(execution_id: str):
+        """Return one execution record."""
+        try:
+            return state.get_execution(execution_id)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Execution '{execution_id}' was not found.",
+            ) from exc
+
+    @app.get(
+        "/api/v1/executions",
+        summary="List execution records",
+    )
+    async def list_executions():
+        """Return all execution records."""
+        return {"executions": state.list_executions()}
+
+    @app.get(
+        "/api/v1/audit",
+        summary="Return sanitized execution audit events",
+    )
+    async def get_execution_audit():
+        """Return append-only in-memory audit events."""
+        return {"events": state.get_execution_audit()}
+
+    @app.get(
+        "/api/v1/kill-switch",
+        summary="Get automation kill-switch state",
+    )
+    async def get_kill_switch():
+        """Return current kill-switch state."""
+        return state.execution_kill_switch.state.model_dump(mode="json")
+
+    @app.post(
+        "/api/v1/kill-switch/enable",
+        summary="Enable automation kill switch",
+    )
+    async def enable_kill_switch(request: KillSwitchRequest):
+        """Enable global or scoped automation block."""
+        result = state.execution_kill_switch.enable(
+            actor=request.actor,
+            reason=request.reason,
+            action_type=request.action_type,
+            environment=request.environment,
+        )
+        return result.model_dump(mode="json")
+
+    @app.post(
+        "/api/v1/kill-switch/disable",
+        summary="Disable automation kill switch",
+    )
+    async def disable_kill_switch(request: KillSwitchRequest):
+        """Disable global or scoped automation block."""
+        result = state.execution_kill_switch.disable(
+            actor=request.actor,
+            reason=request.reason,
+            action_type=request.action_type,
+            environment=request.environment,
+        )
+        return result.model_dump(mode="json")
 
     # ---- WebSocket ----
 

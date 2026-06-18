@@ -9,7 +9,11 @@ def main(argv: list[str] | None = None) -> int:
     """Dispatch package-level commands such as `python -m mirage replay`."""
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or args[0] in {"-h", "--help"}:
-        print("Usage: python -m mirage {replay,detect,analyze-paths} [options]")
+        print(
+            "Usage: python -m mirage "
+            "{replay,detect,analyze-paths,safety-check,execute-plan,"
+            "execution-status,rollback,kill-switch} [options]"
+        )
         return 0
     command = args.pop(0)
     if command == "replay":
@@ -24,6 +28,16 @@ def main(argv: list[str] | None = None) -> int:
         from mirage.analyze_paths import main as analyze_main
 
         return analyze_main(args)
+    if command in {
+        "safety-check",
+        "execute-plan",
+        "execution-status",
+        "rollback",
+        "kill-switch",
+    }:
+        from mirage.execution_cli import main as execution_main
+
+        return execution_main([command, *args])
     print(f"Unknown MIRAGE command: {command}")
     return 2
 

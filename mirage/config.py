@@ -253,6 +253,80 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "uncertainty_weight": 0.3,
         },
     },
+    "execution": {
+        "policy_version": "safety-v1",
+        "action_tiers": {
+            "increase_endpoint_logging": 0,
+            "increase_network_telemetry": 0,
+            "enable_limited_packet_capture": 0,
+            "enable_auth_auditing": 0,
+            "create_soc_ticket": 0,
+            "request_analyst_review": 0,
+            "deploy_decoy_host": 1,
+            "deploy_decoy_database": 1,
+            "deploy_fake_share": 1,
+            "scatter_honey_credential": 1,
+            "add_decoy_service": 1,
+            "create_fake_dns_record": 1,
+            "throttle_edge": 2,
+            "restrict_smb": 2,
+            "temporary_segmentation": 2,
+            "block_egress": 3,
+            "block_flow": 3,
+            "revoke_session": 3,
+            "isolate_host": 3,
+            "isolate_database": 4,
+            "block_subnet": 4,
+            "disable_privileged_identity": 4,
+        },
+        "confidence_thresholds": {
+            "low": 0.20,
+            "medium": 0.35,
+            "high": 0.70,
+            "critical": 0.95,
+        },
+        "protected_asset_ids": [],
+        "protected_asset_types": ["database", "dc", "domain_controller"],
+        "protected_criticality_threshold": 0.85,
+        "managed_environments": ["lab", "test", "dev", ""],
+        "management_channel_ids": [],
+        "twin_freshness_threshold": 0.35,
+        "graph_coverage_threshold": 0.20,
+        "blast_radius_limit": 5,
+        "action_budget": 6.0,
+        "default_ttl_seconds": 3600,
+        "maximum_ttl_seconds": 14400,
+        "approval_ttl_seconds": 900,
+        "rollback_required_tier": 2,
+        "reversible_required_tier": 2,
+        "tier3_auto_confidence": 0.98,
+        "adapters": {
+            "docker_decoy": True,
+            "mock_firewall": True,
+            "mock_edr": True,
+            "mock_iam": True,
+            "mock_dns": True,
+            "mock_telemetry": True,
+            "mock_ticket": True,
+        },
+        "canary_timeout_seconds": 60,
+        "execution_timeout_seconds": 300,
+        "retries": 1,
+        "rollback_retries": 2,
+        "kill_switch": {
+            "default_enabled": False
+        },
+        "audit_path": "artifacts/execution_audit.jsonl",
+        "docker_templates": {
+            "decoy_database": "mirage-decoy-db-template",
+            "fake_smb": "mirage-fake-smb-template"
+        },
+        "lab_networks": {
+            "control": "mirage-control",
+            "workload": "mirage-workload",
+            "decoy": "mirage-decoy"
+        }
+    },
 }
 
 
@@ -465,6 +539,38 @@ def _validate_config(config: Dict[str, Any]) -> None:
             raise ValueError(f"analysis.constraints.{key} must be in [0, 1]")
     if float(constraints["action_budget"]) < 0:
         raise ValueError("analysis.constraints.action_budget must be >= 0")
+
+    execution = config["execution"]
+    if int(execution["blast_radius_limit"]) < 1:
+        raise ValueError("execution.blast_radius_limit must be at least 1")
+    for key in (
+        "twin_freshness_threshold",
+        "graph_coverage_threshold",
+        "protected_criticality_threshold",
+        "tier3_auto_confidence",
+    ):
+        value = float(execution[key])
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError(f"execution.{key} must be in [0, 1]")
+    for key in (
+        "action_budget",
+        "default_ttl_seconds",
+        "maximum_ttl_seconds",
+        "approval_ttl_seconds",
+        "canary_timeout_seconds",
+        "execution_timeout_seconds",
+        "retries",
+        "rollback_retries",
+    ):
+        value = float(execution[key])
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"execution.{key} must be finite and non-negative")
+    if int(execution["maximum_ttl_seconds"]) < int(execution["default_ttl_seconds"]):
+        raise ValueError(
+            "execution.maximum_ttl_seconds must be >= default_ttl_seconds"
+        )
+    if not isinstance(execution["adapters"], dict):
+        raise ValueError("execution.adapters must be an object")
 
 
 def get_config_path(path: Optional[os.PathLike | str] = None) -> Path:

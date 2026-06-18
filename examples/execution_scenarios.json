@@ -1,0 +1,81 @@
+{
+  "scope": "synthetic_milestone4_lab",
+  "scenarios": [
+    {
+      "id": "safe_decoy_deployment_succeeds",
+      "action_type": "deploy_decoy_database",
+      "expected_state": "SUCCEEDED"
+    },
+    {
+      "id": "decoy_health_check_fails_and_rolls_back",
+      "action_type": "deploy_decoy_database",
+      "failure_injection": "docker_decoy.execute_canary",
+      "expected_state": "ROLLED_BACK"
+    },
+    {
+      "id": "decoy_can_reach_protected_service_rolls_back",
+      "action_type": "deploy_decoy_database",
+      "lab_flag": "decoy_can_reach_protected",
+      "expected_state": "ROLLED_BACK"
+    },
+    {
+      "id": "temporary_throttle_succeeds_and_expires",
+      "action_type": "throttle_edge",
+      "ttl_seconds": 1,
+      "expected_state_after_expiry": "ROLLED_BACK"
+    },
+    {
+      "id": "protected_database_containment_denied",
+      "action_type": "isolate_host",
+      "target_asset_type": "database",
+      "expected_verdict": "DENY"
+    },
+    {
+      "id": "stale_twin_requires_approval",
+      "action_type": "throttle_edge",
+      "twin_freshness": 0.1,
+      "graph_coverage": 0.1,
+      "expected_verdict": "REQUIRE_APPROVAL"
+    },
+    {
+      "id": "duplicate_execution_request_idempotent",
+      "action_type": "deploy_decoy_database",
+      "expected_same_execution_id": true
+    },
+    {
+      "id": "adapter_failure_triggers_rollback",
+      "action_type": "deploy_decoy_database",
+      "failure_injection": "docker_decoy.execute",
+      "expected_state": "ROLLED_BACK"
+    },
+    {
+      "id": "rollback_failure_reported",
+      "action_type": "deploy_decoy_database",
+      "failure_injection": "docker_decoy.rollback",
+      "expected_state": "FAILED"
+    },
+    {
+      "id": "kill_switch_blocks_automation",
+      "action_type": "deploy_decoy_database",
+      "kill_switch": true,
+      "expected_verdict": "DENY"
+    },
+    {
+      "id": "approval_required_waits",
+      "action_type": "block_egress",
+      "expected_state": "AWAITING_APPROVAL"
+    },
+    {
+      "id": "expired_approval_cannot_be_used",
+      "action_type": "block_egress",
+      "approval_ttl_seconds": 1,
+      "expected_state": "AWAITING_APPROVAL"
+    },
+    {
+      "id": "digital_twin_updates_after_deploy_and_rollback",
+      "action_type": "deploy_decoy_database",
+      "expected_twin_decoy_count": 1,
+      "expected_active_after_rollback": false
+    }
+  ]
+}

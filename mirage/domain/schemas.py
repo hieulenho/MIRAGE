@@ -957,3 +957,229 @@ class RobustDecisionInput(StrictModel):
     affected_attack_paths: dict[str, list[str]] = Field(default_factory=dict)
     budget_requirements: dict[str, float] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
+
+
+class SafetyVerdict(str, Enum):
+    """Milestone 4 safety verdicts for candidate execution."""
+
+    ALLOW = "ALLOW"
+    ALLOW_WITH_MONITORING = "ALLOW_WITH_MONITORING"
+    REQUIRE_APPROVAL = "REQUIRE_APPROVAL"
+    DENY = "DENY"
+
+
+class ExecutionState(str, Enum):
+    """Explicit execution state-machine states."""
+
+    PROPOSED = "PROPOSED"
+    VALIDATED = "VALIDATED"
+    AWAITING_APPROVAL = "AWAITING_APPROVAL"
+    PREPARED = "PREPARED"
+    CANARY_RUNNING = "CANARY_RUNNING"
+    EXECUTING = "EXECUTING"
+    VERIFYING = "VERIFYING"
+    SUCCEEDED = "SUCCEEDED"
+    EXPIRED = "EXPIRED"
+    FAILED = "FAILED"
+    ROLLING_BACK = "ROLLING_BACK"
+    ROLLED_BACK = "ROLLED_BACK"
+    CANCELLED = "CANCELLED"
+    DENIED = "DENIED"
+
+
+class ApprovalDecision(str, Enum):
+    """Human approval decision labels."""
+
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+
+
+class SafetyDecision(StrictModel):
+    """Safety Gate V1 decision for one candidate action."""
+
+    action_id: str = Field(min_length=1)
+    verdict: SafetyVerdict
+    risk_tier: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    business_risk: float = Field(ge=0.0, le=1.0)
+    blast_radius_estimate: int = Field(ge=0)
+    twin_freshness: float = Field(ge=0.0, le=1.0)
+    graph_coverage: float = Field(ge=0.0, le=1.0)
+    violated_policies: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    required_approvals: list[str] = Field(default_factory=list)
+    allowed_scope: list[str] = Field(default_factory=list)
+    maximum_ttl_seconds: int | None = Field(default=None, ge=1)
+    rollback_required: bool = True
+    reasons: list[str] = Field(default_factory=list)
+    policy_version: str
+    evaluated_at: datetime
+
+    @field_validator("evaluated_at")
+    @classmethod
+    def _aware_datetime(cls, value: datetime) -> datetime:
+        return require_aware(value)
+
+
+class ExecutionPlan(StrictModel):
+    """Deterministic lab execution plan for one safe candidate action."""
+
+    plan_id: str = Field(min_length=1)
+    source_action_id: str = Field(min_length=1)
+    action_type: str = Field(min_length=1)
+    targets: list[str] = Field(default_factory=list)
+    adapter_type: str = Field(min_length=1)
+    requested_scope: list[str] = Field(default_factory=list)
+    allowed_scope: list[str] = Field(default_factory=list)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    preconditions: list[str] = Field(default_factory=list)
+    canary_steps: list[str] = Field(default_factory=list)
+    execution_steps: list[str] = Field(default_factory=list)
+    verification_checks: list[str] = Field(default_factory=list)
+    postconditions: list[str] = Field(default_factory=list)
+    rollback_steps: list[str] = Field(default_factory=list)
+    ttl_seconds: int | None = Field(default=None, ge=1)
+    timeout_seconds: int = Field(default=300, ge=1)
+    retry_policy: dict[str, int] = Field(default_factory=dict)
+    idempotency_key: str = Field(min_length=1)
+    required_approvals: list[str] = Field(default_factory=list)
+    twin_version: str
+    graph_version: str
+    belief_version: str
+    analysis_id: str | None = None
+    policy_version: str
+    created_at: datetime
+
+    @field_validator("created_at")
+    @classmethod
+    def _aware_datetime(cls, value: datetime) -> datetime:
+        return require_aware(value)
+
+
+class AdapterCallResult(StrictModel):
+    """Typed result returned by a mock/lab enforcement adapter."""
+
+    adapter_type: str
+    operation: str
+    success: bool
+    idempotency_key: str
+    changed_resources: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    details: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
+    timestamp: datetime
+
+    @field_validator("timestamp")
+    @classmethod
+    def _aware_datetime(cls, value: datetime) -> datetime:
+        return require_aware(value)
+
+
+class HealthCheckResult(StrictModel):
+    """Verification or health-check result for an execution plan."""
+
+    check_name: str
+    success: bool
+    details: dict[str, Any] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+    timestamp: datetime
+
+    @field_validator("timestamp")
+    @classmethod
+    def _aware_datetime(cls, value: datetime) -> datetime:
+        return require_aware(value)
+
+
+class StateTransitionRecord(StrictModel):
+    """One deterministic state transition in an execution record."""
+
+    from_state: ExecutionState | None = None
+    to_state: ExecutionState
+    reason: str
+    timestamp: datetime
+
+    @field_validator("timestamp")
+    @classmethod
+    def _aware_datetime(cls, value: datetime) -> datetime:
+        return require_aware(value)
+
+
+class ExecutionRecord(StrictModel):
+    """Auditable state for one execution workflow."""
+
+    execution_id: str = Field(min_length=1)
+    plan_id: str = Field(min_length=1)
+    current_state: ExecutionState
+    state_history: list[StateTransitionRecord] = Field(default_factory=list)
+    adapter_results: list[AdapterCallResult] = Field(default_factory=list)
+    health_check_results: list[HealthCheckResult] = Field(default_factory=list)
+    canary_result: AdapterCallResult | None = None
+    rollback_result: AdapterCallResult | None = None
+    created_at: datetime
+    updated_at: datetime
+    expires_at: datetime | None = None
+    actor: str = "mirage-policy"
+    warnings: list[str] = Field(default_factory=list)
+    failure_reason: str | None = None
+    audit_references: list[str] = Field(default_factory=list)
+
+    @field_validator("created_at", "updated_at", "expires_at")
+    @classmethod
+    def _aware_datetime(cls, value: datetime | None) -> datetime | None:
+        return require_aware(value) if value is not None else None
+
+
+class ApprovalRecord(StrictModel):
+    """Human approval record for an execution."""
+
+    approval_id: str = Field(min_length=1)
+    execution_id: str = Field(min_length=1)
+    approver: str = Field(min_length=1)
+    decision: ApprovalDecision
+    reason: str = ""
+    timestamp: datetime
+    expiry: datetime
+
+    @field_validator("timestamp", "expiry")
+    @classmethod
+    def _aware_datetime(cls, value: datetime) -> datetime:
+        return require_aware(value)
+
+
+class KillSwitchState(StrictModel):
+    """Global/per-action/per-environment automation kill-switch state."""
+
+    global_enabled: bool = False
+    action_type_blocks: dict[str, bool] = Field(default_factory=dict)
+    environment_blocks: dict[str, bool] = Field(default_factory=dict)
+    updated_by: str = "system"
+    reason: str = ""
+    updated_at: datetime
+
+    @field_validator("updated_at")
+    @classmethod
+    def _aware_datetime(cls, value: datetime) -> datetime:
+        return require_aware(value)
+
+
+class AuditEvent(StrictModel):
+    """Append-only sanitized audit event."""
+
+    audit_id: str = Field(min_length=1)
+    event_type: str = Field(min_length=1)
+    timestamp: datetime
+    actor: str = "mirage"
+    execution_id: str | None = None
+    plan_id: str | None = None
+    action_id: str | None = None
+    policy_version: str | None = None
+    twin_version: str | None = None
+    graph_version: str | None = None
+    belief_version: str | None = None
+    analysis_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("timestamp")
+    @classmethod
+    def _aware_datetime(cls, value: datetime) -> datetime:
+        return require_aware(value)
