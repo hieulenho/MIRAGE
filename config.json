@@ -136,5 +136,137 @@
     "graph_propagation_depth": 1,
     "graph_propagation_decay": 0.45,
     "api_timeline_limit": 100
+  },
+  "analysis": {
+    "seed_selection": {
+      "minimum_compromise_probability": 0.30,
+      "minimum_attacker_location_probability": 0.20,
+      "maximum_seeds": 20,
+      "uncertainty_penalty": 0.20,
+      "deception_event_priority": 0.25,
+      "neighborhood_deduplication": true
+    },
+    "subgraph": {
+      "default_max_hops": 3,
+      "max_nodes": 80,
+      "max_edges": 160,
+      "minimum_edge_confidence": 0.10,
+      "freshness_threshold": 86400,
+      "relationship_allowlist": [],
+      "criticality_threshold": 0.80
+    },
+    "paths": {
+      "maximum_path_length": 6,
+      "maximum_paths_per_target": 3,
+      "maximum_total_paths": 60,
+      "enabled_path_types": [
+        "shortest_to_critical_asset",
+        "highest_success_probability",
+        "highest_risk",
+        "credential_driven",
+        "recently_observed",
+        "decoy_path",
+        "unprotected_path",
+        "high_blast_radius"
+      ],
+      "observed_edge_bonus": 0.12,
+      "inferred_edge_penalty": 0.25,
+      "stale_edge_penalty": 0.20,
+      "uncertainty_penalty": 0.20
+    },
+    "risk_scoring": {
+      "source_compromise_weight": 1.0,
+      "path_success_weight": 1.0,
+      "target_criticality_weight": 1.0,
+      "stage_compatibility_weight": 0.8,
+      "evidence_recency_weight": 0.8,
+      "relationship_confidence_weight": 0.8,
+      "credential_feasibility_weight": 0.6,
+      "exposure_weight": 0.5,
+      "probability_floor": 0.01,
+      "probability_ceiling": 0.99
+    },
+    "candidate_actions": {
+      "enabled_action_types": [
+        "increase_endpoint_logging",
+        "increase_network_telemetry",
+        "enable_limited_packet_capture",
+        "enable_auth_auditing",
+        "create_soc_ticket",
+        "request_analyst_review",
+        "deploy_decoy_database",
+        "deploy_fake_share",
+        "scatter_honey_credential",
+        "add_decoy_service",
+        "throttle_edge",
+        "restrict_smb",
+        "require_mfa",
+        "temporary_segmentation",
+        "block_egress",
+        "isolate_host"
+      ],
+      "default_ttl_seconds": 3600,
+      "action_costs": {
+        "increase_endpoint_logging": 0.2,
+        "increase_network_telemetry": 0.3,
+        "enable_limited_packet_capture": 0.5,
+        "enable_auth_auditing": 0.25,
+        "create_soc_ticket": 0.1,
+        "request_analyst_review": 0.1,
+        "deploy_decoy_database": 1.5,
+        "deploy_fake_share": 0.9,
+        "scatter_honey_credential": 0.8,
+        "add_decoy_service": 1.0,
+        "throttle_edge": 0.5,
+        "restrict_smb": 0.7,
+        "require_mfa": 0.8,
+        "temporary_segmentation": 1.2,
+        "block_egress": 1.0,
+        "isolate_host": 2.0
+      },
+      "business_risks": {
+        "increase_endpoint_logging": 0.05,
+        "increase_network_telemetry": 0.05,
+        "enable_limited_packet_capture": 0.15,
+        "enable_auth_auditing": 0.05,
+        "create_soc_ticket": 0.01,
+        "request_analyst_review": 0.01,
+        "deploy_decoy_database": 0.10,
+        "deploy_fake_share": 0.08,
+        "scatter_honey_credential": 0.05,
+        "add_decoy_service": 0.10,
+        "throttle_edge": 0.20,
+        "restrict_smb": 0.30,
+        "require_mfa": 0.25,
+        "temporary_segmentation": 0.50,
+        "block_egress": 0.55,
+        "isolate_host": 0.75
+      },
+      "information_gain_weights": {
+        "observe": 0.8,
+        "deception": 0.7,
+        "control": 0.3
+      }
+    },
+    "constraints": {
+      "protected_asset_ids": [],
+      "protected_asset_types": ["database", "dc", "domain_controller"],
+      "required_confidence_threshold": 0.35,
+      "twin_freshness_threshold": 0.35,
+      "graph_coverage_threshold": 0.20,
+      "blast_radius_limit": 5,
+      "action_budget": 6.0,
+      "active_decoy_limit": 20,
+      "deny_action_types": ["delete_credentials", "block_all_traffic"]
+    },
+    "ranking": {
+      "risk_reduction_weight": 1.0,
+      "information_gain_weight": 0.4,
+      "path_coverage_weight": 0.3,
+      "operational_cost_weight": 0.15,
+      "deployment_cost_weight": 0.15,
+      "business_risk_weight": 0.4,
+      "uncertainty_weight": 0.3
+    }
   }
 }

@@ -69,8 +69,9 @@ from mirage.layer2_graph_engine.attack_graph import MIRAGEAttackGraph, build_con
 from mirage.layer3_deception.deception_fabric import DeceptionFabric
 from mirage.layer5_safe_control.safe_control import create_safety_gate
 from mirage.config import load_config, resolve_project_path
+from mirage.analysis.pipeline import AttackAnalysisPipeline
 from mirage.detection.pipeline import ContextualDetectionPipeline
-from mirage.domain.schemas import SecurityEvent
+from mirage.domain.schemas import AttackAnalysisResult, SecurityEvent
 from mirage.ingestion.normalizer import EventNormalizer
 from mirage.layer6_twin.digital_twin import DigitalTwin
 from mirage import __version__
@@ -123,6 +124,14 @@ if HAS_FASTAPI:
     class BeliefRecomputeRequest(BaseModel):
         """Request to recompute one contextual entity belief."""
         entity_id: str = Field(min_length=1)
+        reference_time: Optional[datetime] = None
+
+    class AnalysisRunRequest(BaseModel):
+        """Request for Milestone 3 attack-path analysis."""
+        seed_entity_ids: List[str] = Field(default_factory=list)
+        max_hops: Optional[int] = Field(default=None, ge=0, le=10)
+        max_nodes: Optional[int] = Field(default=None, ge=1)
+        max_paths: Optional[int] = Field(default=None, ge=1)
         reference_time: Optional[datetime] = None
 
 
@@ -342,6 +351,11 @@ class MIRAGEStateManager:
         )
         self.event_normalizer = EventNormalizer()
         self.detection_pipeline = self._build_detection_pipeline(self.twin)
+        self.analysis_pipeline = AttackAnalysisPipeline(
+            attack_graph=self.graph,
+            config=self.config.get("analysis", {}),
+        )
+        self.analysis_history: Dict[str, AttackAnalysisResult] = {}
 
         # Metrics
         self.total_events_processed = 0
@@ -507,6 +521,28 @@ class MIRAGEStateManager:
                 reference_time,
             )
         return belief.model_dump(mode="json")
+
+    def run_attack_analysis(self, request) -> Dict:
+        """Run Milestone 3 attack-path analysis from current snapshots."""
+        with self._lock:
+            result = self.analysis_pipeline.analyze(
+                self.twin.create_snapshot(),
+                self.detection_pipeline.belief_engine.create_snapshot(),
+                reference_time=request.reference_time,
+                seed_entity_ids=request.seed_entity_ids,
+                max_hops=request.max_hops,
+                max_nodes=request.max_nodes,
+                max_paths=request.max_paths,
+            )
+            self.analysis_history[result.analysis_id] = result
+            return result.model_dump(mode="json")
+
+    def get_attack_analysis(self, analysis_id: str) -> AttackAnalysisResult:
+        """Return one stored attack analysis."""
+        with self._lock:
+            if analysis_id not in self.analysis_history:
+                raise KeyError(analysis_id)
+            return self.analysis_history[analysis_id]
 
     def get_belief_all(self) -> Dict:
         """Get belief states for all tracked hosts."""
@@ -1025,6 +1061,15 @@ def create_app() -> Any:
                 "GET  /api/v1/detection/incidents/{incident_id}",
                 "GET  /api/v1/belief/snapshot",
                 "POST /api/v1/belief/recompute",
+                "POST /api/v1/analysis/run",
+                "GET  /api/v1/analysis/{analysis_id}",
+                "GET  /api/v1/analysis/{analysis_id}/subgraph",
+                "GET  /api/v1/analysis/{analysis_id}/paths",
+                "GET  /api/v1/analysis/{analysis_id}/critical-assets",
+                "GET  /api/v1/analysis/{analysis_id}/deception-positions",
+                "GET  /api/v1/analysis/{analysis_id}/actions",
+                "GET  /api/v1/analysis/{analysis_id}/masks",
+                "POST /api/v1/analysis/recompute",
                 "WS   /ws",
             ],
         }
@@ -1405,6 +1450,11 @@ def create_app() -> Any:
                 state.detection_pipeline = state._build_detection_pipeline(
                     fresh_twin
                 )
+                state.analysis_pipeline = AttackAnalysisPipeline(
+                    attack_graph=state.graph,
+                    config=state.config.get("analysis", {}),
+                )
+                state.analysis_history = {}
             snapshot = fresh_twin.create_snapshot().model_dump(mode="json")
             response = {
                 "summary": summary.model_dump(mode="json"),
@@ -1574,6 +1624,126 @@ def create_app() -> Any:
                 status_code=404,
                 detail=f"Entity '{request.entity_id}' was not found.",
             ) from exc
+
+    @app.post(
+        "/api/v1/analysis/run",
+        summary="Run attack-path analysis and candidate action generation",
+    )
+    async def run_attack_analysis(request: AnalysisRunRequest):
+        """Run Milestone 3 analysis from current Twin and belief state."""
+        try:
+            return await asyncio.to_thread(state.run_attack_analysis, request)
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post(
+        "/api/v1/analysis/recompute",
+        summary="Recompute attack-path analysis",
+    )
+    async def recompute_attack_analysis(request: AnalysisRunRequest):
+        """Alias for a fresh analysis run."""
+        return await run_attack_analysis(request)
+
+    def _analysis_or_404(analysis_id: str) -> AttackAnalysisResult:
+        try:
+            return state.get_attack_analysis(analysis_id)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Analysis '{analysis_id}' was not found.",
+            ) from exc
+
+    @app.get(
+        "/api/v1/analysis/{analysis_id}",
+        summary="Get full attack analysis result",
+    )
+    async def get_attack_analysis(analysis_id: str):
+        """Return full stored analysis."""
+        return _analysis_or_404(analysis_id).model_dump(mode="json")
+
+    @app.get(
+        "/api/v1/analysis/{analysis_id}/subgraph",
+        summary="Get local operational subgraph",
+    )
+    async def get_attack_analysis_subgraph(analysis_id: str):
+        """Return bounded local subgraph."""
+        return _analysis_or_404(analysis_id).subgraph.model_dump(mode="json")
+
+    @app.get(
+        "/api/v1/analysis/{analysis_id}/paths",
+        summary="Get attack paths",
+    )
+    async def get_attack_analysis_paths(
+        analysis_id: str,
+        limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+        minimum_path_risk: Annotated[float, Query(ge=0.0, le=1.0)] = 0.0,
+    ):
+        """Return bounded path list."""
+        result = _analysis_or_404(analysis_id)
+        paths = [
+            path
+            for path in result.path_analysis.paths
+            if path.risk_score >= minimum_path_risk
+        ][:limit]
+        return {"paths": [path.model_dump(mode="json") for path in paths]}
+
+    @app.get(
+        "/api/v1/analysis/{analysis_id}/critical-assets",
+        summary="Get critical assets at risk",
+    )
+    async def get_attack_analysis_critical_assets(analysis_id: str):
+        """Return critical assets at risk."""
+        result = _analysis_or_404(analysis_id)
+        return {"critical_assets": result.path_analysis.critical_assets_at_risk}
+
+    @app.get(
+        "/api/v1/analysis/{analysis_id}/deception-positions",
+        summary="Get deception placement opportunities",
+    )
+    async def get_attack_analysis_deception_positions(analysis_id: str):
+        """Return non-executing deception placement recommendations."""
+        result = _analysis_or_404(analysis_id)
+        return {
+            "deception_positions": [
+                position.model_dump(mode="json")
+                for position in result.deception_positions
+            ]
+        }
+
+    @app.get(
+        "/api/v1/analysis/{analysis_id}/actions",
+        summary="Get candidate defense actions",
+    )
+    async def get_attack_analysis_actions(
+        analysis_id: str,
+        include_blocked: bool = True,
+        include_approval_required: bool = True,
+    ):
+        """Return generated candidate actions with optional filtering."""
+        result = _analysis_or_404(analysis_id)
+        actions = []
+        for action in result.candidate_action_set.actions:
+            mask = result.candidate_action_set.masks[action.action_id]
+            if not include_blocked and not mask.allowed:
+                continue
+            if not include_approval_required and mask.approval_required:
+                continue
+            actions.append(action.model_dump(mode="json"))
+        return {"actions": actions}
+
+    @app.get(
+        "/api/v1/analysis/{analysis_id}/masks",
+        summary="Get action masks",
+    )
+    async def get_attack_analysis_masks(analysis_id: str):
+        """Return action masks and explicit reasons."""
+        result = _analysis_or_404(analysis_id)
+        return {
+            "masks": {
+                action_id: mask.model_dump(mode="json")
+                for action_id, mask in result.candidate_action_set.masks.items()
+            }
+        }
 
     # ---- WebSocket ----
 

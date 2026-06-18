@@ -1090,3 +1090,219 @@ Dynamic Local Subgraph Retrieval
 + Attack-Path Risk Engine
 + Candidate Defense Action Generation
 ```
+
+## Milestone 3: Attack-Path Analysis and Candidate Actions
+
+Milestone 3 turns Digital Twin and belief snapshots into bounded local attack
+paths and non-executing candidate defense actions:
+
+```text
+Belief Snapshot
+      +
+Digital Twin
+      +
+Attack Graph
+      ->
+Seed Entity Selector
+      ->
+Local Subgraph Extractor
+      ->
+Attack-Path Finder
+      ->
+Path Risk Scorer
+      ->
+Deception Position Analyzer
+      ->
+Candidate Action Generator
+      ->
+Constraint Evaluator
+      ->
+Action Mask Builder
+      ->
+Candidate Action Ranker
+      ->
+Robust Decision Adapter
+```
+
+### What It Does
+
+- Selects seed entities from compromise probability, attacker-location
+  probability, evidence recency, stage severity, deception evidence, and
+  uncertainty.
+- Extracts bounded local operational subgraphs from active Digital Twin
+  relationships with hop, node, edge, freshness, confidence, and relationship
+  filters.
+- Finds bounded paths by type: shortest critical path, highest-success path,
+  high-risk, credential-driven, recently observed, decoy path, unprotected
+  path, and high-blast-radius path.
+- Scores paths using an explicit heuristic formula with source compromise,
+  path success, target criticality, stage compatibility, evidence recency,
+  relationship confidence, credential feasibility, exposure, direct-observation
+  bonuses, inferred/stale penalties, and uncertainty.
+- Identifies deception placement opportunities at shared branch points and
+  risky edges.
+- Generates allowlisted candidate actions only. Examples: increase telemetry,
+  enable auth auditing, deploy fake share, scatter honey credential, throttle
+  edge, require MFA, temporary segmentation, and isolate host.
+- Evaluates constraints and builds masks. Blocked actions keep explicit reasons;
+  approval-required actions remain visible but are not treated as directly
+  executable.
+- Produces a compatibility payload for future robust-decision integration
+  without rewriting the existing robust decision engine.
+
+### CLI
+
+First create snapshots:
+
+```bash
+python -m mirage replay \
+  --events examples/events/analysis_lateral_critical_db.jsonl \
+  --snapshot-out artifacts/m3_twin.json
+
+python -m mirage detect \
+  --events examples/events/analysis_lateral_critical_db.jsonl \
+  --belief-out artifacts/m3_belief.json \
+  --detections-out artifacts/m3_detections.jsonl
+```
+
+Then run attack-path analysis:
+
+```bash
+python -m mirage analyze-paths \
+  --twin-snapshot artifacts/m3_twin.json \
+  --belief-snapshot artifacts/m3_belief.json \
+  --analysis-out artifacts/attack_analysis.json \
+  --actions-out artifacts/candidate_actions.json \
+  --verbose
+```
+
+Example output:
+
+```text
+MIRAGE attack-path analysis complete
+  selected seed entities:    10
+  subgraph nodes/edges:      11/6
+  coverage/freshness:        1.000/0.999
+  attack paths found:        5
+  critical assets at risk:   1
+  deception positions:       1
+  actions generated:         12
+  allowed actions:           9
+  blocked actions:           3
+  approval-required actions: 9
+```
+
+### API
+
+Milestone 3 endpoints:
+
+```text
+POST /api/v1/analysis/run
+GET  /api/v1/analysis/{analysis_id}
+GET  /api/v1/analysis/{analysis_id}/subgraph
+GET  /api/v1/analysis/{analysis_id}/paths
+GET  /api/v1/analysis/{analysis_id}/critical-assets
+GET  /api/v1/analysis/{analysis_id}/deception-positions
+GET  /api/v1/analysis/{analysis_id}/actions
+GET  /api/v1/analysis/{analysis_id}/masks
+POST /api/v1/analysis/recompute
+```
+
+Minimal request:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/analysis/run \
+  -H "Content-Type: application/json" \
+  -d '{"max_hops":3,"max_nodes":80,"max_paths":60}'
+```
+
+The API analyzes the current in-memory Twin and belief state created by the
+existing ingestion/detection endpoints.
+
+### Formulas
+
+Seed priority:
+
+```text
+0.38 * compromise
++ 0.25 * attacker_location
++ 0.12 * evidence_confidence
++ 0.10 * evidence_recency
++ 0.15 * stage_severity
++ deception_bonus
+- uncertainty_penalty
+- inferred_only_penalty
+```
+
+Path risk:
+
+```text
+risk =
+  source_compromise
+* path_success
+* target_criticality
+* stage_compatibility
+* evidence_recency
+* relationship_confidence
+* credential_feasibility
+* exposure_modifier
++ direct_observation_bonus
++ credential_bonus
++ protected_asset_bonus
+- decoy_modifier
+- inferred/stale/uncertainty penalties
+```
+
+Candidate ranking:
+
+```text
+score =
+  expected_risk_reduction
++ information_gain_weight * expected_information_gain
++ path_coverage_weight * affected_path_coverage
+- operational_cost_weight * operational_cost
+- deployment_cost_weight * deployment_cost
+- business_risk_weight * business_risk
+- uncertainty_weight * uncertainty
+```
+
+### Synthetic Scenarios
+
+Milestone 3 adds deterministic synthetic scenarios:
+
+- `analysis_discovery_low_risk.jsonl`
+- `analysis_lateral_critical_db.jsonl`
+- `analysis_decoy_interaction.jsonl`
+- `analysis_stale_twin.jsonl`
+- `analysis_protected_asset.jsonl`
+- `analysis_overlapping_paths.jsonl`
+- `analysis_inferred_only.jsonl`
+
+Use `mirage.analysis.evaluation.evaluate_analysis_scenarios(...)` for
+synthetic-only metrics such as seed correctness, path recall, critical-asset
+identification, candidate-action coverage, invalid-action rejection, protected
+asset safety, deterministic replay consistency, average local subgraph size,
+average path/action counts, and blocked-action explanation coverage.
+
+### Limitations
+
+- This remains a research prototype.
+- Risk scores are heuristic and explainable; they are not calibrated production
+  probabilities.
+- Candidate actions are recommendations only and do not execute firewall, EDR,
+  IAM, Kubernetes, or host changes.
+- Action masks are preliminary constraints, not the full Safety Gate.
+- No GNN, LLM, RL training, MARL, or real enforcement exists in this milestone.
+- Stale or incomplete Twin data reduces confidence and blocks disruptive
+  recommendations.
+
+Recommended Milestone 4:
+
+```text
+Safety Gate V1
++ Deception Orchestrator
++ Mock Enforcement Adapters
++ Docker/Kubernetes Lab Deployment
++ Canary Execution
++ Rollback and Audit
+```
