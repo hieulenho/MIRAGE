@@ -135,7 +135,7 @@ class CandidateActionGenerator:
         """Generate deterministic candidate actions from top paths."""
         paths = sorted(path_analysis.paths, key=lambda path: (-path.risk_score, path.path_id))
         positions = deception_positions or []
-        actions: list[CandidateDefenseAction] = []
+        actions: list[CandidateDefenseAction | None] = []
         for path in paths[:20]:
             target = path.target_entity_id
             source = path.source_entity_id
@@ -190,9 +190,9 @@ class CandidateActionGenerator:
         risk: float,
         generated_at: datetime,
         reason: str,
-    ) -> CandidateDefenseAction:
+    ) -> CandidateDefenseAction | None:
         if self.enabled and action_type not in self.enabled:
-            raise ValueError(f"Action type is not enabled: {action_type}")
+            return None
         category = (
             "observe"
             if action_type in OBSERVE_ACTIONS
@@ -237,9 +237,14 @@ class CandidateActionGenerator:
             generated_at=generated_at,
         )
 
-    def _merge(self, actions: list[CandidateDefenseAction]) -> list[CandidateDefenseAction]:
+    def _merge(
+        self,
+        actions: list[CandidateDefenseAction | None],
+    ) -> list[CandidateDefenseAction]:
         merged: dict[tuple[str, tuple[str, ...]], CandidateDefenseAction] = {}
         for action in actions:
+            if action is None:
+                continue
             key = (action.action_type, tuple(action.target_entity_ids))
             if key not in merged:
                 merged[key] = action

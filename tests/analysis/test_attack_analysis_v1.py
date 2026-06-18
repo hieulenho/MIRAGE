@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 from pathlib import Path
 
@@ -86,6 +87,26 @@ def test_action_generation_constraints_masks_and_ranking():
         for action in action_set.actions
         if not action_set.masks[action.action_id].allowed
     )
+
+
+def test_disabled_candidate_action_types_are_skipped_without_crashing():
+    config = deepcopy(load_config()["analysis"])
+    config["candidate_actions"]["enabled_action_types"] = [
+        "increase_endpoint_logging"
+    ]
+    _result, twin, detection = run_analysis_scenario(
+        "analysis_lateral_critical_db.jsonl"
+    )
+
+    limited = AttackAnalysisPipeline(config=config).analyze(
+        twin.create_snapshot(),
+        detection.belief_engine.create_snapshot(),
+    )
+
+    assert limited.candidate_action_set.actions
+    assert {
+        action.action_type for action in limited.candidate_action_set.actions
+    } == {"increase_endpoint_logging"}
 
 
 def test_decoy_path_prioritizes_information_gain_actions():
