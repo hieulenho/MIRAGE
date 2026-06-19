@@ -1,0 +1,39 @@
+# MIRAGE GNN Training Configuration V1
+# Use with: python -m mirage gnn train --config configs/gnn_v1.yaml
+
+# Reproducibility
+seed: 42
+
+# Architecture
+hidden_dim: 64
+out_dim: 64
+n_layers: 2
+dropout: 0.2
+type_embed_dim: 8
+
+# Training
+epochs: 100
+learning_rate: 0.001
+l2_weight: 0.0001
+use_cuda: false
+
+# Loss weights
+node_loss_weight: 1.0
+edge_loss_weight: 0.5
+graph_loss_weight: 0.3
+focal_gamma: 0.0          # 0 = standard BCE; >0 = focal loss
+
+# Early stopping
+early_stopping_patience: 15
+min_improvement: 0.0001
+
+# Hybrid scoring
+default_operating_mode: "gnn_shadow"   # heuristic_only / gnn_shadow / hybrid_recommendation
+heuristic_weight: 0.7
+gnn_weight: 0.3
+
+# Uncertainty / OOD
+uncertainty_threshold: 0.4
+missing_feature_threshold: 0.3
+max_nodes_train: 80
+max_edges_train: 160

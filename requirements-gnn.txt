@@ -1,0 +1,7 @@
+# GNN optional dependencies for Milestone 6
+# Install with: pip install -r requirements-gnn.txt
+# Core GNN requirements are listed first; install these before using
+# any mirage.gnn.* modules.
+torch>=2.1.0
+scikit-learn>=1.4.0
+pyyaml>=6.0.1

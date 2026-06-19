@@ -1622,3 +1622,82 @@ Durable storage and multi-worker state
 + calibrated evaluation on larger labeled datasets
 + optional GNN/MARL research tracks
 ```
+
+## Milestone 6: Hierarchical Graph Representation and GNN Encoder V1
+
+Milestone 6 adds an optional learned graph representation for MIRAGE local
+attack subgraphs. The GNN pipeline is additive: it produces embeddings and
+node, edge, and subgraph risk predictions, but it does not replace the
+deterministic attack-path scorer, POMDP/simulator logic, robust decision
+adapter, Safety Gate, action masks, rollback, or Shadow Mode.
+
+```text
+Digital Twin Snapshot
++ Belief Snapshot
++ Evidence
++ Local Attack Subgraph
++ Shadow/Synthetic Labels
+        ->
+GraphDatasetBuilder
+        ->
+HierarchicalGraphBuilder
+        ->
+GNNStateEncoder / Baselines
+        ->
+Risk Predictions
+        ->
+Hybrid Path Risk + Robust Decision optional features
+```
+
+Key modules:
+
+- `mirage.gnn.schema`: `GraphFeatureSchema`, `GraphSample`, labels, metadata,
+  inference results, and hybrid-risk schemas.
+- `mirage.gnn.dataset`: deterministic sample and dataset serialization with
+  scenario/time split manifests.
+- `mirage.gnn.hierarchy`: application, subnet, domain, and optional enterprise
+  aggregation over bounded local subgraphs.
+- `mirage.gnn.encoder`: pure PyTorch GraphSAGE-style encoder isolated behind a
+  replaceable interface.
+- `mirage.gnn.baselines`: heuristic, logistic, and MLP baselines using the same
+  features.
+- `mirage.gnn.inference`: read-only model loading, schema checks, OOD warnings,
+  fallback behavior, and latency reporting.
+- `mirage.gnn.hybrid_scorer`: `heuristic_only`, `gnn_shadow`, and
+  `hybrid_recommendation` scoring modes.
+- `mirage.gnn.decision_adapter`: optional GNN features for robust-decision
+  inputs without changing robust optimization mathematics.
+
+CLI:
+
+```bash
+python -m mirage gnn build-dataset --snapshots scenarios --output artifacts/gnn_dataset
+python -m mirage gnn train --dataset artifacts/gnn_dataset --config configs/gnn_v1.yaml --output models/gnn_v1
+python -m mirage gnn evaluate --dataset artifacts/gnn_dataset --model models/gnn_v1/best_model.pt
+python -m mirage gnn encode --sample artifacts/gnn_dataset/samples/<sample_id>.json --model models/gnn_v1/best_model.pt
+python -m mirage gnn models
+```
+
+API:
+
+```text
+POST /api/v1/gnn/encode
+GET  /api/v1/gnn/models
+GET  /api/v1/gnn/models/{id}
+GET  /api/v1/gnn/health
+POST /api/v1/gnn/evaluate
+GET  /api/v1/gnn/predictions/{analysis_id}
+```
+
+The default operating mode is `gnn_shadow`. When no model is installed, when
+uncertainty is high, or when OOD/schema checks fail, the GNN contribution is
+zero and MIRAGE keeps heuristic scores and safety fallbacks. GNN predictions
+are not automatically trusted; labels may be synthetic or weakly supervised;
+unseen environments may reduce performance; graph quality depends on Digital
+Twin quality; Milestone 6 does not implement RL, MARL, LLM decision making,
+production enforcement, or automatic retraining.
+
+See [docs/milestone6_gnn.md](docs/milestone6_gnn.md) for the full graph schema,
+feature definitions, hierarchy design, dataset strategy, baselines, model
+architecture, uncertainty/OOD behavior, integration rules, limitations, and
+recommended Milestone 7.

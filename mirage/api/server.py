@@ -225,6 +225,21 @@ if HAS_FASTAPI:
         corrected_action_type: Optional[str] = Field(default=None, max_length=100)
         comments: str = Field(default="", max_length=1000)
 
+    class GNNEncodeRequest(BaseModel):
+        """Read-only GNN encode request.
+
+        Provide either a serialized GraphSample or an existing analysis_id.
+        If no model is loaded, the response uses heuristic fallback values.
+        """
+        graph_sample: Optional[Dict[str, Any]] = None
+        analysis_id: Optional[str] = Field(default=None, min_length=1)
+        model_path: Optional[str] = Field(default=None, max_length=500)
+
+    class GNNEvaluateRequest(BaseModel):
+        """Evaluate baselines and, optionally, a GNN model on a dataset."""
+        dataset_path: str = Field(min_length=1, max_length=500)
+        model_path: Optional[str] = Field(default=None, max_length=500)
+
 
 def _parse_timestamp(value: Any) -> float:
     if value is None:
@@ -509,6 +524,9 @@ class MIRAGEStateManager:
         self.shadow_controller = ShadowModeController(
             self.config.get("shadow", {})
         )
+        self.gnn_startup_warnings: List[str] = []
+        self.gnn_predictions: Dict[str, Any] = {}
+        self._init_gnn_state()
 
         # Metrics
         self.total_events_processed = 0
@@ -519,6 +537,35 @@ class MIRAGEStateManager:
         self._ws_broadcast_lock = asyncio.Lock()
 
         print("[MIRAGE API] Engine ready.")
+
+    def _init_gnn_state(self) -> None:
+        """Initialize optional Milestone 6 GNN services without training."""
+        from mirage.gnn.inference import GNNInferenceService
+        from mirage.gnn.registry import ModelRegistry
+        from mirage.gnn.schema import GraphFeatureSchema
+
+        gnn_config = self.config.get("gnn", {})
+        self.gnn_schema = GraphFeatureSchema()
+        self.gnn_registry = ModelRegistry(
+            registry_path=str(
+                resolve_project_path(
+                    gnn_config.get("registry_path", "models/gnn_registry.json")
+                )
+            )
+        )
+        self.gnn_inference_service = GNNInferenceService(
+            schema=self.gnn_schema,
+            max_nodes=int(gnn_config.get("max_nodes", 200)),
+            max_edges=int(gnn_config.get("max_edges", 400)),
+        )
+        model_path = gnn_config.get("model_path")
+        if model_path:
+            try:
+                self.gnn_inference_service.load_model(
+                    str(resolve_project_path(model_path))
+                )
+            except (ImportError, RuntimeError, OSError, ValueError) as exc:
+                self.gnn_startup_warnings.append(f"gnn_model_not_loaded: {exc}")
 
     def _build_detection_pipeline(
         self,
@@ -959,6 +1006,145 @@ class MIRAGEStateManager:
                     rec.model_dump(mode="json") for rec in recs
                 ]
             }
+
+    def gnn_health(self) -> Dict:
+        """Return read-only GNN model health and registry summary."""
+        with self._lock:
+            health = self.gnn_inference_service.health().model_dump(mode="json")
+            health["registry"] = self.gnn_registry.summary()
+            health["warnings"] = list(health.get("warnings", [])) + list(
+                self.gnn_startup_warnings
+            )
+            return health
+
+    def gnn_list_models(self) -> Dict:
+        """Return all registered GNN models."""
+        with self._lock:
+            return {
+                "summary": self.gnn_registry.summary(),
+                "models": [
+                    model.model_dump(mode="json")
+                    for model in self.gnn_registry.list_models()
+                ],
+            }
+
+    def gnn_get_model(self, model_id: str) -> Dict:
+        """Return one registered GNN model."""
+        with self._lock:
+            model = self.gnn_registry.get(model_id)
+            if model is None:
+                raise KeyError(model_id)
+            return model.model_dump(mode="json")
+
+    def _gnn_sample_from_analysis(self, analysis_id: str):
+        """Build a GraphSample from a stored attack analysis."""
+        from mirage.gnn.dataset import GraphDatasetBuilder
+
+        analysis = self.get_attack_analysis(analysis_id)
+        builder = GraphDatasetBuilder(schema=self.gnn_schema)
+        return builder.build_sample(
+            twin_snapshot=self.twin.create_snapshot(),
+            belief_snapshot=self.detection_pipeline.belief_engine.create_snapshot(),
+            local_subgraph=analysis.subgraph,
+            reference_time=analysis.reference_time,
+            scenario_id=f"api:{analysis_id}",
+            topology_id="api_current_twin",
+        )
+
+    def gnn_encode(self, request) -> Dict:
+        """Encode a GraphSample or stored analysis with the GNN service."""
+        from mirage.gnn.schema import GraphSample
+
+        with self._lock:
+            if request.graph_sample is not None:
+                sample = GraphSample.model_validate(request.graph_sample)
+                prediction_key = request.analysis_id or sample.sample_id
+            elif request.analysis_id:
+                sample = self._gnn_sample_from_analysis(request.analysis_id)
+                prediction_key = request.analysis_id
+            else:
+                raise ValueError("graph_sample or analysis_id is required")
+
+            if request.model_path:
+                self.gnn_inference_service.load_model(
+                    str(resolve_project_path(request.model_path))
+                )
+
+            result = self.gnn_inference_service.encode_subgraph(sample)
+            self.gnn_predictions[prediction_key] = result
+            return result.model_dump(mode="json")
+
+    def gnn_get_prediction(self, analysis_id: str) -> Dict:
+        """Return a cached GNN prediction by analysis/sample key."""
+        with self._lock:
+            result = self.gnn_predictions.get(analysis_id)
+            if result is None:
+                raise KeyError(analysis_id)
+            return result.model_dump(mode="json")
+
+    def gnn_evaluate(self, request) -> Dict:
+        """Evaluate baselines and optionally a GNN model on a dataset."""
+        from mirage.gnn.baselines import HeuristicBaseline, LogisticBaseline, MLPBaseline
+        from mirage.gnn.dataset import GraphDatasetBuilder
+        from mirage.gnn.evaluation import GNNEvaluator
+        from mirage.gnn.schema import SplitType
+
+        dataset_path = resolve_project_path(request.dataset_path)
+        if not os.path.exists(dataset_path):
+            raise FileNotFoundError(str(dataset_path))
+
+        samples, _ = GraphDatasetBuilder.load_dataset(str(dataset_path))
+        test_samples = [sample for sample in samples if sample.split == SplitType.TEST]
+        if not test_samples:
+            test_samples = samples
+        train_samples = [sample for sample in samples if sample.split == SplitType.TRAIN]
+        evaluator = GNNEvaluator()
+        results: Dict[str, Any] = {}
+
+        for baseline_cls in (HeuristicBaseline, LogisticBaseline, MLPBaseline):
+            baseline = baseline_cls(schema=self.gnn_schema)
+            baseline.fit(train_samples)
+            results[baseline.name] = evaluator.full_evaluation(
+                test_samples,
+                baseline.predict,
+                baseline.name,
+            )
+
+        if request.model_path:
+            self.gnn_inference_service.load_model(
+                str(resolve_project_path(request.model_path))
+            )
+
+            def _predict(sample):
+                encoded = self.gnn_inference_service.encode_subgraph(sample)
+                return {
+                    "node_risk_probabilities": (
+                        encoded.gnn_output.node_risk_probabilities
+                    ),
+                    "edge_movement_probabilities": (
+                        encoded.gnn_output.edge_movement_probabilities
+                    ),
+                    "graph_risk_probability": (
+                        encoded.gnn_output.graph_risk_probability
+                    ),
+                }
+
+            results["gnn_v1"] = evaluator.full_evaluation(
+                test_samples,
+                _predict,
+                "gnn_v1",
+            )
+
+        return {
+            "dataset_path": str(dataset_path),
+            "sample_count": len(samples),
+            "test_sample_count": len(test_samples),
+            "results": results,
+            "note": (
+                "Metrics are synthetic/offline evaluation indicators and are "
+                "not production cybersecurity-effectiveness claims."
+            ),
+        }
 
     def record_shadow_feedback(
         self,
@@ -1513,6 +1699,12 @@ def create_app() -> Any:
                 "GET  /api/v1/analysis/{analysis_id}/actions",
                 "GET  /api/v1/analysis/{analysis_id}/masks",
                 "POST /api/v1/analysis/recompute",
+                "POST /api/v1/gnn/encode",
+                "GET  /api/v1/gnn/models",
+                "GET  /api/v1/gnn/models/{id}",
+                "GET  /api/v1/gnn/health",
+                "POST /api/v1/gnn/evaluate",
+                "GET  /api/v1/gnn/predictions/{analysis_id}",
                 "WS   /ws",
             ],
         }
@@ -2464,6 +2656,46 @@ def create_app() -> Any:
         return state.realtime_twin_service.create_consistent_snapshot().model_dump(
             mode="json"
         )
+
+    @app.post("/api/v1/gnn/encode")
+    async def encode_gnn(request: GNNEncodeRequest):
+        try:
+            return await asyncio.to_thread(state.gnn_encode, request)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Analysis not found") from exc
+        except (ImportError, RuntimeError, TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/gnn/models")
+    async def list_gnn_models():
+        return state.gnn_list_models()
+
+    @app.get("/api/v1/gnn/models/{model_id}")
+    async def get_gnn_model(model_id: str):
+        try:
+            return state.gnn_get_model(model_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Model not found") from exc
+
+    @app.get("/api/v1/gnn/health")
+    async def get_gnn_health():
+        return state.gnn_health()
+
+    @app.post("/api/v1/gnn/evaluate")
+    async def evaluate_gnn(request: GNNEvaluateRequest):
+        try:
+            return await asyncio.to_thread(state.gnn_evaluate, request)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (ImportError, RuntimeError, TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/gnn/predictions/{analysis_id}")
+    async def get_gnn_prediction(analysis_id: str):
+        try:
+            return state.gnn_get_prediction(analysis_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Prediction not found") from exc
 
     @app.post("/api/v1/shadow/run")
     async def run_shadow(request: ShadowRunRequest):

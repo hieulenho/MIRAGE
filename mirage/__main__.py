@@ -43,6 +43,10 @@ def main(argv: list[str] | None = None) -> int:
         from mirage.m5_cli import main as m5_main
 
         return m5_main([command, *args])
+    if command == "gnn":
+        from mirage.gnn.cli import main as gnn_main
+
+        return gnn_main(args)
     print(f"Unknown MIRAGE command: {command}")
     return 2
 

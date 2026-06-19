@@ -379,6 +379,27 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "feedback_state_path": "artifacts/shadow_feedback.json",
         "recommendation_state_path": "artifacts/shadow_recommendations.json"
     },
+    "gnn": {
+        "feature_schema_version": "v1",
+        "model_path": "",
+        "registry_path": "models/gnn_registry.json",
+        "prediction_state_path": "artifacts/gnn_predictions.json",
+        "default_operating_mode": "gnn_shadow",
+        "heuristic_weight": 0.7,
+        "gnn_weight": 0.3,
+        "max_nodes": 200,
+        "max_edges": 400,
+        "max_nodes_train": 80,
+        "max_edges_train": 160,
+        "uncertainty_threshold": 0.4,
+        "missing_feature_threshold": 0.3,
+        "low_coverage_threshold": 0.25,
+        "embedding_dim": 64,
+        "gnn_type": "graphsage",
+        "n_layers": 2,
+        "dropout": 0.2,
+        "random_seed": 42,
+    },
     "performance": {
         "synthetic_event_sizes": [1000, 10000],
         "max_fixture_events": 100000
@@ -654,6 +675,33 @@ def _validate_config(config: Dict[str, Any]) -> None:
     shadow = config["shadow"]
     if int(shadow["recommendation_ttl_seconds"]) < 1:
         raise ValueError("shadow.recommendation_ttl_seconds must be at least 1")
+
+    gnn = config["gnn"]
+    if str(gnn["default_operating_mode"]) not in {
+        "heuristic_only",
+        "gnn_shadow",
+        "hybrid_recommendation",
+    }:
+        raise ValueError("gnn.default_operating_mode is unsupported")
+    weight_sum = float(gnn["heuristic_weight"]) + float(gnn["gnn_weight"])
+    if abs(weight_sum - 1.0) > 1e-6:
+        raise ValueError("gnn heuristic and learned weights must sum to 1")
+    for key in ("max_nodes", "max_edges", "max_nodes_train", "max_edges_train"):
+        if int(gnn[key]) < 0:
+            raise ValueError(f"gnn.{key} must be >= 0")
+    for key in (
+        "uncertainty_threshold",
+        "missing_feature_threshold",
+        "low_coverage_threshold",
+        "dropout",
+    ):
+        value = float(gnn[key])
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError(f"gnn.{key} must be in [0, 1]")
+    if int(gnn["embedding_dim"]) < 1:
+        raise ValueError("gnn.embedding_dim must be at least 1")
+    if int(gnn["n_layers"]) < 1:
+        raise ValueError("gnn.n_layers must be at least 1")
 
 
 def get_config_path(path: Optional[os.PathLike | str] = None) -> Path:

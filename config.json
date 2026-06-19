@@ -395,6 +395,27 @@
     "feedback_state_path": "artifacts/shadow_feedback.json",
     "recommendation_state_path": "artifacts/shadow_recommendations.json"
   },
+  "gnn": {
+    "feature_schema_version": "v1",
+    "model_path": "",
+    "registry_path": "models/gnn_registry.json",
+    "prediction_state_path": "artifacts/gnn_predictions.json",
+    "default_operating_mode": "gnn_shadow",
+    "heuristic_weight": 0.7,
+    "gnn_weight": 0.3,
+    "max_nodes": 200,
+    "max_edges": 400,
+    "max_nodes_train": 80,
+    "max_edges_train": 160,
+    "uncertainty_threshold": 0.4,
+    "missing_feature_threshold": 0.3,
+    "low_coverage_threshold": 0.25,
+    "embedding_dim": 64,
+    "gnn_type": "graphsage",
+    "n_layers": 2,
+    "dropout": 0.2,
+    "random_seed": 42
+  },
   "performance": {
     "synthetic_event_sizes": [1000, 10000],
     "max_fixture_events": 100000
