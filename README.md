@@ -1442,3 +1442,183 @@ freshness/coverage restrictions, state-machine transitions, idempotency,
 canary failure, adapter failure, rollback failure, TTL expiry, kill switch,
 approval expiry, API, CLI, audit sanitization, and Digital Twin execution
 updates.
+
+## Milestone 5: Real-time Digital Twin, CASM, and Shadow Mode
+
+Milestone 5 moves MIRAGE from file replay and lab-only execution toward
+continuous read-only visibility. The enforced operating mode is `shadow` and
+`enforcement_enabled` must remain `false`.
+
+```text
+Read-only Connectors
+        ->
+Normalization
+        ->
+Checkpoint + Dedup + Ordering
+        ->
+CASM and Entity Resolution
+        ->
+Real-time Digital Twin
+        ->
+Contextual Detection and Belief
+        ->
+Local Attack-Path Analysis
+        ->
+Candidate Actions
+        ->
+Safety Gate
+        ->
+Shadow Recommendations
+        ->
+Analyst Feedback and Metrics
+```
+
+### Connector Architecture
+
+Connectors live under `mirage.connectors` and are read-only. They emit
+`RawConnectorRecord` objects and normalize through the canonical
+`SecurityEvent` schema. A connector never updates the attack graph, beliefs, or
+execution adapters directly.
+
+Supported fixture-driven connector types:
+
+- `sysmon` / `windows_event`
+- `zeek` / `netflow`
+- `active_directory` / `iam`
+- `asset_inventory` / `vulnerability_scanner`
+- `generic_jsonl`
+
+The streaming coordinator handles batching, stable ordering, deduplication,
+late-event marking, checkpoint commits, and sanitized dead-letter records.
+Checkpoints advance only after processing succeeds.
+
+### CASM V1
+
+`mirage.casm.CASMService` reconciles `DiscoveryObservation` records from
+inventory, endpoint, network, identity, and vulnerability sources. It uses
+configurable source precedence, preserves provenance in asset attributes,
+creates `AssetConflict` records for unsafe disagreements, avoids low-confidence
+automatic merges, and never reduces business criticality solely from a weaker
+source.
+
+Twin quality metrics include coverage, freshness, confidence, source diversity,
+conflict count, duplicate candidates, provisional assets, stale assets, and
+unknown asset rate. These are engineering indicators, not proof of complete
+visibility.
+
+### Realtime Twin
+
+`RealtimeTwinService` reuses the existing `DigitalTwin` and
+`ContextualDetectionPipeline` for incremental processing. It supports:
+
+- `process_event(SecurityEvent)`
+- `process_observation(DiscoveryObservation)`
+- `process_batch(...)`
+- consistent snapshots
+- Twin quality reports
+
+No full graph rebuild is required per connector record. Analysis remains
+bounded and explicit through existing analysis APIs.
+
+### Shadow Mode
+
+`ShadowModeController` evaluates analysis outputs and Safety Gate decisions to
+produce `ShadowRecommendation` records. Shadow Mode never calls enforcement
+adapters and never creates a real execution plan. Recommendations include
+evidence/version provenance, safety verdict, would-execute reasoning, predicted
+benefit, business risk, uncertainty, and expiry.
+
+Analyst feedback supports `ACCEPT`, `REJECT`, `DEFER`, `DUPLICATE`,
+`INSUFFICIENT_EVIDENCE`, `UNSAFE`, and `IRRELEVANT`. Feedback is stored for
+offline evaluation only; it does not retrain or modify models automatically.
+
+### CLI
+
+```bash
+python -m mirage connectors list
+python -m mirage connectors validate --config examples/connectors.json
+python -m mirage connectors poll-once --config examples/connectors.json
+python -m mirage connectors health --config examples/connectors.json
+
+python -m mirage casm quality --observations examples/casm_observations.jsonl
+python -m mirage casm conflicts --observations examples/casm_observations.jsonl
+
+python -m mirage twin realtime-status
+python -m mirage twin snapshot --out artifacts/realtime_twin.json
+
+python -m mirage shadow recommendations
+python -m mirage shadow feedback --recommendation-id <id> --decision ACCEPT
+```
+
+### API
+
+Milestone 5 endpoints:
+
+```text
+GET  /api/v1/connectors
+POST /api/v1/connectors
+POST /api/v1/connectors/{id}/validate
+POST /api/v1/connectors/{id}/start
+POST /api/v1/connectors/{id}/stop
+POST /api/v1/connectors/poll
+GET  /api/v1/connectors/{id}/health
+GET  /api/v1/connectors/health
+
+GET  /api/v1/casm/status
+GET  /api/v1/casm/assets
+GET  /api/v1/casm/conflicts
+GET  /api/v1/casm/quality
+POST /api/v1/casm/reconcile
+POST /api/v1/casm/expire-stale
+
+GET  /api/v1/twin/realtime/status
+GET  /api/v1/twin/realtime/quality
+POST /api/v1/twin/realtime/snapshot
+
+POST /api/v1/shadow/run
+GET  /api/v1/shadow/recommendations
+GET  /api/v1/shadow/recommendations/{id}
+POST /api/v1/shadow/recommendations/{id}/feedback
+GET  /api/v1/shadow/metrics
+
+GET  /api/v1/dead-letter
+POST /api/v1/dead-letter/{id}/retry
+```
+
+### Synthetic Fixtures
+
+Fixtures live in `examples/connectors/`:
+
+- `sysmon_lateral.jsonl`
+- `zeek_flows.jsonl`
+- `ad_iam_lab.jsonl`
+- `inventory_vuln.jsonl`
+- `duplicate_events.jsonl`
+- `out_of_order.jsonl`
+- `malformed.jsonl`
+
+`examples/m5_scenarios.json` documents scenarios A-J: normal activity,
+lateral movement, duplicates, out-of-order events, very late events, identity
+conflict, stale assets, decoy interaction, connector restart, and analyst
+rejection.
+
+### Security Boundaries
+
+- Connectors are read-only.
+- Source fixtures are synthetic.
+- No plaintext secrets are stored in connector configuration.
+- Raw command lines are redacted or hashed by default.
+- No packet payload storage.
+- No production enforcement, active scanning, exploit code, or hack-back.
+- Shadow Mode remains active even when automation kill switch is enabled.
+- CASM and Twin quality do not guarantee complete visibility.
+
+Recommended Milestone 6:
+
+```text
+Durable storage and multi-worker state
++ RBAC and stronger audit authorization
++ real read-only SIEM/EDR/cloud connectors
++ calibrated evaluation on larger labeled datasets
++ optional GNN/MARL research tracks
+```

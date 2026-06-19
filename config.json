@@ -1,7 +1,9 @@
 {
   "general": {
     "budget_limit": 6.0,
-    "discount_factor": 0.95
+    "discount_factor": 0.95,
+    "operating_mode": "shadow",
+    "enforcement_enabled": false
   },
   "topology": {
     "source": "builtin",
@@ -342,5 +344,59 @@
       "workload": "mirage-workload",
       "decoy": "mirage-decoy"
     }
+  },
+  "connectors": {
+    "enabled": true,
+    "definitions": [],
+    "allowed_lateness_seconds": 300,
+    "checkpoint_state_path": "artifacts/connectors_state.json",
+    "deduplication_window_seconds": 86400,
+    "dead_letter_state_path": "artifacts/dead_letter_state.json",
+    "default_batch_size": 100,
+    "maximum_buffered_events": 1000,
+    "retry": {"max_attempts": 3},
+    "backoff": {"initial_seconds": 1.0, "max_seconds": 30.0},
+    "redaction": {
+      "redact_command_line": true,
+      "redact_raw_payload": true
+    }
+  },
+  "casm": {
+    "asset_ttl_seconds": 86400,
+    "relationship_ttl_seconds": 3600,
+    "source_precedence": {
+      "authoritative_inventory": 100,
+      "active_directory": 90,
+      "iam": 90,
+      "edr": 80,
+      "sysmon": 75,
+      "vulnerability_scanner": 70,
+      "asset_inventory": 70,
+      "zeek": 50,
+      "netflow": 45,
+      "generic_jsonl": 40
+    },
+    "conflict_policy": "preserve_and_warn",
+    "allow_provisional_entities": true,
+    "quality_thresholds": {
+      "minimum_coverage": 0.2,
+      "minimum_freshness": 0.35,
+      "minimum_confidence": 0.35
+    }
+  },
+  "realtime": {
+    "analysis_debounce_seconds": 30,
+    "event_trigger_compromise_threshold": 0.85,
+    "max_events_per_poll": 1000
+  },
+  "shadow": {
+    "enabled": true,
+    "recommendation_ttl_seconds": 3600,
+    "feedback_state_path": "artifacts/shadow_feedback.json",
+    "recommendation_state_path": "artifacts/shadow_recommendations.json"
+  },
+  "performance": {
+    "synthetic_event_sizes": [1000, 10000],
+    "max_fixture_events": 100000
   }
 }

@@ -1,0 +1,3 @@
+{"event_id":"sys-001","event_time":"2026-06-18T08:00:00Z","EventID":1,"Computer":"ws-01","User":"LAB\\alice","Image":"powershell.exe","CommandLine":"powershell.exe -enc REDACT_ME","technique_ids":["T1059"],"environment":"lab","asset_type":"workstation"}
+{"event_id":"sys-002","event_time":"2026-06-18T08:00:20Z","EventID":3,"Computer":"ws-01","SourceIp":"10.10.20.10","DestinationIp":"10.10.30.20","DestinationPort":445,"User":"LAB\\alice","environment":"lab","asset_type":"workstation"}
+{"event_id":"sys-003","event_time":"2026-06-18T08:01:00Z","EventID":4624,"Computer":"app-01","TargetUserName":"alice","environment":"lab","asset_type":"application"}

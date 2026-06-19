@@ -1,0 +1,43 @@
+{
+  "connectors": [
+    {
+      "connector_id": "sysmon-fixture",
+      "connector_type": "sysmon",
+      "enabled": true,
+      "operating_mode": "shadow",
+      "input_path": "examples/connectors/sysmon_lateral.jsonl",
+      "polling_interval_seconds": 30,
+      "batch_size": 10,
+      "maximum_buffered_events": 1000,
+      "source_timezone": "UTC",
+      "strict": false,
+      "source_metadata": {"environment": "lab", "synthetic": true}
+    },
+    {
+      "connector_id": "zeek-fixture",
+      "connector_type": "zeek",
+      "enabled": true,
+      "operating_mode": "shadow",
+      "input_path": "examples/connectors/zeek_flows.jsonl",
+      "polling_interval_seconds": 30,
+      "batch_size": 10,
+      "maximum_buffered_events": 1000,
+      "source_timezone": "UTC",
+      "strict": false,
+      "source_metadata": {"environment": "lab", "synthetic": true}
+    },
+    {
+      "connector_id": "inventory-fixture",
+      "connector_type": "asset_inventory",
+      "enabled": true,
+      "operating_mode": "shadow",
+      "input_path": "examples/connectors/inventory_vuln.jsonl",
+      "polling_interval_seconds": 60,
+      "batch_size": 10,
+      "maximum_buffered_events": 1000,
+      "source_timezone": "UTC",
+      "strict": false,
+      "source_metadata": {"environment": "lab", "synthetic": true}
+    }
+  ]
+}

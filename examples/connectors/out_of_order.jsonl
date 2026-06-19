@@ -1,0 +1,2 @@
+{"event_id":"ooo-002","event_time":"2026-06-18T08:00:30Z","event_type":"dns_query","source":"fixture","src_ip":"10.10.20.10","dst_ip":"10.10.10.53","attributes":{"query":"db.lab.local","environment":"lab"}}
+{"event_id":"ooo-001","event_time":"2026-06-18T08:00:10Z","event_type":"network_connection","source":"fixture","src_ip":"10.10.20.10","dst_ip":"10.10.30.20","dst_port":445,"attributes":{"environment":"lab"}}

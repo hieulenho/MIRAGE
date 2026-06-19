@@ -1,0 +1,15 @@
+{
+  "scope": "synthetic_milestone5_shadow_only",
+  "scenarios": [
+    {"id": "normal_enterprise_activity", "fixtures": ["inventory_vuln.jsonl", "ad_iam_lab.jsonl"], "expected": "low compromise belief"},
+    {"id": "discovery_and_lateral_movement", "fixtures": ["sysmon_lateral.jsonl", "zeek_flows.jsonl"], "expected": "recommendations generated in shadow mode"},
+    {"id": "duplicate_source_events", "fixtures": ["duplicate_events.jsonl"], "expected": "duplicates counted without risk inflation"},
+    {"id": "out_of_order_events", "fixtures": ["out_of_order.jsonl"], "expected": "stable event-time ordering"},
+    {"id": "very_late_event", "expected": "late event preserved and counted"},
+    {"id": "asset_identity_conflict", "expected": "conflict created without unsafe merge"},
+    {"id": "stale_asset_relationship", "expected": "quality decreases and restrictive safety verdicts"},
+    {"id": "decoy_interaction", "expected": "high-priority shadow recommendation"},
+    {"id": "connector_failure_restart", "fixtures": ["malformed.jsonl"], "expected": "dead-letter and checkpoint preservation"},
+    {"id": "analyst_rejects_unsafe_recommendation", "expected": "feedback stored without learning or execution"}
+  ]
+}

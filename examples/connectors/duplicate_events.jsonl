@@ -1,0 +1,2 @@
+{"event_id":"dup-001","event_time":"2026-06-18T08:00:00Z","event_type":"network_connection","source":"fixture","src_ip":"10.10.20.10","dst_ip":"10.10.30.20","dst_port":445,"attributes":{"environment":"lab"}}
+{"event_id":"dup-001","event_time":"2026-06-18T08:00:00Z","event_type":"network_connection","source":"fixture","src_ip":"10.10.20.10","dst_ip":"10.10.30.20","dst_port":445,"attributes":{"environment":"lab"}}

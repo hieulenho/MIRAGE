@@ -1,0 +1,2 @@
+{"uid":"z-001","ts":"2026-06-18T08:00:10Z","_path":"conn","id.orig_h":"10.10.20.10","id.resp_h":"10.10.30.20","id.resp_p":445,"proto":"tcp","conn_state":"S1","orig_bytes":512,"environment":"lab"}
+{"uid":"z-002","ts":"2026-06-18T08:00:15Z","_path":"dns","id.orig_h":"10.10.20.10","id.resp_h":"10.10.10.53","id.resp_p":53,"proto":"udp","query":"app-01.lab.local","environment":"lab"}

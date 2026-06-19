@@ -1,0 +1,2 @@
+{"record_id":"ad-001","event_time":"2026-06-18T08:00:05Z","event_type":"authentication_success","domain":"LAB","username":"alice","hostname":"ws-01","groups":["Domain Users"],"identity_type":"user","privilege_level":"standard","environment":"lab"}
+{"record_id":"ad-002","event_time":"2026-06-18T08:01:05Z","event_type":"credential_use","domain":"LAB","username":"svc-backup","hostname":"app-01","groups":["Service Accounts"],"identity_type":"service_account","privilege_level":"privileged","environment":"lab"}

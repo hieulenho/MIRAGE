@@ -17,6 +17,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "general": {
         "budget_limit": 6.0,
         "discount_factor": 0.95,
+        "operating_mode": "shadow",
+        "enforcement_enabled": False,
     },
     "topology": {
         "source": "builtin",
@@ -327,6 +329,60 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "decoy": "mirage-decoy"
         }
     },
+    "connectors": {
+        "enabled": True,
+        "definitions": [],
+        "allowed_lateness_seconds": 300,
+        "checkpoint_state_path": "artifacts/connectors_state.json",
+        "deduplication_window_seconds": 86400,
+        "dead_letter_state_path": "artifacts/dead_letter_state.json",
+        "default_batch_size": 100,
+        "maximum_buffered_events": 1000,
+        "retry": {"max_attempts": 3},
+        "backoff": {"initial_seconds": 1.0, "max_seconds": 30.0},
+        "redaction": {
+            "redact_command_line": True,
+            "redact_raw_payload": True
+        }
+    },
+    "casm": {
+        "asset_ttl_seconds": 86400,
+        "relationship_ttl_seconds": 3600,
+        "source_precedence": {
+            "authoritative_inventory": 100,
+            "active_directory": 90,
+            "iam": 90,
+            "edr": 80,
+            "sysmon": 75,
+            "vulnerability_scanner": 70,
+            "asset_inventory": 70,
+            "zeek": 50,
+            "netflow": 45,
+            "generic_jsonl": 40
+        },
+        "conflict_policy": "preserve_and_warn",
+        "allow_provisional_entities": True,
+        "quality_thresholds": {
+            "minimum_coverage": 0.2,
+            "minimum_freshness": 0.35,
+            "minimum_confidence": 0.35
+        }
+    },
+    "realtime": {
+        "analysis_debounce_seconds": 30,
+        "event_trigger_compromise_threshold": 0.85,
+        "max_events_per_poll": 1000
+    },
+    "shadow": {
+        "enabled": True,
+        "recommendation_ttl_seconds": 3600,
+        "feedback_state_path": "artifacts/shadow_feedback.json",
+        "recommendation_state_path": "artifacts/shadow_recommendations.json"
+    },
+    "performance": {
+        "synthetic_event_sizes": [1000, 10000],
+        "max_fixture_events": 100000
+    },
 }
 
 
@@ -571,6 +627,33 @@ def _validate_config(config: Dict[str, Any]) -> None:
         )
     if not isinstance(execution["adapters"], dict):
         raise ValueError("execution.adapters must be an object")
+
+    if str(config["general"].get("operating_mode", "shadow")) != "shadow":
+        if bool(config["general"].get("enforcement_enabled", False)):
+            raise ValueError(
+                "Milestone 5 fails safely: enforcement cannot be enabled "
+                "outside shadow mode."
+            )
+    if bool(config["general"].get("enforcement_enabled", False)):
+        raise ValueError("Milestone 5 requires enforcement_enabled=false")
+
+    connectors = config["connectors"]
+    if int(connectors["default_batch_size"]) < 1:
+        raise ValueError("connectors.default_batch_size must be at least 1")
+    if int(connectors["maximum_buffered_events"]) < 1:
+        raise ValueError("connectors.maximum_buffered_events must be at least 1")
+    if int(connectors["allowed_lateness_seconds"]) < 0:
+        raise ValueError("connectors.allowed_lateness_seconds must be >= 0")
+
+    casm = config["casm"]
+    if int(casm["asset_ttl_seconds"]) < 1:
+        raise ValueError("casm.asset_ttl_seconds must be at least 1")
+    if not isinstance(casm["source_precedence"], dict):
+        raise ValueError("casm.source_precedence must be an object")
+
+    shadow = config["shadow"]
+    if int(shadow["recommendation_ttl_seconds"]) < 1:
+        raise ValueError("shadow.recommendation_ttl_seconds must be at least 1")
 
 
 def get_config_path(path: Optional[os.PathLike | str] = None) -> Path:

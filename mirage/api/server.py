@@ -73,21 +73,46 @@ from mirage.analysis.pipeline import AttackAnalysisPipeline
 from mirage.detection.pipeline import ContextualDetectionPipeline
 from mirage.domain.schemas import (
     ActionMask,
+    AnalystDecision,
+    AnalystFeedback,
     ApprovalDecision,
+    ConnectorConfig,
     CandidateDefenseAction,
+    DiscoveryObservation,
     SafetyVerdict,
     AttackAnalysisResult,
     SecurityEvent,
 )
+from mirage.casm.service import CASMService
+from mirage.connectors.fixture import build_connector
 from mirage.execution.audit import ImmutableAuditStore
 from mirage.execution.kill_switch import KillSwitch
 from mirage.execution.orchestrator import DeceptionOrchestrator
 from mirage.execution.safety import SafetyGate as ExecutionSafetyGate
+from mirage.execution.utils import deterministic_id
+from mirage.realtime.twin_service import RealtimeTwinService
+from mirage.shadow.controller import ShadowModeController
+from mirage.streaming.coordinator import ConnectorManager
+from mirage.streaming.state import JSONStateStore
 from mirage.ingestion.normalizer import EventNormalizer
 from mirage.layer6_twin.digital_twin import DigitalTwin
 from mirage import __version__
 
 LOGGER = logging.getLogger(__name__)
+
+
+def stable_shadow_feedback_id(
+    recommendation_id: str,
+    analyst_identifier: str,
+    decision: str,
+) -> str:
+    """Create deterministic feedback IDs for API submissions."""
+    return deterministic_id(
+        "feedback",
+        recommendation_id,
+        analyst_identifier,
+        decision,
+    )
 
 
 # ============================================================
@@ -176,6 +201,29 @@ if HAS_FASTAPI:
         reason: str = Field(default="", max_length=500)
         action_type: Optional[str] = Field(default=None, max_length=100)
         environment: Optional[str] = Field(default=None, max_length=100)
+
+    class ConnectorRegisterRequest(BaseModel):
+        """Register or replace a read-only connector config."""
+        connector: ConnectorConfig
+
+    class CASMReconcileRequest(BaseModel):
+        """Apply one CASM discovery observation."""
+        observation: DiscoveryObservation
+
+    class ShadowRunRequest(BaseModel):
+        """Run shadow recommendations for an existing analysis."""
+        analysis_id: str = Field(min_length=1)
+
+    class ShadowFeedbackRequest(BaseModel):
+        """Record analyst feedback for a shadow recommendation."""
+        analyst_decision: AnalystDecision
+        analyst_identifier: str = Field(min_length=1, max_length=100)
+        usefulness_score: Optional[float] = Field(default=None, ge=0, le=1)
+        correctness_score: Optional[float] = Field(default=None, ge=0, le=1)
+        safety_score: Optional[float] = Field(default=None, ge=0, le=1)
+        rejection_reason: str = Field(default="", max_length=500)
+        corrected_action_type: Optional[str] = Field(default=None, max_length=100)
+        comments: str = Field(default="", max_length=1000)
 
 
 def _parse_timestamp(value: Any) -> float:
@@ -427,6 +475,39 @@ class MIRAGEStateManager:
             audit_store=self.execution_audit_store,
             kill_switch=self.execution_kill_switch,
             twin=self.twin,
+        )
+        self.casm_service = CASMService(
+            self.twin,
+            config=self.config.get("casm", {}),
+        )
+        self.realtime_twin_service = RealtimeTwinService(
+            twin=self.twin,
+            detection_pipeline=self.detection_pipeline,
+            casm_service=self.casm_service,
+        )
+        connector_config = self.config.get("connectors", {})
+        self.connector_state_store = JSONStateStore(
+            resolve_project_path(
+                connector_config.get(
+                    "checkpoint_state_path",
+                    "artifacts/connectors_state.json",
+                )
+            )
+        )
+        self.connector_manager = ConnectorManager(
+            event_sink=self.realtime_twin_service.process_event,
+            allowed_lateness_seconds=int(
+                connector_config.get("allowed_lateness_seconds", 300)
+            ),
+            state_store=self.connector_state_store,
+        )
+        self.connectors: Dict[str, Any] = {}
+        for raw_connector in connector_config.get("definitions", []):
+            connector = build_connector(ConnectorConfig.model_validate(raw_connector))
+            self.connector_manager.register(connector)
+            self.connectors[connector.config.connector_id] = connector
+        self.shadow_controller = ShadowModeController(
+            self.config.get("shadow", {})
         )
 
         # Metrics
@@ -777,6 +858,134 @@ class MIRAGEStateManager:
         """Return sanitized execution audit events."""
         with self._lock:
             return self.execution_audit_store.list_events()
+
+    def register_connector(self, config: ConnectorConfig) -> Dict:
+        """Register a read-only connector."""
+        with self._lock:
+            connector = build_connector(config)
+            self.connector_manager.register(connector)
+            self.connectors[config.connector_id] = connector
+            return connector.health().model_dump(mode="json")
+
+    def connector_health(self, connector_id: str | None = None) -> Dict | List[Dict]:
+        """Return connector health."""
+        with self._lock:
+            if connector_id is None:
+                return [
+                    health.model_dump(mode="json")
+                    for health in self.connector_manager.health_summary()
+                ]
+            connector = self.connectors.get(connector_id)
+            if connector is None:
+                raise KeyError(connector_id)
+            return connector.health().model_dump(mode="json")
+
+    def connector_validate(self, connector_id: str) -> Dict:
+        """Validate one connector."""
+        with self._lock:
+            connector = self.connectors.get(connector_id)
+            if connector is None:
+                raise KeyError(connector_id)
+            connector.validate_config()
+            return {"connector_id": connector_id, "valid": True}
+
+    def connector_start(self, connector_id: str) -> Dict:
+        """Start one connector."""
+        with self._lock:
+            connector = self.connectors.get(connector_id)
+            if connector is None:
+                raise KeyError(connector_id)
+            connector.start()
+            return connector.health().model_dump(mode="json")
+
+    def connector_stop(self, connector_id: str) -> Dict:
+        """Stop one connector."""
+        with self._lock:
+            connector = self.connectors.get(connector_id)
+            if connector is None:
+                raise KeyError(connector_id)
+            connector.stop()
+            return connector.health().model_dump(mode="json")
+
+    def connector_poll(self) -> Dict:
+        """Poll all connectors once."""
+        with self._lock:
+            summary = self.connector_manager.poll_once(
+                datetime.now().astimezone()
+            )
+            return summary.model_dump(mode="json")
+
+    def casm_status(self) -> Dict:
+        """Return CASM/Twin status."""
+        with self._lock:
+            return {
+                "twin": self.twin.health(),
+                "quality": self.casm_service.quality_report().model_dump(mode="json"),
+            }
+
+    def casm_reconcile(self, observation: DiscoveryObservation) -> Dict:
+        """Apply one CASM observation."""
+        with self._lock:
+            return self.casm_service.apply_observation(observation).model_dump(
+                mode="json"
+            )
+
+    def run_shadow(self, analysis_id: str) -> Dict:
+        """Run shadow recommendations for an existing analysis."""
+        with self._lock:
+            analysis = self.get_attack_analysis(analysis_id)
+            twin_snapshot = self.twin.create_snapshot()
+            belief_snapshot = self.detection_pipeline.belief_engine.create_snapshot()
+            decisions = []
+            for action in analysis.candidate_action_set.actions:
+                mask = analysis.candidate_action_set.masks[action.action_id]
+                decisions.append(
+                    self.execution_safety_gate.evaluate(
+                        action,
+                        mask,
+                        twin_snapshot,
+                        belief_snapshot,
+                        list(self.execution_orchestrator.records.values()),
+                        analysis.reference_time,
+                    )
+                )
+            recs = self.shadow_controller.evaluate_analysis(
+                analysis,
+                decisions,
+                analysis.reference_time,
+            )
+            return {
+                "recommendations": [
+                    rec.model_dump(mode="json") for rec in recs
+                ]
+            }
+
+    def record_shadow_feedback(
+        self,
+        recommendation_id: str,
+        request,
+    ) -> Dict:
+        """Record analyst feedback for shadow recommendation."""
+        feedback = AnalystFeedback(
+            feedback_id=stable_shadow_feedback_id(
+                recommendation_id,
+                request.analyst_identifier,
+                request.analyst_decision.value,
+            ),
+            recommendation_id=recommendation_id,
+            analyst_decision=request.analyst_decision,
+            usefulness_score=request.usefulness_score,
+            correctness_score=request.correctness_score,
+            safety_score=request.safety_score,
+            rejection_reason=request.rejection_reason,
+            corrected_action_type=request.corrected_action_type,
+            comments=request.comments,
+            analyst_identifier=request.analyst_identifier,
+            timestamp=datetime.now().astimezone(),
+        )
+        with self._lock:
+            self.shadow_controller.record_feedback(feedback)
+        return feedback.model_dump(mode="json")
 
     def get_belief_all(self) -> Dict:
         """Get belief states for all tracked hosts."""
@@ -1690,6 +1899,18 @@ def create_app() -> Any:
                 )
                 state.analysis_history = {}
                 state.execution_orchestrator.twin = fresh_twin
+                state.casm_service = CASMService(
+                    fresh_twin,
+                    config=state.config.get("casm", {}),
+                )
+                state.realtime_twin_service = RealtimeTwinService(
+                    twin=fresh_twin,
+                    detection_pipeline=state.detection_pipeline,
+                    casm_service=state.casm_service,
+                )
+                state.connector_manager.event_sink = (
+                    state.realtime_twin_service.process_event
+                )
             snapshot = fresh_twin.create_snapshot().model_dump(mode="json")
             response = {
                 "summary": summary.model_dump(mode="json"),
@@ -2136,6 +2357,173 @@ def create_app() -> Any:
             environment=request.environment,
         )
         return result.model_dump(mode="json")
+
+    @app.get("/api/v1/connectors", summary="List read-only connectors")
+    async def list_connectors():
+        return {
+            "connectors": [
+                connector.config.model_dump(mode="json")
+                for connector in state.connectors.values()
+            ]
+        }
+
+    @app.post("/api/v1/connectors", summary="Register a read-only connector")
+    async def register_connector(request: ConnectorRegisterRequest):
+        try:
+            return state.register_connector(request.connector)
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/connectors/{connector_id}/validate")
+    async def validate_connector(connector_id: str):
+        try:
+            return state.connector_validate(connector_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Connector not found") from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/connectors/{connector_id}/start")
+    async def start_connector(connector_id: str):
+        try:
+            return state.connector_start(connector_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Connector not found") from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/connectors/{connector_id}/stop")
+    async def stop_connector(connector_id: str):
+        try:
+            return state.connector_stop(connector_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Connector not found") from exc
+
+    @app.post("/api/v1/connectors/poll")
+    async def poll_connectors():
+        return state.connector_poll()
+
+    @app.get("/api/v1/connectors/{connector_id}/health")
+    async def get_connector_health(connector_id: str):
+        try:
+            return state.connector_health(connector_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Connector not found") from exc
+
+    @app.get("/api/v1/connectors/health")
+    async def get_connectors_health():
+        return {"connectors": state.connector_health()}
+
+    @app.get("/api/v1/casm/status")
+    async def get_casm_status():
+        return state.casm_status()
+
+    @app.get("/api/v1/casm/assets")
+    async def get_casm_assets(limit: Annotated[int, Query(ge=1, le=1000)] = 100):
+        snapshot = state.twin.create_snapshot()
+        return {
+            "assets": [
+                asset.model_dump(mode="json")
+                for asset in list(snapshot.assets.values())[:limit]
+            ]
+        }
+
+    @app.get("/api/v1/casm/conflicts")
+    async def get_casm_conflicts():
+        return {
+            "conflicts": [
+                conflict.model_dump(mode="json")
+                for conflict in state.casm_service.find_conflicts()
+            ]
+        }
+
+    @app.get("/api/v1/casm/quality")
+    async def get_casm_quality():
+        return state.casm_service.quality_report().model_dump(mode="json")
+
+    @app.post("/api/v1/casm/reconcile")
+    async def reconcile_casm(request: CASMReconcileRequest):
+        return state.casm_reconcile(request.observation)
+
+    @app.post("/api/v1/casm/expire-stale")
+    async def expire_stale_casm():
+        return state.casm_service.expire_stale_entities(
+            datetime.now().astimezone()
+        ).model_dump(mode="json")
+
+    @app.get("/api/v1/twin/realtime/status")
+    async def get_realtime_status():
+        return state.twin.health()
+
+    @app.get("/api/v1/twin/realtime/quality")
+    async def get_realtime_quality():
+        return state.realtime_twin_service.quality_report().model_dump(mode="json")
+
+    @app.post("/api/v1/twin/realtime/snapshot")
+    async def create_realtime_snapshot():
+        return state.realtime_twin_service.create_consistent_snapshot().model_dump(
+            mode="json"
+        )
+
+    @app.post("/api/v1/shadow/run")
+    async def run_shadow(request: ShadowRunRequest):
+        try:
+            return state.run_shadow(request.analysis_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Analysis not found") from exc
+
+    @app.get("/api/v1/shadow/recommendations")
+    async def list_shadow_recommendations(
+        status: Optional[str] = None,
+        limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    ):
+        return {
+            "recommendations": [
+                rec.model_dump(mode="json")
+                for rec in state.shadow_controller.get_recommendations(status)[:limit]
+            ]
+        }
+
+    @app.get("/api/v1/shadow/recommendations/{recommendation_id}")
+    async def get_shadow_recommendation(recommendation_id: str):
+        rec = state.shadow_controller.recommendations.get(recommendation_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="Recommendation not found")
+        return rec.model_dump(mode="json")
+
+    @app.post("/api/v1/shadow/recommendations/{recommendation_id}/feedback")
+    async def record_shadow_feedback(
+        recommendation_id: str,
+        request: ShadowFeedbackRequest,
+    ):
+        return state.record_shadow_feedback(recommendation_id, request)
+
+    @app.get("/api/v1/shadow/metrics")
+    async def get_shadow_metrics():
+        return state.shadow_controller.metrics().model_dump(mode="json")
+
+    @app.get("/api/v1/dead-letter")
+    async def get_dead_letters():
+        return {
+            "entries": [
+                entry.model_dump(mode="json")
+                for entry in state.connector_manager.dead_letters.list_entries()
+            ]
+        }
+
+    @app.post("/api/v1/dead-letter/{dead_letter_id}/retry")
+    async def retry_dead_letter(dead_letter_id: str):
+        entries = {
+            entry.dead_letter_id: entry
+            for entry in state.connector_manager.dead_letters.list_entries()
+        }
+        if dead_letter_id not in entries:
+            raise HTTPException(status_code=404, detail="Dead-letter not found")
+        return {
+            "dead_letter_id": dead_letter_id,
+            "retry_queued": entries[dead_letter_id].retry_eligible,
+            "note": "Controlled replay is recorded for operator review in Milestone 5.",
+        }
 
     # ---- WebSocket ----
 

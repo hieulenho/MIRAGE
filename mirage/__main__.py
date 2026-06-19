@@ -12,7 +12,8 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "Usage: python -m mirage "
             "{replay,detect,analyze-paths,safety-check,execute-plan,"
-            "execution-status,rollback,kill-switch} [options]"
+            "execution-status,rollback,kill-switch,connectors,casm,shadow,twin} "
+            "[options]"
         )
         return 0
     command = args.pop(0)
@@ -38,6 +39,10 @@ def main(argv: list[str] | None = None) -> int:
         from mirage.execution_cli import main as execution_main
 
         return execution_main([command, *args])
+    if command in {"connectors", "casm", "shadow", "twin"}:
+        from mirage.m5_cli import main as m5_main
+
+        return m5_main([command, *args])
     print(f"Unknown MIRAGE command: {command}")
     return 2
 

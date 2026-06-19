@@ -1183,3 +1183,370 @@ class AuditEvent(StrictModel):
     @classmethod
     def _aware_datetime(cls, value: datetime) -> datetime:
         return require_aware(value)
+
+
+class ConnectorType(str, Enum):
+    """Supported read-only connector types."""
+
+    SYSMON = "sysmon"
+    WINDOWS_EVENT = "windows_event"
+    ZEEK = "zeek"
+    NETFLOW = "netflow"
+    ACTIVE_DIRECTORY = "active_directory"
+    IAM = "iam"
+    ASSET_INVENTORY = "asset_inventory"
+    VULNERABILITY_SCANNER = "vulnerability_scanner"
+    GENERIC_JSONL = "generic_jsonl"
+
+
+class ConnectorHealthState(str, Enum):
+    """Connector lifecycle and health states."""
+
+    STARTING = "STARTING"
+    HEALTHY = "HEALTHY"
+    DEGRADED = "DEGRADED"
+    BACKOFF = "BACKOFF"
+    FAILED = "FAILED"
+    STOPPED = "STOPPED"
+
+
+class EntityLifecycleState(str, Enum):
+    """CASM lifecycle states for continuous observations."""
+
+    ACTIVE = "ACTIVE"
+    STALE = "STALE"
+    INACTIVE = "INACTIVE"
+    EXPIRED = "EXPIRED"
+    CONFLICTED = "CONFLICTED"
+    PROVISIONAL = "PROVISIONAL"
+
+
+class ShadowStatus(str, Enum):
+    """Shadow recommendation lifecycle states."""
+
+    GENERATED = "GENERATED"
+    PRESENTED = "PRESENTED"
+    ACKNOWLEDGED = "ACKNOWLEDGED"
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
+    DEFERRED = "DEFERRED"
+    EXPIRED = "EXPIRED"
+
+
+class AnalystDecision(str, Enum):
+    """Supported analyst feedback decisions."""
+
+    ACCEPT = "ACCEPT"
+    REJECT = "REJECT"
+    DEFER = "DEFER"
+    DUPLICATE = "DUPLICATE"
+    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+    UNSAFE = "UNSAFE"
+    IRRELEVANT = "IRRELEVANT"
+
+
+class ConnectorConfig(StrictModel):
+    """Configuration for a read-only connector."""
+
+    connector_id: str = Field(min_length=1)
+    connector_type: ConnectorType
+    enabled: bool = True
+    operating_mode: str = "shadow"
+    input_path: str | None = None
+    endpoint_ref: str | None = None
+    polling_interval_seconds: int = Field(default=30, ge=1)
+    batch_size: int = Field(default=100, ge=1)
+    maximum_buffered_events: int = Field(default=1000, ge=1)
+    source_timezone: str = "UTC"
+    strict: bool = False
+    checkpoint: dict[str, Any] = Field(default_factory=dict)
+    retry: dict[str, int] = Field(default_factory=dict)
+    backoff: dict[str, float] = Field(default_factory=dict)
+    allowed_event_types: list[str] = Field(default_factory=list)
+    source_metadata: dict[str, Any] = Field(default_factory=dict)
+    redaction_policy: dict[str, Any] = Field(default_factory=dict)
+    health_check_interval_seconds: int = Field(default=60, ge=1)
+
+
+class RawConnectorRecord(StrictModel):
+    """Raw read-only connector record before canonical normalization."""
+
+    connector_id: str = Field(min_length=1)
+    source_record_id: str = Field(min_length=1)
+    source_event_time: datetime
+    ingestion_time: datetime
+    source_offset: int | str = Field(default=0)
+    source_partition: str | None = None
+    raw_event_type: str = "unknown"
+    raw_payload: dict[str, Any] = Field(default_factory=dict)
+    payload_hash: str = Field(min_length=1)
+    parsing_warnings: list[str] = Field(default_factory=list)
+
+    @field_validator("source_event_time", "ingestion_time")
+    @classmethod
+    def _aware_datetime(cls, value: datetime) -> datetime:
+        return require_aware(value)
+
+
+class ConnectorCheckpoint(StrictModel):
+    """Durable connector checkpoint."""
+
+    connector_id: str = Field(min_length=1)
+    checkpoint_version: int = Field(default=1, ge=1)
+    source_identifier: str = Field(min_length=1)
+    last_committed_offset: int | str = Field(default=0)
+    last_event_time: datetime | None = None
+    last_record_id: str | None = None
+    updated_timestamp: datetime
+    checksum: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("last_event_time", "updated_timestamp")
+    @classmethod
+    def _aware_datetime(cls, value: datetime | None) -> datetime | None:
+        return require_aware(value) if value is not None else None
+
+
+class ConnectorHealth(StrictModel):
+    """Connector health and counters."""
+
+    connector_id: str = Field(min_length=1)
+    state: ConnectorHealthState
+    last_successful_read: datetime | None = None
+    last_successful_checkpoint: datetime | None = None
+    records_read: int = Field(default=0, ge=0)
+    events_normalized: int = Field(default=0, ge=0)
+    rejected_records: int = Field(default=0, ge=0)
+    duplicate_records: int = Field(default=0, ge=0)
+    late_records: int = Field(default=0, ge=0)
+    retry_count: int = Field(default=0, ge=0)
+    current_lag_seconds: float = Field(default=0.0, ge=0.0)
+    buffer_utilization: float = Field(default=0.0, ge=0.0, le=1.0)
+    error_summary: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+    @field_validator("last_successful_read", "last_successful_checkpoint")
+    @classmethod
+    def _aware_datetime(cls, value: datetime | None) -> datetime | None:
+        return require_aware(value) if value is not None else None
+
+
+class DiscoveryObservation(StrictModel):
+    """CASM discovery observation from inventory, identity, network, or scanner sources."""
+
+    observation_id: str = Field(min_length=1)
+    observed_entity_type: str = Field(min_length=1)
+    source: str = Field(min_length=1)
+    event_time: datetime
+    hostname: str | None = None
+    domain: str | None = None
+    ip_addresses: list[str] = Field(default_factory=list)
+    mac_address: str | None = None
+    agent_id: str | None = None
+    cloud_instance_id: str | None = None
+    operating_system: str | None = None
+    services: list[str] = Field(default_factory=list)
+    ports: list[int] = Field(default_factory=list)
+    software: list[str] = Field(default_factory=list)
+    vulnerabilities: list[str] = Field(default_factory=list)
+    identity_refs: list[str] = Field(default_factory=list)
+    subnet: str | None = None
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    attributes: dict[str, Any] = Field(default_factory=dict)
+    expires_at: datetime | None = None
+
+    @field_validator("event_time", "expires_at")
+    @classmethod
+    def _aware_datetime(cls, value: datetime | None) -> datetime | None:
+        return require_aware(value) if value is not None else None
+
+
+class AssetConflict(StrictModel):
+    """Conflict between CASM observations for one canonical asset field."""
+
+    conflict_id: str = Field(min_length=1)
+    canonical_entity_id: str = Field(min_length=1)
+    conflicting_field: str = Field(min_length=1)
+    candidate_values: list[str] = Field(default_factory=list)
+    sources: list[str] = Field(default_factory=list)
+    source_confidence: dict[str, float] = Field(default_factory=dict)
+    resolution_status: str = "open"
+    chosen_value: str | None = None
+    resolution_reason: str = ""
+    created_at: datetime
+    updated_at: datetime
+
+    @field_validator("created_at", "updated_at")
+    @classmethod
+    def _aware_datetime(cls, value: datetime) -> datetime:
+        return require_aware(value)
+
+
+class TwinQualityReport(StrictModel):
+    """Engineering quality metrics for the Digital Twin."""
+
+    twin_version: int = Field(ge=0)
+    total_assets: int = Field(ge=0)
+    active_assets: int = Field(ge=0)
+    stale_assets: int = Field(ge=0)
+    provisional_assets: int = Field(ge=0)
+    unresolved_assets: int = Field(ge=0)
+    duplicate_candidates: int = Field(ge=0)
+    conflicting_fields: int = Field(ge=0)
+    relationship_count: int = Field(ge=0)
+    expired_relationships: int = Field(ge=0)
+    coverage_score: float = Field(ge=0.0, le=1.0)
+    freshness_score: float = Field(ge=0.0, le=1.0)
+    confidence_score: float = Field(ge=0.0, le=1.0)
+    source_diversity_score: float = Field(ge=0.0, le=1.0)
+    warnings: list[str] = Field(default_factory=list)
+    generated_at: datetime
+
+    @field_validator("generated_at")
+    @classmethod
+    def _aware_datetime(cls, value: datetime) -> datetime:
+        return require_aware(value)
+
+
+class DeadLetterEntry(StrictModel):
+    """Sanitized dead-letter record for failed connector processing."""
+
+    dead_letter_id: str = Field(min_length=1)
+    connector_id: str = Field(min_length=1)
+    source_reference: str = Field(min_length=1)
+    failure_stage: str = Field(min_length=1)
+    reason: str
+    safe_metadata: dict[str, Any] = Field(default_factory=dict)
+    retry_eligible: bool = True
+    timestamp: datetime
+
+    @field_validator("timestamp")
+    @classmethod
+    def _aware_datetime(cls, value: datetime) -> datetime:
+        return require_aware(value)
+
+
+class ConnectorPollSummary(StrictModel):
+    """Summary of one connector manager polling cycle."""
+
+    records_read: int = Field(default=0, ge=0)
+    events_normalized: int = Field(default=0, ge=0)
+    events_processed: int = Field(default=0, ge=0)
+    duplicates: int = Field(default=0, ge=0)
+    late_records: int = Field(default=0, ge=0)
+    rejected_records: int = Field(default=0, ge=0)
+    checkpoints_committed: int = Field(default=0, ge=0)
+    dead_letters: int = Field(default=0, ge=0)
+    warnings: list[str] = Field(default_factory=list)
+    timestamp: datetime
+
+    @field_validator("timestamp")
+    @classmethod
+    def _aware_datetime(cls, value: datetime) -> datetime:
+        return require_aware(value)
+
+
+class CASMUpdateResult(StrictModel):
+    """Result of applying one CASM observation."""
+
+    observation_id: str
+    canonical_entity_id: str | None = None
+    created: bool = False
+    updated: bool = False
+    conflicts: list[AssetConflict] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class CASMExpirySummary(StrictModel):
+    """Summary of stale/expired CASM entities."""
+
+    stale_assets: int = Field(default=0, ge=0)
+    expired_relationships: int = Field(default=0, ge=0)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class TwinBatchUpdateSummary(StrictModel):
+    """Batch update summary for realtime twin processing."""
+
+    processed_events: int = Field(default=0, ge=0)
+    processed_observations: int = Field(default=0, ge=0)
+    duplicates: int = Field(default=0, ge=0)
+    failed_items: int = Field(default=0, ge=0)
+    final_twin_version: int = Field(default=0, ge=0)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ShadowRecommendation(StrictModel):
+    """Shadow-mode recommendation with action, safety, and version provenance."""
+
+    recommendation_id: str = Field(min_length=1)
+    source_analysis_id: str
+    action_id: str
+    safety_verdict: SafetyVerdict
+    shadow_status: ShadowStatus
+    recommendation_timestamp: datetime
+    expiry: datetime
+    proposed_execution_tier: int = Field(ge=0, le=4)
+    would_execute: bool = False
+    would_execute_reason: str
+    predicted_benefit: float = Field(ge=0.0, le=1.0)
+    predicted_business_risk: float = Field(ge=0.0, le=1.0)
+    evidence_ids: list[str] = Field(default_factory=list)
+    twin_version: str
+    graph_version: str
+    belief_version: str
+    analysis_version: str
+    policy_version: str
+    explanation: str = ""
+    uncertainty: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    @field_validator("recommendation_timestamp", "expiry")
+    @classmethod
+    def _aware_datetime(cls, value: datetime) -> datetime:
+        return require_aware(value)
+
+
+class AnalystFeedback(StrictModel):
+    """Analyst feedback for one shadow recommendation."""
+
+    feedback_id: str = Field(min_length=1)
+    recommendation_id: str = Field(min_length=1)
+    analyst_decision: AnalystDecision
+    usefulness_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    correctness_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    safety_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    rejection_reason: str = ""
+    corrected_action_type: str | None = None
+    comments: str = ""
+    analyst_identifier: str = Field(min_length=1)
+    timestamp: datetime
+
+    @field_validator("timestamp")
+    @classmethod
+    def _aware_datetime(cls, value: datetime) -> datetime:
+        return require_aware(value)
+
+
+class ShadowMetrics(StrictModel):
+    """Synthetic/lab-only shadow evaluation metrics."""
+
+    recommendation_count: int = Field(default=0, ge=0)
+    acceptance_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    rejection_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    defer_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    duplicate_recommendation_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    insufficient_evidence_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    unsafe_recommendation_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    median_recommendation_latency_ms: float = Field(default=0.0, ge=0.0)
+    complete_evidence_pct: float = Field(default=0.0, ge=0.0, le=1.0)
+    complete_explanation_pct: float = Field(default=0.0, ge=0.0, le=1.0)
+    blocked_by_safety_pct: float = Field(default=0.0, ge=0.0, le=1.0)
+    approval_required_pct: float = Field(default=0.0, ge=0.0, le=1.0)
+    twin_coverage_at_recommendation: float = Field(default=0.0, ge=0.0, le=1.0)
+    twin_freshness_at_recommendation: float = Field(default=0.0, ge=0.0, le=1.0)
+    generated_at: datetime
+
+    @field_validator("generated_at")
+    @classmethod
+    def _aware_datetime(cls, value: datetime) -> datetime:
+        return require_aware(value)
