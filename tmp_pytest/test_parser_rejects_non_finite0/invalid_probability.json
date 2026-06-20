@@ -1,1 +1,0 @@
-{"nodes": [{"id": 0, "start": true}, {"id": 1, "goal": true}], "edges": [{"src": 0, "dst": 1, "action": "move", "prob": NaN}]}

@@ -21,7 +21,11 @@ def _utc_now() -> datetime:
 
 
 class _StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        validate_assignment=True,
+        protected_namespaces=(),  # Allow intentional model_* field names (model_id, model_path, etc.)
+    )
 
 
 # ---------------------------------------------------------------------------

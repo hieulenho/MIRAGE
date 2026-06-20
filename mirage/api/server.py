@@ -58,7 +58,7 @@ try:
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse, FileResponse
     from fastapi.staticfiles import StaticFiles
-    from pydantic import BaseModel, Field, ValidationError
+    from pydantic import BaseModel, ConfigDict, Field, ValidationError
     HAS_FASTAPI = True
 except ImportError:
     HAS_FASTAPI = False
@@ -231,12 +231,14 @@ if HAS_FASTAPI:
         Provide either a serialized GraphSample or an existing analysis_id.
         If no model is loaded, the response uses heuristic fallback values.
         """
+        model_config = ConfigDict(protected_namespaces=())
         graph_sample: Optional[Dict[str, Any]] = None
         analysis_id: Optional[str] = Field(default=None, min_length=1)
         model_path: Optional[str] = Field(default=None, max_length=500)
 
     class GNNEvaluateRequest(BaseModel):
         """Evaluate baselines and, optionally, a GNN model on a dataset."""
+        model_config = ConfigDict(protected_namespaces=())
         dataset_path: str = Field(min_length=1, max_length=500)
         model_path: Optional[str] = Field(default=None, max_length=500)
 
