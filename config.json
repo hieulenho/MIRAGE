@@ -475,6 +475,33 @@
       "unseen_path_selection"
     ]
   },
+  "marl": {
+    "cyber_range_only": true,
+    "red_agent_external_network": false,
+    "production_connectivity": false,
+    "real_exploitation_enabled": false,
+    "blue_execution_mode": "shadow",
+    "training_api_enabled": false,
+    "registry_path": "models/marl_policy_registry.json",
+    "scenario_path": "artifacts/marl_scenarios",
+    "checkpoint_path": "models/marl_self_play",
+    "max_steps": 12,
+    "max_scenarios_per_job": 20,
+    "default_episodes": 6,
+    "random_seed": 42,
+    "opponent_profiles": [
+      "random",
+      "shortest_path",
+      "highest_value",
+      "credential_focused",
+      "stealth",
+      "speed",
+      "deception_naive",
+      "deception_aware",
+      "risk_sensitive",
+      "goal_switching"
+    ]
+  },
   "performance": {
     "synthetic_event_sizes": [1000, 10000],
     "max_fixture_events": 100000

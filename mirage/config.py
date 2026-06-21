@@ -459,6 +459,33 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "unseen_path_selection"
         ]
     },
+    "marl": {
+        "cyber_range_only": True,
+        "red_agent_external_network": False,
+        "production_connectivity": False,
+        "real_exploitation_enabled": False,
+        "blue_execution_mode": "shadow",
+        "training_api_enabled": False,
+        "registry_path": "models/marl_policy_registry.json",
+        "scenario_path": "artifacts/marl_scenarios",
+        "checkpoint_path": "models/marl_self_play",
+        "max_steps": 12,
+        "max_scenarios_per_job": 20,
+        "default_episodes": 6,
+        "random_seed": 42,
+        "opponent_profiles": [
+            "random",
+            "shortest_path",
+            "highest_value",
+            "credential_focused",
+            "stealth",
+            "speed",
+            "deception_naive",
+            "deception_aware",
+            "risk_sensitive",
+            "goal_switching"
+        ]
+    },
     "performance": {
         "synthetic_event_sizes": [1000, 10000],
         "max_fixture_events": 100000
@@ -796,6 +823,27 @@ def _validate_config(config: Dict[str, Any]) -> None:
         raise ValueError("offline_rl.discount_factor must be < 1")
     if not isinstance(offline_rl["fallback_order"], list):
         raise ValueError("offline_rl.fallback_order must be a list")
+
+    marl = config["marl"]
+    if not bool(marl.get("cyber_range_only", False)):
+        raise ValueError("Milestone 8 requires marl.cyber_range_only=true")
+    if bool(marl.get("red_agent_external_network", False)):
+        raise ValueError(
+            "Milestone 8 requires marl.red_agent_external_network=false"
+        )
+    if bool(marl.get("production_connectivity", False)):
+        raise ValueError("Milestone 8 requires marl.production_connectivity=false")
+    if bool(marl.get("real_exploitation_enabled", False)):
+        raise ValueError(
+            "Milestone 8 requires marl.real_exploitation_enabled=false"
+        )
+    if str(marl.get("blue_execution_mode", "")) != "shadow":
+        raise ValueError("Milestone 8 requires marl.blue_execution_mode=shadow")
+    for key in ("max_steps", "max_scenarios_per_job", "default_episodes"):
+        if int(marl[key]) < 1:
+            raise ValueError(f"marl.{key} must be at least 1")
+    if not isinstance(marl.get("opponent_profiles", []), list):
+        raise ValueError("marl.opponent_profiles must be a list")
 
 
 def get_config_path(path: Optional[os.PathLike | str] = None) -> Path:

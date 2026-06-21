@@ -1787,3 +1787,79 @@ See [docs/milestone7_offline_rl.md](docs/milestone7_offline_rl.md) for the
 state/action definitions, trajectory design, reward model, baselines, offline
 RL architecture, fallback behavior, evaluation strategy, API details, and
 limitations.
+
+## Milestone 8: Adversarial Red-Blue Self-Play and MARL Cyber Range V1
+
+Milestone 8 adds an isolated synthetic red-blue cyber range for adversarial
+self-play and robustness evaluation. Red actions are abstract graph-simulator
+state transitions only; blue actions are shadow-mode MIRAGE candidate actions
+under normal action masks.
+
+```text
+Synthetic Scenario Graph
++ Red Partial Observation + Red Action Mask
++ Blue Telemetry Observation + Candidate Defense Actions + Masks
+        ->
+CyberRangeEnvironment
+        ->
+Opponent Population + Curriculum + Self-Play Trainer
+        ->
+Exploitability / Robustness Reports
+        ->
+Shadow Comparison Context
+```
+
+Key modules:
+
+- `mirage.marl.environment`: deterministic reset, step, snapshot, restore, and
+  replay for the graph-only cyber range.
+- `mirage.marl.actions`: allowlisted `RedActionCatalog` and blue
+  `CandidateDefenseAction` adapter.
+- `mirage.marl.policies`: scripted red profiles and shadow blue policy adapter.
+- `mirage.marl.training`: compact self-play trainer and trajectory collection.
+- `mirage.marl.evaluation`: approximate exploitability and robustness reports.
+- `mirage.marl.registry`: MARL policy metadata registry.
+
+CLI:
+
+```bash
+python -m mirage marl range-check
+python -m mirage marl generate-scenarios --output artifacts/marl_scenarios
+python -m mirage marl self-play --episodes 6 --output models/marl_self_play
+python -m mirage marl evaluate --scenarios 6
+python -m mirage marl population
+python -m mirage marl compare-blue --scenarios 6
+```
+
+API:
+
+```text
+GET  /api/v1/marl/range-health
+POST /api/v1/marl/train
+POST /api/v1/marl/evaluate
+POST /api/v1/marl/replay
+GET  /api/v1/marl/jobs/{job_id}
+GET  /api/v1/marl/population
+GET  /api/v1/marl/policies
+GET  /api/v1/marl/policies/{policy_id}
+GET  /api/v1/marl/comparisons/{analysis_id}
+```
+
+Defaults remain fail-safe:
+
+```yaml
+marl:
+  cyber_range_only: true
+  red_agent_external_network: false
+  production_connectivity: false
+  real_exploitation_enabled: false
+  blue_execution_mode: shadow
+  training_api_enabled: false
+```
+
+Milestone 8 does not implement real exploitation, live red-team tooling,
+production connectivity, automatic production containment, distributed
+training, automatic policy promotion, or Milestone 9.
+
+See [docs/milestone8_marl.md](docs/milestone8_marl.md) for the full safety
+contract, component layout, CLI/API details, and limitations.

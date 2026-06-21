@@ -266,6 +266,22 @@ if HAS_FASTAPI:
         analysis_id: Optional[str] = Field(default=None, min_length=1)
         policy_path: Optional[str] = Field(default=None, max_length=500)
 
+    class MARLTrainRequest(BaseModel):
+        """Run synthetic MARL self-play training. Disabled by default."""
+        algorithm: str = Field(default="self_play", max_length=50)
+        episodes: int = Field(default=4, ge=1, le=200)
+        scenario_count: int = Field(default=6, ge=1, le=200)
+        output_path: Optional[str] = Field(default=None, max_length=500)
+
+    class MARLEvaluateRequest(BaseModel):
+        """Evaluate MARL policies in the synthetic range."""
+        scenario_count: int = Field(default=6, ge=1, le=200)
+
+    class MARLReplayRequest(BaseModel):
+        """Replay red/blue actions in one synthetic scenario."""
+        scenario_id: str = Field(default="marl_scenario_00", min_length=1)
+        steps: List[Dict[str, str]] = Field(default_factory=list)
+
 
 def _parse_timestamp(value: Any) -> float:
     if value is None:
@@ -557,6 +573,10 @@ class MIRAGEStateManager:
         self.rl_predictions: Dict[str, Any] = {}
         self.rl_comparisons: Dict[str, Any] = {}
         self._init_rl_state()
+        self.marl_startup_warnings: List[str] = []
+        self.marl_jobs: Dict[str, Any] = {}
+        self.marl_replays: Dict[str, Any] = {}
+        self._init_marl_state()
 
         # Metrics
         self.total_events_processed = 0
@@ -627,6 +647,29 @@ class MIRAGEStateManager:
                 )
             except (OSError, ValueError, RuntimeError) as exc:
                 self.rl_startup_warnings.append(f"rl_policy_not_loaded: {exc}")
+
+    def _init_marl_state(self) -> None:
+        """Initialize Milestone 8 cyber-range services."""
+        from mirage.marl.registry import MARLPolicyRegistry
+        from mirage.marl.schema import RangeIsolationConfig
+        from mirage.marl.scenarios import load_scenarios
+
+        marl_config = self.config.get("marl", {})
+        self.marl_isolation = RangeIsolationConfig.model_validate(marl_config)
+        self.marl_isolation.assert_safe()
+        self.marl_scenarios = load_scenarios(
+            int(marl_config.get("max_scenarios_per_job", 20))
+        )
+        self.marl_policy_registry = MARLPolicyRegistry(
+            registry_path=str(
+                resolve_project_path(
+                    marl_config.get(
+                        "registry_path",
+                        "models/marl_policy_registry.json",
+                    )
+                )
+            )
+        )
 
     def _build_detection_pipeline(
         self,
@@ -1459,6 +1502,158 @@ class MIRAGEStateManager:
                 raise KeyError(analysis_id)
             return comparison
 
+    def _marl_training_enabled(self) -> bool:
+        """Return whether MARL training API mutations are enabled."""
+        return bool(self.config.get("marl", {}).get("training_api_enabled", False))
+
+    def marl_health(self) -> Dict:
+        """Return MARL cyber-range health."""
+        from mirage.marl.schema import RangeHealth
+
+        with self._lock:
+            health = RangeHealth(
+                status="isolated",
+                isolation=self.marl_isolation,
+                training_api_enabled=self._marl_training_enabled(),
+                policy_count=len(self.marl_policy_registry.list_policies()),
+                scenario_count=len(self.marl_scenarios),
+                warnings=list(self.marl_startup_warnings),
+            )
+            return health.model_dump(mode="json")
+
+    def marl_list_policies(self) -> Dict:
+        """Return registered MARL policy metadata."""
+        with self._lock:
+            return {
+                "summary": self.marl_policy_registry.summary(),
+                "policies": [
+                    policy.model_dump(mode="json")
+                    for policy in self.marl_policy_registry.list_policies()
+                ],
+            }
+
+    def marl_get_policy(self, policy_id: str) -> Dict:
+        """Return one MARL policy metadata record."""
+        with self._lock:
+            policy = self.marl_policy_registry.get(policy_id)
+            if policy is None:
+                raise KeyError(policy_id)
+            return policy.model_dump(mode="json")
+
+    def marl_population(self) -> Dict:
+        """Return default opponent population metadata."""
+        from mirage.marl.population import OpponentPopulation
+
+        population = OpponentPopulation()
+        population.add_scripted_defaults()
+        return {
+            "opponents": [
+                item.model_dump(mode="json") for item in population.list_metadata()
+            ]
+        }
+
+    def marl_train(self, request) -> Dict:
+        """Run synthetic self-play training. Disabled by default."""
+        if not self._marl_training_enabled():
+            raise PermissionError(
+                "MARL training API is disabled by default. "
+                "Set marl.training_api_enabled=true explicitly."
+            )
+        from mirage.marl.scenarios import load_scenarios
+        from mirage.marl.training import SelfPlayTrainer
+
+        scenarios = load_scenarios(int(request.scenario_count))
+        trainer = SelfPlayTrainer(scenarios, isolation=self.marl_isolation)
+        algorithm = str(request.algorithm).lower()
+        if algorithm in {"self_play", "self-play", "population_self_play"}:
+            summary = trainer.self_play(int(request.episodes))
+        elif algorithm in {"train_blue", "blue"}:
+            summary = trainer.train_blue(int(request.episodes))
+        elif algorithm in {"train_red", "red"}:
+            summary = trainer.train_red(int(request.episodes))
+        else:
+            raise ValueError("algorithm must be self_play, train_blue, or train_red")
+        if request.output_path:
+            trainer.save_checkpoint(str(resolve_project_path(request.output_path)), summary)
+        if summary.policy_metadata is not None:
+            with self._lock:
+                self.marl_policy_registry.register(summary.policy_metadata)
+                self.marl_jobs[summary.job_id] = summary
+        return summary.model_dump(mode="json")
+
+    def marl_evaluate(self, request) -> Dict:
+        """Run synthetic exploitability and robustness evaluation."""
+        from mirage.marl.evaluation import ExploitabilityEvaluator, PolicyRobustnessEvaluator
+        from mirage.marl.scenarios import load_scenarios
+
+        scenarios = load_scenarios(int(request.scenario_count))
+        return {
+            "exploitability": ExploitabilityEvaluator(
+                scenarios,
+                isolation=self.marl_isolation,
+            ).evaluate().model_dump(mode="json"),
+            "robustness": PolicyRobustnessEvaluator(
+                scenarios,
+                isolation=self.marl_isolation,
+            ).evaluate().model_dump(mode="json"),
+        }
+
+    def marl_replay(self, request) -> Dict:
+        """Replay abstract red/blue actions inside one synthetic scenario."""
+        from mirage.marl.environment import CyberRangeEnvironment
+
+        scenario = next(
+            (
+                item for item in self.marl_scenarios
+                if item.scenario_id == request.scenario_id
+            ),
+            None,
+        )
+        if scenario is None:
+            raise KeyError(request.scenario_id)
+        env = CyberRangeEnvironment(scenario, isolation=self.marl_isolation)
+        env.reset()
+        results = env.replay(request.steps)
+        replay_id = deterministic_id(
+            "marl_replay",
+            request.scenario_id,
+            json.dumps(request.steps, sort_keys=True),
+        )
+        payload = {
+            "replay_id": replay_id,
+            "scenario_id": request.scenario_id,
+            "steps": [result.model_dump(mode="json") for result in results],
+            "final_state": env.snapshot(),
+        }
+        with self._lock:
+            self.marl_replays[replay_id] = payload
+        return payload
+
+    def marl_get_job(self, job_id: str) -> Dict:
+        """Return cached MARL training job output."""
+        with self._lock:
+            job = self.marl_jobs.get(job_id)
+            if job is None:
+                raise KeyError(job_id)
+            if hasattr(job, "model_dump"):
+                return job.model_dump(mode="json")
+            return dict(job)
+
+    def marl_get_comparison(self, analysis_id: str) -> Dict:
+        """Return a shadow comparison with MARL evaluation context."""
+        with self._lock:
+            rl = self.rl_comparisons.get(analysis_id, {})
+        evaluation = self.marl_evaluate(type("Req", (), {"scenario_count": 3})())
+        return {
+            "analysis_id": analysis_id,
+            "rl_comparison": rl,
+            "marl_shadow_context": evaluation,
+            "note": (
+                "MARL comparison is synthetic cyber-range context only; "
+                "it does not execute production actions."
+            ),
+        }
+
     def record_shadow_feedback(
         self,
         recommendation_id: str,
@@ -2018,6 +2213,20 @@ def create_app() -> Any:
                 "GET  /api/v1/gnn/health",
                 "POST /api/v1/gnn/evaluate",
                 "GET  /api/v1/gnn/predictions/{analysis_id}",
+                "POST /api/v1/rl/datasets/build",
+                "POST /api/v1/rl/train",
+                "POST /api/v1/rl/evaluate",
+                "POST /api/v1/rl/recommend",
+                "GET  /api/v1/rl/policies",
+                "GET  /api/v1/rl/health",
+                "GET  /api/v1/marl/range-health",
+                "POST /api/v1/marl/train",
+                "POST /api/v1/marl/evaluate",
+                "POST /api/v1/marl/replay",
+                "GET  /api/v1/marl/jobs/{job_id}",
+                "GET  /api/v1/marl/population",
+                "GET  /api/v1/marl/policies",
+                "GET  /api/v1/marl/comparisons/{analysis_id}",
                 "WS   /ws",
             ],
         }
@@ -3106,6 +3315,61 @@ def create_app() -> Any:
             return state.rl_get_comparison(analysis_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Comparison not found") from exc
+
+    @app.get("/api/v1/marl/range-health")
+    async def get_marl_range_health():
+        return state.marl_health()
+
+    @app.post("/api/v1/marl/train")
+    async def train_marl_policy(request: MARLTrainRequest):
+        try:
+            return await asyncio.to_thread(state.marl_train, request)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/marl/evaluate")
+    async def evaluate_marl_policy(request: MARLEvaluateRequest):
+        try:
+            return await asyncio.to_thread(state.marl_evaluate, request)
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/marl/replay")
+    async def replay_marl_range(request: MARLReplayRequest):
+        try:
+            return await asyncio.to_thread(state.marl_replay, request)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Scenario not found") from exc
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/marl/jobs/{job_id}")
+    async def get_marl_job(job_id: str):
+        try:
+            return state.marl_get_job(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Job not found") from exc
+
+    @app.get("/api/v1/marl/population")
+    async def get_marl_population():
+        return state.marl_population()
+
+    @app.get("/api/v1/marl/policies")
+    async def list_marl_policies():
+        return state.marl_list_policies()
+
+    @app.get("/api/v1/marl/policies/{policy_id}")
+    async def get_marl_policy(policy_id: str):
+        try:
+            return state.marl_get_policy(policy_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Policy not found") from exc
+
+    @app.get("/api/v1/marl/comparisons/{analysis_id}")
+    async def get_marl_comparison(analysis_id: str):
+        return await asyncio.to_thread(state.marl_get_comparison, analysis_id)
 
     @app.post("/api/v1/shadow/run")
     async def run_shadow(request: ShadowRunRequest):

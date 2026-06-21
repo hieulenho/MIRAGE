@@ -12,7 +12,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "Usage: python -m mirage "
             "{replay,detect,analyze-paths,safety-check,execute-plan,"
-            "execution-status,rollback,kill-switch,connectors,casm,shadow,twin,gnn,rl} "
+            "execution-status,rollback,kill-switch,connectors,casm,shadow,twin,gnn,rl,marl} "
             "[options]"
         )
         return 0
@@ -51,6 +51,10 @@ def main(argv: list[str] | None = None) -> int:
         from mirage.rl.cli import main as rl_main
 
         return rl_main(args)
+    if command == "marl":
+        from mirage.marl.cli import main as marl_main
+
+        return marl_main(args)
     print(f"Unknown MIRAGE command: {command}")
     return 2
 

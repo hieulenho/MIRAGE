@@ -1,0 +1,8 @@
+scenario_count: 6
+evaluation:
+  exploitability: approximate_scripted_best_response
+  robustness: cross_scenario_population
+safety:
+  cyber_range_only: true
+  blue_execution_mode: shadow
+  real_exploitation_enabled: false
