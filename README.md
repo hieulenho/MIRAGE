@@ -1701,3 +1701,89 @@ See [docs/milestone6_gnn.md](docs/milestone6_gnn.md) for the full graph schema,
 feature definitions, hierarchy design, dataset strategy, baselines, model
 architecture, uncertainty/OOD behavior, integration rules, limitations, and
 recommended Milestone 7.
+
+## Milestone 7: Offline RL and Hierarchical Blue-Team Policy V1
+
+Milestone 7 adds a conservative offline-learning policy track for MIRAGE
+defense recommendations. It is additive and shadow-first: the learned policy
+selects only from existing candidate defense actions, applies action masks,
+passes Safety Gate context, and falls back to behavior cloning, the robust
+decision engine, and the heuristic ranker when support or confidence is low.
+
+```text
+Digital Twin + Belief + Local Attack Graph
++ GNN/Heuristic Risk Features
++ Candidate Actions + Masks + Safety Context
+        ->
+Offline Trajectory Dataset
+        ->
+Behavior Cloning
+        ->
+Conservative Hierarchical Offline RL
+        ->
+RL Shadow Recommendation
+        ->
+Analyst / Offline Evaluation Comparison
+```
+
+Key modules:
+
+- `mirage.rl.schema`: RL state/action, transition, trajectory, dataset,
+  policy, inference, and registry schemas.
+- `mirage.rl.features`: deterministic state and action encoders with explicit
+  missing-value masks and no raw identifier features.
+- `mirage.rl.dataset`: deterministic offline trajectory generation,
+  serialization, manifest hashing, and split manifests.
+- `mirage.rl.reward`: auditable reward components and separate hard-constraint
+  violations.
+- `mirage.rl.baselines`: heuristic, random-safe, always-observe, behavior
+  cloning, and hierarchical behavior-cloning baselines.
+- `mirage.rl.policy`: compact discrete IQL-style conservative hierarchical
+  policy with support scoring and fallback.
+- `mirage.rl.inference`: read-only inference service; no training or
+  enforcement calls.
+- `mirage.rl.evaluation`: replay, FQE-style synthetic evaluation, disagreement,
+  and worst-case summaries.
+
+CLI:
+
+```bash
+python -m mirage rl build-dataset --sources simulator,robust,shadow,lab --output artifacts/rl_dataset
+python -m mirage rl analyze-dataset --dataset artifacts/rl_dataset
+python -m mirage rl train-bc --dataset artifacts/rl_dataset --config configs/rl_bc_v1.yaml --output models/rl_bc_v1
+python -m mirage rl train-offline --dataset artifacts/rl_dataset --init-policy models/rl_bc_v1 --config configs/rl_offline_v1.yaml --output models/rl_offline_v1
+python -m mirage rl evaluate --policy models/rl_offline_v1 --dataset artifacts/rl_dataset --simulator-config configs/rl_eval.yaml
+```
+
+API:
+
+```text
+POST /api/v1/rl/datasets/build
+GET  /api/v1/rl/datasets
+GET  /api/v1/rl/datasets/{id}
+POST /api/v1/rl/train
+POST /api/v1/rl/evaluate
+POST /api/v1/rl/recommend
+GET  /api/v1/rl/policies
+GET  /api/v1/rl/policies/{id}
+GET  /api/v1/rl/health
+GET  /api/v1/rl/comparisons/{analysis_id}
+```
+
+Defaults remain safe:
+
+```yaml
+offline_rl:
+  rl_operating_mode: rl_shadow
+  rl_execution_enabled: false
+  api_training_enabled: false
+```
+
+Milestone 7 does not implement online production exploration, Red-Team AI,
+adversarial MARL, autonomous production containment, automatic training from
+unreviewed analyst feedback, automatic policy promotion, or Milestone 8.
+
+See [docs/milestone7_offline_rl.md](docs/milestone7_offline_rl.md) for the
+state/action definitions, trajectory design, reward model, baselines, offline
+RL architecture, fallback behavior, evaluation strategy, API details, and
+limitations.

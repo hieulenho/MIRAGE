@@ -242,6 +242,30 @@ if HAS_FASTAPI:
         dataset_path: str = Field(min_length=1, max_length=500)
         model_path: Optional[str] = Field(default=None, max_length=500)
 
+    class RLDatasetBuildRequest(BaseModel):
+        """Build a deterministic offline-RL dataset."""
+        sources: str = Field(default="simulator,robust,shadow,lab", max_length=200)
+        output_path: Optional[str] = Field(default=None, max_length=500)
+
+    class RLTrainRequest(BaseModel):
+        """Train a BC or offline-RL policy. Disabled by default."""
+        dataset_path: str = Field(min_length=1, max_length=500)
+        output_path: str = Field(min_length=1, max_length=500)
+        algorithm: str = Field(default="offline_rl", max_length=50)
+        init_policy_path: Optional[str] = Field(default=None, max_length=500)
+        config: Dict[str, Any] = Field(default_factory=dict)
+
+    class RLEvaluateRequest(BaseModel):
+        """Evaluate offline-RL policies on a dataset."""
+        dataset_path: str = Field(min_length=1, max_length=500)
+        policy_path: Optional[str] = Field(default=None, max_length=500)
+
+    class RLRecommendRequest(BaseModel):
+        """Run read-only RL shadow recommendation for an encoded state or analysis."""
+        encoded_state: Optional[Dict[str, Any]] = None
+        analysis_id: Optional[str] = Field(default=None, min_length=1)
+        policy_path: Optional[str] = Field(default=None, max_length=500)
+
 
 def _parse_timestamp(value: Any) -> float:
     if value is None:
@@ -529,6 +553,10 @@ class MIRAGEStateManager:
         self.gnn_startup_warnings: List[str] = []
         self.gnn_predictions: Dict[str, Any] = {}
         self._init_gnn_state()
+        self.rl_startup_warnings: List[str] = []
+        self.rl_predictions: Dict[str, Any] = {}
+        self.rl_comparisons: Dict[str, Any] = {}
+        self._init_rl_state()
 
         # Metrics
         self.total_events_processed = 0
@@ -568,6 +596,37 @@ class MIRAGEStateManager:
                 )
             except (ImportError, RuntimeError, OSError, ValueError) as exc:
                 self.gnn_startup_warnings.append(f"gnn_model_not_loaded: {exc}")
+
+    def _init_rl_state(self) -> None:
+        """Initialize optional Milestone 7 offline-RL services without training."""
+        from mirage.rl.features import RLStateEncoder
+        from mirage.rl.inference import OfflineRLInferenceService
+        from mirage.rl.registry import PolicyRegistry
+
+        rl_config = self.config.get("offline_rl", {})
+        self.rl_state_encoder = RLStateEncoder(
+            operating_mode=str(rl_config.get("rl_operating_mode", "rl_shadow"))
+        )
+        self.rl_policy_registry = PolicyRegistry(
+            registry_path=str(
+                resolve_project_path(
+                    rl_config.get("registry_path", "models/rl_policy_registry.json")
+                )
+            )
+        )
+        self.rl_inference_service = OfflineRLInferenceService(
+            operating_mode=str(rl_config.get("rl_operating_mode", "rl_shadow")),
+            max_candidate_actions=int(rl_config.get("max_candidate_actions", 100)),
+            uncertainty_threshold=float(rl_config.get("uncertainty_threshold", 0.65)),
+        )
+        model_path = rl_config.get("model_path")
+        if model_path:
+            try:
+                self.rl_inference_service.load_policy(
+                    str(resolve_project_path(model_path))
+                )
+            except (OSError, ValueError, RuntimeError) as exc:
+                self.rl_startup_warnings.append(f"rl_policy_not_loaded: {exc}")
 
     def _build_detection_pipeline(
         self,
@@ -1003,10 +1062,30 @@ class MIRAGEStateManager:
                 decisions,
                 analysis.reference_time,
             )
+            rl_comparison = None
+            try:
+                encoded_state = self._rl_encoded_state_from_analysis(analysis_id)
+                safety_context = {
+                    decision.action_id: decision for decision in decisions
+                }
+                rl_result = self.rl_inference_service.recommend(
+                    encoded_state,
+                    safety_context=safety_context,
+                )
+                rl_comparison = self._rl_policy_comparison(
+                    encoded_state,
+                    analysis_id=analysis_id,
+                    rl_result=rl_result,
+                )
+                self.rl_predictions[analysis_id] = rl_result
+                self.rl_comparisons[analysis_id] = rl_comparison
+            except Exception as exc:  # noqa: BLE001
+                rl_comparison = {"warning": f"rl_shadow_comparison_failed: {exc}"}
             return {
                 "recommendations": [
                     rec.model_dump(mode="json") for rec in recs
-                ]
+                ],
+                "policy_comparison": rl_comparison,
             }
 
     def gnn_health(self) -> Dict:
@@ -1147,6 +1226,238 @@ class MIRAGEStateManager:
                 "not production cybersecurity-effectiveness claims."
             ),
         }
+
+    def _rl_training_enabled(self) -> bool:
+        """Return whether RL dataset/training API mutations are enabled."""
+        return bool(
+            self.config.get("offline_rl", {}).get("api_training_enabled", False)
+        )
+
+    def _rl_encoded_state_from_analysis(self, analysis_id: str):
+        """Build an EncodedRLState from a stored attack analysis."""
+        analysis = self.get_attack_analysis(analysis_id)
+        return self.rl_state_encoder.encode(
+            twin_snapshot=self.twin.create_snapshot(),
+            belief_snapshot=self.detection_pipeline.belief_engine.create_snapshot(),
+            attack_analysis=analysis,
+            candidate_action_set=analysis.candidate_action_set,
+            gnn_result=self.gnn_predictions.get(analysis_id),
+        )
+
+    def _rl_safety_context_for_analysis(self, analysis_id: str) -> Dict[str, Any]:
+        """Evaluate Safety Gate decisions for an analysis without execution."""
+        analysis = self.get_attack_analysis(analysis_id)
+        twin_snapshot = self.twin.create_snapshot()
+        belief_snapshot = self.detection_pipeline.belief_engine.create_snapshot()
+        decisions = {}
+        for action in analysis.candidate_action_set.actions:
+            mask = analysis.candidate_action_set.masks[action.action_id]
+            decisions[action.action_id] = self.execution_safety_gate.evaluate(
+                action,
+                mask,
+                twin_snapshot,
+                belief_snapshot,
+                list(self.execution_orchestrator.records.values()),
+                analysis.reference_time,
+            )
+        return decisions
+
+    def rl_health(self) -> Dict:
+        """Return offline-RL inference health and policy registry summary."""
+        with self._lock:
+            health = self.rl_inference_service.health().model_dump(mode="json")
+            health["registry"] = self.rl_policy_registry.summary()
+            health["warnings"] = list(health.get("warnings", [])) + list(
+                self.rl_startup_warnings
+            )
+            health["execution_enabled"] = bool(
+                self.config.get("offline_rl", {}).get(
+                    "rl_execution_enabled",
+                    False,
+                )
+            )
+            return health
+
+    def rl_list_policies(self) -> Dict:
+        """Return registered offline-RL policies."""
+        with self._lock:
+            return {
+                "summary": self.rl_policy_registry.summary(),
+                "policies": [
+                    policy.model_dump(mode="json")
+                    for policy in self.rl_policy_registry.list_policies()
+                ],
+            }
+
+    def rl_get_policy(self, policy_id: str) -> Dict:
+        """Return one registered offline-RL policy."""
+        with self._lock:
+            policy = self.rl_policy_registry.get(policy_id)
+            if policy is None:
+                raise KeyError(policy_id)
+            return policy.model_dump(mode="json")
+
+    def rl_build_dataset(self, request) -> Dict:
+        """Build a deterministic offline-RL dataset. Disabled by default."""
+        if not self._rl_training_enabled():
+            raise PermissionError(
+                "Offline-RL dataset build API is disabled by default. "
+                "Set offline_rl.api_training_enabled=true explicitly."
+            )
+        from mirage.rl.dataset import OfflineRLDatasetBuilder
+        from mirage.rl.scenarios import build_synthetic_trajectories
+
+        with self._lock:
+            output = request.output_path or self.config.get("offline_rl", {}).get(
+                "dataset_path",
+                "artifacts/rl_dataset",
+            )
+            trajectories = build_synthetic_trajectories()
+            manifest = OfflineRLDatasetBuilder().save_dataset(
+                trajectories,
+                str(resolve_project_path(output)),
+            )
+            return manifest.model_dump(mode="json")
+
+    def rl_train(self, request) -> Dict:
+        """Train BC or offline-RL policy. Disabled by default."""
+        if not self._rl_training_enabled():
+            raise PermissionError(
+                "Offline-RL training API is disabled by default. "
+                "Set offline_rl.api_training_enabled=true explicitly."
+            )
+        from mirage.rl.training import train_behavior_cloning, train_offline_policy
+
+        algorithm = str(request.algorithm).lower()
+        dataset_path = str(resolve_project_path(request.dataset_path))
+        output_path = str(resolve_project_path(request.output_path))
+        if algorithm in {"bc", "behavior_cloning", "hierarchical_bc"}:
+            metadata = train_behavior_cloning(
+                dataset_path,
+                output_path,
+                request.config,
+            )
+        elif algorithm in {"offline_rl", "iql", "hierarchical_offline_rl"}:
+            init_path = (
+                str(resolve_project_path(request.init_policy_path))
+                if request.init_policy_path
+                else None
+            )
+            metadata = train_offline_policy(
+                dataset_path,
+                output_path,
+                init_path,
+                request.config,
+            )
+        else:
+            raise ValueError("algorithm must be 'behavior_cloning' or 'offline_rl'")
+        with self._lock:
+            self.rl_policy_registry.register(metadata)
+        return metadata.model_dump(mode="json")
+
+    def rl_evaluate(self, request) -> Dict:
+        """Run offline/replay evaluation for RL policies."""
+        from mirage.rl.evaluation import OfflinePolicyEvaluator
+
+        dataset_path = str(resolve_project_path(request.dataset_path))
+        policy_path = (
+            str(resolve_project_path(request.policy_path))
+            if request.policy_path
+            else None
+        )
+        return OfflinePolicyEvaluator().evaluate_baselines(dataset_path, policy_path)
+
+    def rl_recommend(self, request) -> Dict:
+        """Run read-only RL shadow recommendation."""
+        from mirage.rl.schema import EncodedRLState
+
+        with self._lock:
+            safety_context = {}
+            analysis_id = request.analysis_id
+            if request.encoded_state is not None:
+                encoded_state = EncodedRLState.model_validate(request.encoded_state)
+            elif analysis_id:
+                encoded_state = self._rl_encoded_state_from_analysis(analysis_id)
+                safety_context = self._rl_safety_context_for_analysis(analysis_id)
+            else:
+                raise ValueError("encoded_state or analysis_id is required")
+
+            if request.policy_path:
+                self.rl_inference_service.load_policy(
+                    str(resolve_project_path(request.policy_path))
+                )
+
+            result = self.rl_inference_service.recommend(
+                encoded_state,
+                safety_context=safety_context,
+            )
+            comparison = self._rl_policy_comparison(
+                encoded_state,
+                analysis_id=analysis_id,
+                rl_result=result,
+            )
+            result = result.model_copy(
+                update={"robust_planner_comparison": comparison.get("robust", {})}
+            )
+            key = analysis_id or encoded_state.state_reference.state_id
+            self.rl_predictions[key] = result
+            self.rl_comparisons[key] = comparison
+            return result.model_dump(mode="json")
+
+    def _rl_policy_comparison(
+        self,
+        encoded_state,
+        *,
+        analysis_id: str | None,
+        rl_result,
+    ) -> Dict[str, Any]:
+        from mirage.rl.baselines import BehaviorCloningPolicy, HeuristicCandidatePolicy
+
+        heuristic = HeuristicCandidatePolicy().recommend(encoded_state)
+        bc = BehaviorCloningPolicy().recommend(encoded_state)
+        robust_choice = "__NO_OP__"
+        if analysis_id and analysis_id in self.analysis_history:
+            analysis = self.analysis_history[analysis_id]
+            robust_choice = next(
+                iter(analysis.candidate_action_set.recommended_action_ids),
+                "__NO_OP__",
+            )
+        comparison = {
+            "heuristic": {
+                "selected_action_id": heuristic.selected_action_id,
+                "selected_tactic": heuristic.selected_high_level_tactic.value,
+                "confidence": heuristic.policy_confidence,
+            },
+            "behavior_cloning": {
+                "selected_action_id": bc.selected_action_id,
+                "selected_tactic": bc.selected_high_level_tactic.value,
+                "confidence": bc.policy_confidence,
+            },
+            "rl": {
+                "selected_action_id": rl_result.selected_action_id,
+                "selected_tactic": rl_result.selected_high_level_tactic.value,
+                "confidence": rl_result.policy_confidence,
+                "fallback_used": rl_result.fallback_used,
+                "fallback_reason": rl_result.fallback_reason,
+            },
+            "robust": {
+                "selected_action_id": robust_choice,
+                "agreement_with_rl": robust_choice == rl_result.selected_action_id,
+            },
+            "review_required": (
+                robust_choice != "__NO_OP__"
+                and robust_choice != rl_result.selected_action_id
+            ),
+        }
+        return comparison
+
+    def rl_get_comparison(self, analysis_id: str) -> Dict:
+        """Return cached side-by-side policy comparison."""
+        with self._lock:
+            comparison = self.rl_comparisons.get(analysis_id)
+            if comparison is None:
+                raise KeyError(analysis_id)
+            return comparison
 
     def record_shadow_feedback(
         self,
@@ -2698,6 +3009,103 @@ def create_app() -> Any:
             return state.gnn_get_prediction(analysis_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Prediction not found") from exc
+
+    @app.post("/api/v1/rl/datasets/build")
+    async def build_rl_dataset(request: RLDatasetBuildRequest):
+        try:
+            return await asyncio.to_thread(state.rl_build_dataset, request)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/rl/datasets")
+    async def list_rl_datasets():
+        dataset_path = resolve_project_path(
+            state.config.get("offline_rl", {}).get(
+                "dataset_path",
+                "artifacts/rl_dataset",
+            )
+        )
+        exists = dataset_path.exists()
+        return {
+            "datasets": [
+                {
+                    "path": str(dataset_path),
+                    "exists": exists,
+                }
+            ]
+        }
+
+    @app.get("/api/v1/rl/datasets/{dataset_id}")
+    async def get_rl_dataset(dataset_id: str):
+        dataset_path = resolve_project_path(
+            state.config.get("offline_rl", {}).get(
+                "dataset_path",
+                "artifacts/rl_dataset",
+            )
+        )
+        manifest_path = dataset_path / "manifest.json"
+        if not manifest_path.exists():
+            raise HTTPException(status_code=404, detail="Dataset not found")
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if data.get("dataset_id") != dataset_id and dataset_id not in {
+            "default",
+            data.get("dataset_id", ""),
+        }:
+            raise HTTPException(status_code=404, detail="Dataset not found")
+        return data
+
+    @app.post("/api/v1/rl/train")
+    async def train_rl_policy(request: RLTrainRequest):
+        try:
+            return await asyncio.to_thread(state.rl_train, request)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/rl/evaluate")
+    async def evaluate_rl_policy(request: RLEvaluateRequest):
+        try:
+            return await asyncio.to_thread(state.rl_evaluate, request)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/rl/recommend")
+    async def recommend_rl_policy(request: RLRecommendRequest):
+        try:
+            return await asyncio.to_thread(state.rl_recommend, request)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Analysis not found") from exc
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/rl/policies")
+    async def list_rl_policies():
+        return state.rl_list_policies()
+
+    @app.get("/api/v1/rl/policies/{policy_id}")
+    async def get_rl_policy(policy_id: str):
+        try:
+            return state.rl_get_policy(policy_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Policy not found") from exc
+
+    @app.get("/api/v1/rl/health")
+    async def get_rl_health():
+        return state.rl_health()
+
+    @app.get("/api/v1/rl/comparisons/{analysis_id}")
+    async def get_rl_comparison(analysis_id: str):
+        try:
+            return state.rl_get_comparison(analysis_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Comparison not found") from exc
 
     @app.post("/api/v1/shadow/run")
     async def run_shadow(request: ShadowRunRequest):

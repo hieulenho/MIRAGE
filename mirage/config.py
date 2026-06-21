@@ -19,6 +19,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "discount_factor": 0.95,
         "operating_mode": "shadow",
         "enforcement_enabled": False,
+        "rl_operating_mode": "shadow",
+        "rl_execution_enabled": False,
     },
     "topology": {
         "source": "builtin",
@@ -400,6 +402,63 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "dropout": 0.2,
         "random_seed": 42,
     },
+    "offline_rl": {
+        "rl_operating_mode": "rl_shadow",
+        "rl_execution_enabled": False,
+        "api_training_enabled": False,
+        "dataset_path": "artifacts/rl_dataset",
+        "model_path": "",
+        "bc_model_path": "",
+        "registry_path": "models/rl_policy_registry.json",
+        "prediction_state_path": "artifacts/rl_predictions.json",
+        "feature_schema_version": "rl_state_v1",
+        "action_schema_version": "rl_action_v1",
+        "reward_model_version": "defense_reward_v1",
+        "tactic_vocabulary": [
+            "OBSERVE",
+            "DECEIVE",
+            "DELAY",
+            "LIMITED_CONTAIN",
+            "ESCALATE",
+            "NO_OP"
+        ],
+        "fallback_order": [
+            "offline_rl",
+            "hierarchical_behavior_cloning",
+            "robust_decision_engine",
+            "heuristic_ranker",
+            "observe_or_analyst_review"
+        ],
+        "max_candidate_actions": 100,
+        "batch_size": 32,
+        "learning_rate": 0.001,
+        "discount_factor": 0.95,
+        "expectile": 0.7,
+        "advantage_temperature": 1.0,
+        "target_update_rate": 0.01,
+        "dropout": 0.0,
+        "ensemble_size": 1,
+        "early_stopping_patience": 5,
+        "class_weights": {},
+        "action_support_threshold": 0.05,
+        "uncertainty_threshold": 0.65,
+        "ood_thresholds": {
+            "missing_features": 0.3,
+            "low_twin_quality": 0.25,
+            "unknown_action_type": 1.0
+        },
+        "training_seeds": [42],
+        "maximum_candidate_actions": 100,
+        "evaluation_attacker_profiles": [
+            "shortest_path",
+            "greedy_asset_value",
+            "stealthy",
+            "deception_aware",
+            "credential_focused",
+            "randomly_perturbed",
+            "unseen_path_selection"
+        ]
+    },
     "performance": {
         "synthetic_event_sizes": [1000, 10000],
         "max_fixture_events": 100000
@@ -657,6 +716,8 @@ def _validate_config(config: Dict[str, Any]) -> None:
             )
     if bool(config["general"].get("enforcement_enabled", False)):
         raise ValueError("Milestone 5 requires enforcement_enabled=false")
+    if bool(config["general"].get("rl_execution_enabled", False)):
+        raise ValueError("Milestone 7 requires rl_execution_enabled=false")
 
     connectors = config["connectors"]
     if int(connectors["default_batch_size"]) < 1:
@@ -702,6 +763,39 @@ def _validate_config(config: Dict[str, Any]) -> None:
         raise ValueError("gnn.embedding_dim must be at least 1")
     if int(gnn["n_layers"]) < 1:
         raise ValueError("gnn.n_layers must be at least 1")
+
+    offline_rl = config["offline_rl"]
+    if str(offline_rl["rl_operating_mode"]) not in {
+        "robust_only",
+        "bc_shadow",
+        "rl_shadow",
+        "rl_robust_hybrid",
+        "shadow",
+    }:
+        raise ValueError("offline_rl.rl_operating_mode is unsupported")
+    if bool(offline_rl.get("rl_execution_enabled", False)):
+        raise ValueError("Milestone 7 requires offline_rl.rl_execution_enabled=false")
+    if int(offline_rl["max_candidate_actions"]) < 1:
+        raise ValueError("offline_rl.max_candidate_actions must be at least 1")
+    if int(offline_rl["maximum_candidate_actions"]) < 1:
+        raise ValueError("offline_rl.maximum_candidate_actions must be at least 1")
+    for key in (
+        "learning_rate",
+        "discount_factor",
+        "expectile",
+        "advantage_temperature",
+        "target_update_rate",
+        "dropout",
+        "action_support_threshold",
+        "uncertainty_threshold",
+    ):
+        value = float(offline_rl[key])
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"offline_rl.{key} must be finite and non-negative")
+    if float(offline_rl["discount_factor"]) >= 1:
+        raise ValueError("offline_rl.discount_factor must be < 1")
+    if not isinstance(offline_rl["fallback_order"], list):
+        raise ValueError("offline_rl.fallback_order must be a list")
 
 
 def get_config_path(path: Optional[os.PathLike | str] = None) -> Path:

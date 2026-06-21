@@ -1,0 +1,21 @@
+seed: 42
+attacker_profiles:
+  - shortest_path
+  - greedy_asset_value
+  - stealthy
+  - deception_aware
+  - credential_focused
+  - randomly_perturbed
+  - unseen_path_selection
+candidate_action_sizes:
+  - 5
+  - 20
+  - 50
+  - 100
+ood_splits:
+  - unseen_topology
+  - stale_or_incomplete_twin
+  - gnn_unavailable
+  - ood_types
+notes: "Synthetic/offline evaluation only; does not prove production effectiveness."
+

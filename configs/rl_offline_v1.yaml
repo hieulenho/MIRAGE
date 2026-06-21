@@ -1,0 +1,15 @@
+seed: 42
+epochs: 5
+batch_size: 32
+learning_rate: 0.001
+discount_factor: 0.95
+expectile: 0.7
+advantage_temperature: 1.0
+target_update_rate: 0.01
+q_clip: 5.0
+min_support_threshold: 0.05
+uncertainty_threshold: 0.65
+gradient_clip: 1.0
+checkpoint_every_steps: 10
+notes: "Compact discrete IQL-style offline optimization; no online exploration."
+

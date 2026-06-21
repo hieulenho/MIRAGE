@@ -1,0 +1,7 @@
+seed: 42
+hierarchical: true
+class_weights: {}
+early_stopping_patience: 5
+max_candidate_actions: 100
+notes: "Milestone 7 behavior-cloning baseline; offline/shadow only."
+
