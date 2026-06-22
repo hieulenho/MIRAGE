@@ -1,0 +1,65 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mirage-default-deny
+  namespace: mirage-production
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mirage-api-ingress
+  namespace: mirage-production
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: api-gateway
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              mirage.io/zone: ingress
+      ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              mirage.io/zone: control-plane
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              mirage.io/zone: audit
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              mirage.io/zone: processing
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mirage-model-no-enforcement-egress
+  namespace: mirage-production
+spec:
+  podSelector:
+    matchLabels:
+      mirage.io/zone: model-inference
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              mirage.io/zone: processing
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mirage-cyber-range-isolated
+  namespace: mirage-cyber-range
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]

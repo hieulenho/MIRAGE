@@ -1,0 +1,8 @@
+formal_verification_required: true
+smt_solver_enabled: false
+solver_timeout_ms: 50
+reachability_max_depth: 8
+minimum_twin_freshness: 0.35
+minimum_twin_coverage: 0.20
+maximum_model_uncertainty: 0.65
+invariant_policy_version: formal-safety-v1

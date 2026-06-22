@@ -1,0 +1,13 @@
+profile: controlled_pilot
+productionExecutionEnabled: false
+highRiskAutomationEnabled: false
+pilotScopes:
+  - pilot-scope-placeholder
+auth:
+  enabled: true
+tls:
+  enabled: true
+storage:
+  backend: sqlite
+eventTransport:
+  backend: local_durable

@@ -56,7 +56,7 @@ try:
         WebSocketDisconnect,
     )
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import JSONResponse, FileResponse
+    from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel, ConfigDict, Field, ValidationError
     HAS_FASTAPI = True
@@ -69,6 +69,8 @@ from mirage.layer2_graph_engine.attack_graph import MIRAGEAttackGraph, build_con
 from mirage.layer3_deception.deception_fabric import DeceptionFabric
 from mirage.layer5_safe_control.safe_control import create_safety_gate
 from mirage.config import load_config, resolve_project_path
+from mirage.production.health import DependencyChecker, build_health_report
+from mirage.production.observability import MetricsRegistry
 from mirage.analysis.pipeline import AttackAnalysisPipeline
 from mirage.detection.pipeline import ContextualDetectionPipeline
 from mirage.domain.schemas import (
@@ -89,7 +91,7 @@ from mirage.execution.audit import ImmutableAuditStore
 from mirage.execution.kill_switch import KillSwitch
 from mirage.execution.orchestrator import DeceptionOrchestrator
 from mirage.execution.safety import SafetyGate as ExecutionSafetyGate
-from mirage.execution.utils import deterministic_id
+from mirage.execution.utils import deterministic_id, ensure_utc
 from mirage.realtime.twin_service import RealtimeTwinService
 from mirage.shadow.controller import ShadowModeController
 from mirage.streaming.coordinator import ConnectorManager
@@ -281,6 +283,64 @@ if HAS_FASTAPI:
         """Replay red/blue actions in one synthetic scenario."""
         scenario_id: str = Field(default="marl_scenario_00", min_length=1)
         steps: List[Dict[str, str]] = Field(default_factory=list)
+
+    class GovernanceReleaseCheckRequest(BaseModel):
+        """Release-gate evidence for one governed artifact."""
+        target_status: str = Field(default="PILOT_CANDIDATE", max_length=50)
+        evidence: Dict[str, Any] = Field(default_factory=dict)
+
+    class GovernanceApprovalRequest(BaseModel):
+        """Governance approval/suspension actor context."""
+        actor: str = Field(default="api", min_length=1, max_length=100)
+        role: str = Field(default="governance_reviewer", max_length=100)
+        reason: str = Field(default="", max_length=500)
+
+    class VerificationPlanRequest(BaseModel):
+        """Verify a proposed execution plan."""
+        plan: Dict[str, Any]
+        action: Dict[str, Any]
+        mask: Dict[str, Any]
+        safety_decision: Optional[Dict[str, Any]] = None
+        twin_snapshot: Dict[str, Any]
+        belief_snapshot: Optional[Dict[str, Any]] = None
+        pilot_scope: Dict[str, Any] = Field(default_factory=dict)
+        approvals: List[Dict[str, Any]] = Field(default_factory=list)
+        dependency_graph: Dict[str, List[str]] = Field(default_factory=dict)
+
+    class VerificationInvariantValidateRequest(BaseModel):
+        """Validate a custom invariant payload."""
+        invariant: Dict[str, Any]
+
+    class PilotPrepareRequest(BaseModel):
+        """Prepare a controlled-pilot recommendation."""
+        recommendation: Dict[str, Any]
+        scope_id: str = Field(default="lab-low-risk", min_length=1)
+
+    class PilotApprovalRequest(BaseModel):
+        """Record exact-plan pilot approval."""
+        plan: Dict[str, Any]
+        approver: str = Field(min_length=1, max_length=100)
+        approver_role: str = Field(min_length=1, max_length=100)
+        environment: str = Field(default="lab", max_length=100)
+        ttl_seconds: int = Field(default=900, ge=1)
+
+    class PilotCanaryRequest(BaseModel):
+        """Evaluate canary evidence."""
+        checks: Dict[str, Optional[bool]] = Field(default_factory=dict)
+
+    class PilotMonitorRequest(BaseModel):
+        """Evaluate runtime monitoring evidence."""
+        metrics: Dict[str, float] = Field(default_factory=dict)
+        protected_asset_affected: bool = False
+        management_channel_lost: bool = False
+        rollback_channel_at_risk: bool = False
+        scope_expanded: bool = False
+        kill_switch_active: bool = False
+        policy_suspended: bool = False
+
+    class PilotRollbackRequest(BaseModel):
+        """Request pilot rollback."""
+        reason: str = Field(min_length=1, max_length=500)
 
 
 def _parse_timestamp(value: Any) -> float:
@@ -577,6 +637,7 @@ class MIRAGEStateManager:
         self.marl_jobs: Dict[str, Any] = {}
         self.marl_replays: Dict[str, Any] = {}
         self._init_marl_state()
+        self._init_m9_state()
 
         # Metrics
         self.total_events_processed = 0
@@ -670,6 +731,51 @@ class MIRAGEStateManager:
                 )
             )
         )
+
+    def _init_m9_state(self) -> None:
+        """Initialize Milestone 9 governance, verification, pilot, and drift."""
+        from mirage.drift.monitor import DriftMonitor
+        from mirage.governance.audit import GovernanceAuditStore
+        from mirage.governance.registry import GovernanceRegistry
+        from mirage.pilot.controller import ControlledPilotController
+        from mirage.pilot.scope import PilotScopeRegistry
+        from mirage.verification.invariants import SafetySpecificationRegistry
+        from mirage.verification.verifier import FormalSafetyVerifier
+
+        governance_config = self.config.get("governance", {})
+        pilot_config = self.config.get("pilot", {})
+        verification_config = self.config.get("verification", {})
+        self.governance_registry = GovernanceRegistry(
+            str(resolve_project_path(governance_config.get("registry_path", "models/governance_registry.json")))
+        )
+        self.governance_audit = GovernanceAuditStore(
+            str(resolve_project_path(governance_config.get("audit_path", "artifacts/governance_audit.jsonl")))
+        )
+        self.invariant_registry = SafetySpecificationRegistry()
+        self.formal_verifier = FormalSafetyVerifier(
+            registry=self.invariant_registry,
+            config=verification_config,
+        )
+        self.pilot_scope_registry = PilotScopeRegistry()
+        self.pilot_controller = ControlledPilotController(
+            config={
+                **pilot_config,
+                "verification": verification_config,
+                "policy": pilot_config,
+                "governance_audit_path": str(resolve_project_path(governance_config.get("audit_path", "artifacts/governance_audit.jsonl"))),
+            },
+            verifier=self.formal_verifier,
+            audit_store=self.governance_audit,
+        )
+        drift_config = self.config.get("drift", {})
+        self.drift_monitor = DriftMonitor(
+            {
+                "warning": float(drift_config.get("warning_threshold", 0.35)),
+                "critical": float(drift_config.get("critical_threshold", 0.70)),
+            }
+        )
+        self.verification_reports: Dict[str, Any] = {}
+        self.drift_reports: Dict[str, Any] = {}
 
     def _build_detection_pipeline(
         self,
@@ -1654,6 +1760,263 @@ class MIRAGEStateManager:
             ),
         }
 
+    def governance_artifacts(self, limit: int = 100) -> Dict:
+        with self._lock:
+            artifacts = self.governance_registry.list_artifacts()[:limit]
+            return {
+                "summary": self.governance_registry.summary(),
+                "artifacts": [item.model_dump(mode="json") for item in artifacts],
+            }
+
+    def governance_get_artifact(self, artifact_id: str) -> Dict:
+        artifact = self.governance_registry.get_artifact(artifact_id)
+        if artifact is None:
+            raise KeyError(artifact_id)
+        return artifact.model_dump(mode="json")
+
+    def governance_model_card(self, artifact_id: str) -> Dict:
+        card = self.governance_registry.model_cards.get(artifact_id)
+        if card is None:
+            raise KeyError(artifact_id)
+        return card.model_dump(mode="json")
+
+    def governance_policy_card(self, artifact_id: str) -> Dict:
+        card = self.governance_registry.policy_cards.get(artifact_id)
+        if card is None:
+            raise KeyError(artifact_id)
+        return card.model_dump(mode="json")
+
+    def governance_release_check(self, artifact_id: str, request) -> Dict:
+        from mirage.governance.release import ReleaseGate
+        from mirage.governance.schema import EvidenceBundle, GovernanceStatus
+
+        artifact = self.governance_registry.get_artifact(artifact_id)
+        if artifact is None:
+            raise KeyError(artifact_id)
+        evidence = EvidenceBundle.model_validate(request.evidence or {})
+        decision = ReleaseGate(
+            self.config.get("governance", {}).get("release_gate_thresholds", {})
+        ).evaluate(artifact, evidence, GovernanceStatus(request.target_status))
+        with self._lock:
+            self.governance_registry.register_decision(decision)
+            self.governance_audit.append(
+                "release_gate_decision",
+                actor="api",
+                role="governance",
+                artifact_or_execution_id=artifact_id,
+                after_state=decision.model_dump(mode="json"),
+            )
+        return decision.model_dump(mode="json")
+
+    def governance_approve(self, artifact_id: str, request) -> Dict:
+        from mirage.governance.schema import GovernanceStatus
+
+        artifact = self.governance_registry.get_artifact(artifact_id)
+        if artifact is None:
+            raise KeyError(artifact_id)
+        updated = artifact.model_copy(
+            update={
+                "status": GovernanceStatus.PILOT_APPROVED,
+                "approval_status": GovernanceStatus.PILOT_APPROVED,
+            }
+        )
+        with self._lock:
+            self.governance_registry.register_artifact(updated)
+            record = self.governance_audit.append(
+                "artifact_approved",
+                actor=request.actor,
+                role=request.role,
+                artifact_or_execution_id=artifact_id,
+                before_state=artifact.model_dump(mode="json"),
+                after_state=updated.model_dump(mode="json"),
+                reason=request.reason,
+            )
+        return {"artifact": updated.model_dump(mode="json"), "audit": record.model_dump(mode="json")}
+
+    def governance_suspend(self, artifact_id: str, request) -> Dict:
+        from mirage.governance.schema import GovernanceStatus
+
+        artifact = self.governance_registry.get_artifact(artifact_id)
+        if artifact is None:
+            raise KeyError(artifact_id)
+        updated = artifact.model_copy(update={"status": GovernanceStatus.SUSPENDED})
+        with self._lock:
+            self.governance_registry.register_artifact(updated)
+            record = self.governance_audit.append(
+                "artifact_suspended",
+                actor=request.actor,
+                role=request.role,
+                artifact_or_execution_id=artifact_id,
+                before_state=artifact.model_dump(mode="json"),
+                after_state=updated.model_dump(mode="json"),
+                reason=request.reason,
+            )
+        return {"artifact": updated.model_dump(mode="json"), "audit": record.model_dump(mode="json")}
+
+    def verification_verify_plan(self, request) -> Dict:
+        from mirage.domain.schemas import (
+            ActionMask,
+            BeliefSnapshot,
+            CandidateDefenseAction,
+            ExecutionPlan,
+            SafetyDecision,
+            TwinSnapshot,
+        )
+        from mirage.verification.schema import FormalVerificationContext
+
+        plan = ExecutionPlan.model_validate(request.plan)
+        twin = TwinSnapshot.model_validate(request.twin_snapshot)
+        context = FormalVerificationContext(
+            action=CandidateDefenseAction.model_validate(request.action),
+            action_mask=ActionMask.model_validate(request.mask),
+            safety_decision=(
+                SafetyDecision.model_validate(request.safety_decision)
+                if request.safety_decision
+                else None
+            ),
+            execution_plan=plan,
+            twin_snapshot=twin,
+            belief_snapshot=(
+                BeliefSnapshot.model_validate(request.belief_snapshot)
+                if request.belief_snapshot
+                else None
+            ),
+            pilot_scope=request.pilot_scope,
+            approvals=request.approvals,
+            dependency_graph=request.dependency_graph,
+        )
+        report = self.formal_verifier.verify(plan, context)
+        with self._lock:
+            self.verification_reports[report.report_id] = report
+            self.governance_audit.append(
+                "formal_verification_report",
+                artifact_or_execution_id=plan.plan_id,
+                after_state=report.model_dump(mode="json"),
+                hashes={"report_hash": report.report_hash},
+            )
+        return report.model_dump(mode="json")
+
+    def verification_get_report(self, report_id: str) -> Dict:
+        report = self.verification_reports.get(report_id)
+        if report is None:
+            raise KeyError(report_id)
+        return report.model_dump(mode="json")
+
+    def verification_invariants(self) -> Dict:
+        return {
+            "invariants": [
+                invariant.model_dump(mode="json")
+                for invariant in self.invariant_registry.list_invariants()
+            ]
+        }
+
+    def verification_validate_invariant(self, request) -> Dict:
+        from mirage.verification.schema import SafetyInvariant
+
+        invariant = SafetyInvariant.model_validate(request.invariant)
+        return {"valid": True, "invariant": invariant.model_dump(mode="json")}
+
+    def pilot_scopes(self) -> Dict:
+        return {
+            "scopes": [
+                scope.model_dump(mode="json")
+                for scope in self.pilot_scope_registry.list_scopes()
+            ]
+        }
+
+    def pilot_prepare(self, request) -> Dict:
+        scope = self.pilot_scope_registry.get(request.scope_id)
+        if scope is None:
+            raise KeyError(request.scope_id)
+        result = self.pilot_controller.prepare(
+            request.recommendation,
+            scope,
+            ensure_utc(None),
+        )
+        return result.model_dump(mode="json")
+
+    def pilot_approve(self, execution_id: str, request) -> Dict:
+        from mirage.domain.schemas import ExecutionPlan
+
+        plan = ExecutionPlan.model_validate(request.plan)
+        approval = self.pilot_controller.record_approval(
+            plan,
+            approver=request.approver,
+            approver_role=request.approver_role,
+            environment=request.environment,
+            ttl_seconds=request.ttl_seconds,
+        )
+        return approval.model_dump(mode="json")
+
+    def pilot_canary(self, execution_id: str, request) -> Dict:
+        decision = self.pilot_controller.canary.evaluate(execution_id, request.checks)
+        return decision.model_dump(mode="json")
+
+    def pilot_monitor(self, execution_id: str, request) -> Dict:
+        result = self.pilot_controller.monitor_engine.evaluate(
+            execution_id,
+            request.metrics,
+            protected_asset_affected=request.protected_asset_affected,
+            management_channel_lost=request.management_channel_lost,
+            rollback_channel_at_risk=request.rollback_channel_at_risk,
+            scope_expanded=request.scope_expanded,
+            kill_switch_active=request.kill_switch_active,
+            policy_suspended=request.policy_suspended,
+        )
+        return result.model_dump(mode="json")
+
+    def pilot_rollback(self, execution_id: str, request) -> Dict:
+        if execution_id not in self.pilot_controller.records:
+            from mirage.pilot.schema import PilotExecutionRecord
+
+            self.pilot_controller.records[execution_id] = PilotExecutionRecord(
+                pilot_execution_id=execution_id,
+                pilot_scope_id="api",
+                execution_plan_id="unknown",
+            )
+        return self.pilot_controller.rollback(
+            execution_id,
+            request.reason,
+        ).model_dump(mode="json")
+
+    def pilot_get_execution(self, execution_id: str) -> Dict:
+        record = self.pilot_controller.records.get(execution_id)
+        if record is None:
+            raise KeyError(execution_id)
+        return record.model_dump(mode="json")
+
+    def pilot_list_executions(self, limit: int = 100) -> Dict:
+        return {
+            "executions": [
+                record.model_dump(mode="json")
+                for record in list(self.pilot_controller.records.values())[:limit]
+            ]
+        }
+
+    def drift_status(self) -> Dict:
+        report = self.drift_monitor.evaluate()
+        self.drift_reports[report.report_id] = report
+        return report.model_dump(mode="json")
+
+    def drift_reports_list(self, limit: int = 100) -> Dict:
+        return {
+            "reports": [
+                report.model_dump(mode="json")
+                for report in list(self.drift_reports.values())[:limit]
+            ]
+        }
+
+    def governance_audit_list(self, limit: int = 100) -> Dict:
+        return {
+            "records": [
+                record.model_dump(mode="json")
+                for record in self.governance_audit.records[-limit:]
+            ]
+        }
+
+    def governance_audit_verify(self) -> Dict:
+        return self.governance_audit.verify_chain()
+
     def record_shadow_feedback(
         self,
         recommendation_id: str,
@@ -2074,6 +2437,7 @@ def create_app() -> Any:
 
     config = load_config()
     api_config = config.get("api", {})
+    production_metrics = MetricsRegistry()
     app = FastAPI(
         title="MIRAGE API",
         description=(
@@ -2098,6 +2462,9 @@ def create_app() -> Any:
 
     @app.middleware("http")
     async def api_key_guard(request: Request, call_next):
+        correlation_id = request.headers.get("X-Correlation-ID") or str(uuid.uuid4())
+        request.state.correlation_id = correlation_id
+        production_metrics.increment("mirage_api_requests_total")
         content_length = request.headers.get("content-length")
         if content_length:
             try:
@@ -2128,6 +2495,11 @@ def create_app() -> Any:
                 content={"detail": "Missing or invalid X-API-Key."},
             )
         response = await call_next(request)
+        response.headers["X-Correlation-ID"] = correlation_id
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
         if request.url.path == "/dashboard":
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; "
@@ -2138,8 +2510,6 @@ def create_app() -> Any:
                 "font-src 'self'; "
                 "base-uri 'none'; frame-ancestors 'none'"
             )
-            response.headers["X-Content-Type-Options"] = "nosniff"
-            response.headers["Referrer-Policy"] = "no-referrer"
         return response
 
     # Serve dashboard static files
@@ -2159,7 +2529,25 @@ def create_app() -> Any:
     # Initialize MIRAGE state
     state = MIRAGEStateManager()
     app.state.mirage_state = state
+    app.state.production_metrics = production_metrics
     decision_lock = asyncio.Lock()
+
+    def production_dependencies() -> DependencyChecker:
+        audit_path = resolve_project_path(
+            config.get("production", {}).get("audit", {}).get(
+                "path",
+                "artifacts/production/audit.jsonl",
+            )
+        )
+        return DependencyChecker(
+            {
+                "audit_storage": lambda: audit_path.parent.exists(),
+                "governance_store": lambda: True,
+                "model_registry": lambda: resolve_project_path("models").exists(),
+                "event_bus": lambda: bool(config.get("production", {}).get("event_transport")),
+                "database": lambda: True,
+            }
+        )
 
     # ---- REST Endpoints ----
 
@@ -2170,6 +2558,11 @@ def create_app() -> Any:
             "version": __version__,
             "docs": "/docs",
             "endpoints": [
+                "GET  /health/live",
+                "GET  /health/ready",
+                "GET  /health/dependencies",
+                "GET  /health/security",
+                "GET  /metrics",
                 "POST /api/telemetry",
                 "POST /api/telemetry/batch",
                 "POST /api/ingest/{splunk|elastic|wazuh}",
@@ -2227,6 +2620,21 @@ def create_app() -> Any:
                 "GET  /api/v1/marl/population",
                 "GET  /api/v1/marl/policies",
                 "GET  /api/v1/marl/comparisons/{analysis_id}",
+                "GET  /api/v1/governance/artifacts",
+                "POST /api/v1/governance/artifacts/{id}/release-check",
+                "POST /api/v1/governance/artifacts/{id}/approve",
+                "POST /api/v1/governance/artifacts/{id}/suspend",
+                "POST /api/v1/verification/plans",
+                "GET  /api/v1/verification/reports/{id}",
+                "GET  /api/v1/verification/invariants",
+                "GET  /api/v1/pilot/scopes",
+                "POST /api/v1/pilot/prepare",
+                "POST /api/v1/pilot/executions/{id}/approve",
+                "POST /api/v1/pilot/executions/{id}/canary",
+                "POST /api/v1/pilot/executions/{id}/monitor",
+                "POST /api/v1/pilot/executions/{id}/rollback",
+                "GET  /api/v1/drift/status",
+                "GET  /api/v1/governance/audit/verify",
                 "WS   /ws",
             ],
         }
@@ -2234,6 +2642,43 @@ def create_app() -> Any:
     @app.get("/healthz")
     async def healthz():
         return {"status": "ok"}
+
+    @app.get("/health/live")
+    async def health_live():
+        return {"status": "live"}
+
+    @app.get("/health/ready")
+    async def health_ready():
+        report = build_health_report(config, dependencies=production_dependencies())
+        status_code = 200 if report.ready else 503
+        return JSONResponse(
+            status_code=status_code,
+            content=report.model_dump(mode="json"),
+        )
+
+    @app.get("/health/dependencies")
+    async def health_dependencies():
+        return {
+            "dependencies": [
+                item.model_dump(mode="json")
+                for item in production_dependencies().check_all()
+            ]
+        }
+
+    @app.get("/health/security")
+    async def health_security():
+        return build_health_report(config).security.model_dump(mode="json")
+
+    @app.get("/metrics")
+    async def metrics():
+        snapshot = state.get_status()
+        production_metrics.gauge("mirage_pending_decisions", len(state.pending_decisions))
+        production_metrics.gauge("mirage_decision_history", len(state.decision_history))
+        production_metrics.gauge("mirage_belief_hosts", len(snapshot.get("belief_hosts", [])))
+        return PlainTextResponse(
+            production_metrics.render_prometheus(),
+            media_type="text/plain; version=0.0.4",
+        )
 
     @app.post("/api/telemetry")
     async def ingest_telemetry(payload: TelemetryEventPayload):
@@ -3370,6 +3815,164 @@ def create_app() -> Any:
     @app.get("/api/v1/marl/comparisons/{analysis_id}")
     async def get_marl_comparison(analysis_id: str):
         return await asyncio.to_thread(state.marl_get_comparison, analysis_id)
+
+    @app.get("/api/v1/governance/artifacts")
+    async def list_governance_artifacts(
+        limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    ):
+        return state.governance_artifacts(limit)
+
+    @app.get("/api/v1/governance/artifacts/{artifact_id}")
+    async def get_governance_artifact(artifact_id: str):
+        try:
+            return state.governance_get_artifact(artifact_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Artifact not found") from exc
+
+    @app.get("/api/v1/governance/artifacts/{artifact_id}/model-card")
+    async def get_governance_model_card(artifact_id: str):
+        try:
+            return state.governance_model_card(artifact_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Model card not found") from exc
+
+    @app.get("/api/v1/governance/artifacts/{artifact_id}/policy-card")
+    async def get_governance_policy_card(artifact_id: str):
+        try:
+            return state.governance_policy_card(artifact_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Policy card not found") from exc
+
+    @app.post("/api/v1/governance/artifacts/{artifact_id}/release-check")
+    async def governance_release_check(
+        artifact_id: str,
+        request: GovernanceReleaseCheckRequest,
+    ):
+        try:
+            return await asyncio.to_thread(
+                state.governance_release_check,
+                artifact_id,
+                request,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Artifact not found") from exc
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/governance/artifacts/{artifact_id}/approve")
+    async def governance_approve(
+        artifact_id: str,
+        request: GovernanceApprovalRequest,
+    ):
+        try:
+            return state.governance_approve(artifact_id, request)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Artifact not found") from exc
+
+    @app.post("/api/v1/governance/artifacts/{artifact_id}/suspend")
+    async def governance_suspend(
+        artifact_id: str,
+        request: GovernanceApprovalRequest,
+    ):
+        try:
+            return state.governance_suspend(artifact_id, request)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Artifact not found") from exc
+
+    @app.post("/api/v1/verification/plans")
+    async def verify_execution_plan(request: VerificationPlanRequest):
+        try:
+            return await asyncio.to_thread(state.verification_verify_plan, request)
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/verification/reports/{report_id}")
+    async def get_verification_report(report_id: str):
+        try:
+            return state.verification_get_report(report_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Report not found") from exc
+
+    @app.get("/api/v1/verification/invariants")
+    async def list_verification_invariants():
+        return state.verification_invariants()
+
+    @app.post("/api/v1/verification/invariants/validate")
+    async def validate_verification_invariant(
+        request: VerificationInvariantValidateRequest,
+    ):
+        try:
+            return state.verification_validate_invariant(request)
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/pilot/scopes")
+    async def list_pilot_scopes():
+        return state.pilot_scopes()
+
+    @app.post("/api/v1/pilot/prepare")
+    async def prepare_pilot(request: PilotPrepareRequest):
+        try:
+            return await asyncio.to_thread(state.pilot_prepare, request)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Pilot scope not found") from exc
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/pilot/executions/{execution_id}/approve")
+    async def approve_pilot_execution(
+        execution_id: str,
+        request: PilotApprovalRequest,
+    ):
+        try:
+            return state.pilot_approve(execution_id, request)
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/pilot/executions/{execution_id}/canary")
+    async def pilot_canary(execution_id: str, request: PilotCanaryRequest):
+        return state.pilot_canary(execution_id, request)
+
+    @app.post("/api/v1/pilot/executions/{execution_id}/monitor")
+    async def pilot_monitor(execution_id: str, request: PilotMonitorRequest):
+        return state.pilot_monitor(execution_id, request)
+
+    @app.post("/api/v1/pilot/executions/{execution_id}/rollback")
+    async def pilot_rollback(execution_id: str, request: PilotRollbackRequest):
+        return state.pilot_rollback(execution_id, request)
+
+    @app.get("/api/v1/pilot/executions/{execution_id}")
+    async def get_pilot_execution(execution_id: str):
+        try:
+            return state.pilot_get_execution(execution_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Pilot execution not found") from exc
+
+    @app.get("/api/v1/pilot/executions")
+    async def list_pilot_executions(
+        limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    ):
+        return state.pilot_list_executions(limit)
+
+    @app.get("/api/v1/drift/status")
+    async def get_drift_status():
+        return state.drift_status()
+
+    @app.get("/api/v1/drift/reports")
+    async def list_drift_reports(
+        limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    ):
+        return state.drift_reports_list(limit)
+
+    @app.get("/api/v1/governance/audit")
+    async def list_governance_audit(
+        limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    ):
+        return state.governance_audit_list(limit)
+
+    @app.get("/api/v1/governance/audit/verify")
+    async def verify_governance_audit():
+        return state.governance_audit_verify()
 
     @app.post("/api/v1/shadow/run")
     async def run_shadow(request: ShadowRunRequest):

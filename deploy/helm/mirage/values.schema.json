@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "profile": {
+      "enum": ["development", "test", "cyber_range", "lab", "shadow", "controlled_pilot", "production"]
+    },
+    "productionExecutionEnabled": {"type": "boolean"},
+    "highRiskAutomationEnabled": {"type": "boolean"},
+    "pilotScopes": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "auth": {
+      "type": "object",
+      "properties": {"enabled": {"type": "boolean"}}
+    },
+    "tls": {
+      "type": "object",
+      "properties": {"enabled": {"type": "boolean"}}
+    },
+    "storage": {
+      "type": "object",
+      "properties": {"backend": {"enum": ["in_memory", "sqlite", "postgres"]}}
+    },
+    "eventTransport": {
+      "type": "object",
+      "properties": {"backend": {"enum": ["in_memory", "local_durable", "kafka_compatible"]}}
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"profile": {"const": "production"}}},
+      "then": {
+        "properties": {
+          "auth": {"properties": {"enabled": {"const": true}}},
+          "tls": {"properties": {"enabled": {"const": true}}},
+          "storage": {"properties": {"backend": {"const": "postgres"}}},
+          "eventTransport": {"properties": {"backend": {"const": "kafka_compatible"}}},
+          "highRiskAutomationEnabled": {"const": false}
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+operating_mode: controlled_pilot
+pilot_execution_enabled: false
+high_risk_automation_enabled: false
+human_approval_required_for_medium_and_high_risk: true
+pilot_rollout_level: 0
+level4_enabled: false
+maximum_ttl_seconds: 3600
+maximum_affected_entities: 5
+maximum_concurrent_actions: 1
+management_channels:
+  - soc-control-plane
+rollback_channels:
+  - rollback-controller
+approval_expiry_seconds: 900
+governance_audit_path: artifacts/governance_audit.jsonl
+allowed_action_types:
+  - increase_endpoint_logging
+  - increase_network_telemetry
+  - enable_limited_packet_capture
+  - scatter_honey_credential
+  - deploy_decoy_database
+  - deploy_fake_share
+  - add_decoy_service
+  - create_fake_dns_record
+  - throttle_edge
+  - create_soc_ticket
+  - request_analyst_review
+prohibited_action_types:
+  - isolate_database
+  - disable_privileged_identity
+  - block_subnet
+  - modify_critical_database
+  - block_all_traffic
+  - change_core_routing
+  - change_domain_controller_policy
+health_thresholds:
+  availability_min: 0.99
+  latency_ms_max: 500.0
+  error_rate_max: 0.02
+  health_success_min: 0.99

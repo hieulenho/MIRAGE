@@ -502,8 +502,194 @@
       "goal_switching"
     ]
   },
+  "verification": {
+    "formal_verification_required": true,
+    "smt_solver_enabled": false,
+    "solver_timeout_ms": 50,
+    "reachability_max_depth": 8,
+    "minimum_twin_freshness": 0.35,
+    "minimum_twin_coverage": 0.20,
+    "maximum_model_uncertainty": 0.65,
+    "invariant_policy_version": "formal-safety-v1"
+  },
+  "governance": {
+    "registry_path": "models/governance_registry.json",
+    "audit_path": "artifacts/governance_audit.jsonl",
+    "training_and_promotion_api_enabled": false,
+    "release_gate_thresholds": {
+      "worst_case_return": 0.0,
+      "unseen_topology_return": 0.0,
+      "calibration_error_max": 0.25,
+      "latency_ms_max": 250.0
+    },
+    "artifact_review_days": 90,
+    "approval_roles": [
+      "soc_analyst",
+      "incident_commander",
+      "system_owner",
+      "security_engineer",
+      "governance_reviewer"
+    ],
+    "separation_of_duties": true
+  },
+  "pilot": {
+    "operating_mode": "controlled_pilot",
+    "pilot_execution_enabled": false,
+    "high_risk_automation_enabled": false,
+    "human_approval_required_for_medium_and_high_risk": true,
+    "pilot_rollout_level": 0,
+    "level4_enabled": false,
+    "allowed_action_types": [
+      "increase_endpoint_logging",
+      "increase_network_telemetry",
+      "enable_limited_packet_capture",
+      "scatter_honey_credential",
+      "deploy_decoy_database",
+      "deploy_fake_share",
+      "add_decoy_service",
+      "create_fake_dns_record",
+      "throttle_edge",
+      "create_soc_ticket",
+      "request_analyst_review"
+    ],
+    "prohibited_action_types": [
+      "isolate_database",
+      "disable_privileged_identity",
+      "block_subnet",
+      "modify_critical_database",
+      "block_all_traffic",
+      "change_core_routing",
+      "change_domain_controller_policy"
+    ],
+    "maximum_ttl_seconds": 3600,
+    "maximum_affected_entities": 5,
+    "maximum_concurrent_actions": 1,
+    "pilot_scopes": [],
+    "management_channels": ["soc-control-plane"],
+    "rollback_channels": ["rollback-controller"],
+    "approval_expiry_seconds": 900,
+    "governance_audit_path": "artifacts/governance_audit.jsonl",
+    "health_thresholds": {
+      "availability_min": 0.99,
+      "latency_ms_max": 500.0,
+      "error_rate_max": 0.02,
+      "health_success_min": 0.99
+    }
+  },
+  "drift": {
+    "warning_threshold": 0.35,
+    "critical_threshold": 0.70,
+    "automatic_suspension_enabled": true,
+    "shadow_mode_preserved": true
+  },
   "performance": {
     "synthetic_event_sizes": [1000, 10000],
     "max_fixture_events": 100000
+  },
+  "production": {
+    "operating_mode": "shadow",
+    "production_execution_enabled": false,
+    "high_risk_automation_enabled": false,
+    "formal_verification_required": true,
+    "governance_gate_required": true,
+    "action_mask_required": true,
+    "safety_gate_required": true,
+    "deployment_mode": "modular_monolith",
+    "profile": "shadow",
+    "deployment_level": "SHADOW_ONLY",
+    "storage": {
+      "backend": "sqlite",
+      "sqlite_path": "artifacts/production/mirage.db",
+      "postgres_dsn": "",
+      "object_storage_uri": "artifacts/production/object_store",
+      "schema_compatibility_window": 1
+    },
+    "event_transport": {
+      "backend": "local_durable",
+      "sqlite_path": "artifacts/production/events.db",
+      "broker_url": "",
+      "max_retries": 3,
+      "poll_lease_seconds": 30,
+      "max_queue_depth": 100000
+    },
+    "auth": {
+      "enabled": false,
+      "oidc_issuer": "",
+      "oidc_audience": "mirage-api",
+      "service_identity_required": false,
+      "api_tokens_enabled": false,
+      "token_ttl_seconds": 900,
+      "revocation_list_path": "artifacts/revoked_service_tokens.json",
+      "default_credentials_allowed": false
+    },
+    "tls": {
+      "enabled": false,
+      "mtls_required": false,
+      "ca_bundle": "",
+      "cert_file": "",
+      "key_file": "",
+      "verify_hostname": true,
+      "insecure_skip_verify": false
+    },
+    "audit": {
+      "path": "artifacts/production/audit.jsonl",
+      "retention_days": 365,
+      "write_only_identity": "mirage-audit-writer",
+      "immutable_export_uri": "artifacts/production/audit_exports",
+      "fail_closed_for_execution": true
+    },
+    "api_gateway": {
+      "require_correlation_id": true,
+      "rate_limit_per_minute": 600,
+      "timeout_seconds": 30,
+      "max_page_size": 1000,
+      "cors_policy": "explicit",
+      "openapi_public": false,
+      "training_endpoints_enabled": false
+    },
+    "allowed_automatic_action_types": [
+      "increase_endpoint_logging",
+      "increase_network_telemetry",
+      "enable_limited_packet_capture",
+      "enable_auth_auditing",
+      "create_soc_ticket",
+      "request_analyst_review",
+      "deploy_decoy_host",
+      "deploy_decoy_database",
+      "deploy_fake_share",
+      "add_decoy_service",
+      "scatter_honey_credential",
+      "create_fake_dns_record",
+      "throttle_edge"
+    ],
+    "prohibited_action_types": [
+      "isolate_host",
+      "isolate_database",
+      "disable_privileged_identity",
+      "block_subnet",
+      "modify_critical_database",
+      "change_core_routing",
+      "block_all_traffic",
+      "delete_credentials"
+    ],
+    "protected_assets": [],
+    "rollback_configured_actions": [
+      "increase_endpoint_logging",
+      "increase_network_telemetry",
+      "enable_limited_packet_capture",
+      "enable_auth_auditing",
+      "create_soc_ticket",
+      "request_analyst_review",
+      "deploy_decoy_host",
+      "deploy_decoy_database",
+      "deploy_fake_share",
+      "add_decoy_service",
+      "scatter_honey_credential",
+      "create_fake_dns_record",
+      "throttle_edge"
+    ],
+    "tenants": ["default"],
+    "required_policy_versions": ["safety-v1", "formal-safety-v1"],
+    "required_model_versions": []
   }
 }

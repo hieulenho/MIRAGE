@@ -1,0 +1,35 @@
+terraform {
+  required_version = ">= 1.5.0"
+}
+
+variable "environment" {
+  type    = string
+  default = "production"
+}
+
+variable "region" {
+  type    = string
+  default = "example-region"
+}
+
+# Provider-specific resources should create:
+# - private subnets for ingress, connector, processing, model, control, audit,
+#   deception, and management zones;
+# - managed PostgreSQL-compatible storage with backups and encryption;
+# - Kafka, Redpanda, or equivalent durable broker;
+# - object storage for artifacts, model registry, policy registry, and backups;
+# - OIDC or compatible identity provider integration;
+# - certificate authority and mTLS material;
+# - append-only or immutable audit export storage.
+
+output "mirage_required_components" {
+  value = [
+    "private_network_segments",
+    "postgresql_storage",
+    "durable_event_broker",
+    "object_storage",
+    "oidc_identity",
+    "certificate_authority",
+    "immutable_audit_export"
+  ]
+}

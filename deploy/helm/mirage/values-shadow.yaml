@@ -1,0 +1,11 @@
+profile: shadow
+productionExecutionEnabled: false
+highRiskAutomationEnabled: false
+auth:
+  enabled: true
+tls:
+  enabled: true
+storage:
+  backend: sqlite
+eventTransport:
+  backend: local_durable

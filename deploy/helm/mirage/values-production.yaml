@@ -1,0 +1,22 @@
+profile: production
+productionExecutionEnabled: false
+highRiskAutomationEnabled: false
+pilotScopes: []
+replicaCount: 3
+auth:
+  enabled: true
+tls:
+  enabled: true
+storage:
+  backend: postgres
+  existingSecret: mirage-secret-refs
+eventTransport:
+  backend: kafka_compatible
+  existingSecret: mirage-secret-refs
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi

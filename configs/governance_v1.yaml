@@ -1,0 +1,16 @@
+registry_path: models/governance_registry.json
+audit_path: artifacts/governance_audit.jsonl
+training_and_promotion_api_enabled: false
+artifact_review_days: 90
+separation_of_duties: true
+approval_roles:
+  - soc_analyst
+  - incident_commander
+  - system_owner
+  - security_engineer
+  - governance_reviewer
+release_gate_thresholds:
+  worst_case_return: 0.0
+  unseen_topology_return: 0.0
+  calibration_error_max: 0.25
+  latency_ms_max: 250.0

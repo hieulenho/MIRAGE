@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from mirage.production.schema import default_production_config
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.json"
@@ -486,10 +488,91 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "goal_switching"
         ]
     },
+    "verification": {
+        "formal_verification_required": True,
+        "smt_solver_enabled": False,
+        "solver_timeout_ms": 50,
+        "reachability_max_depth": 8,
+        "minimum_twin_freshness": 0.35,
+        "minimum_twin_coverage": 0.20,
+        "maximum_model_uncertainty": 0.65,
+        "invariant_policy_version": "formal-safety-v1"
+    },
+    "governance": {
+        "registry_path": "models/governance_registry.json",
+        "audit_path": "artifacts/governance_audit.jsonl",
+        "training_and_promotion_api_enabled": False,
+        "release_gate_thresholds": {
+            "worst_case_return": 0.0,
+            "unseen_topology_return": 0.0,
+            "calibration_error_max": 0.25,
+            "latency_ms_max": 250.0
+        },
+        "artifact_review_days": 90,
+        "approval_roles": [
+            "soc_analyst",
+            "incident_commander",
+            "system_owner",
+            "security_engineer",
+            "governance_reviewer"
+        ],
+        "separation_of_duties": True
+    },
+    "pilot": {
+        "operating_mode": "controlled_pilot",
+        "pilot_execution_enabled": False,
+        "high_risk_automation_enabled": False,
+        "human_approval_required_for_medium_and_high_risk": True,
+        "pilot_rollout_level": 0,
+        "level4_enabled": False,
+        "allowed_action_types": [
+            "increase_endpoint_logging",
+            "increase_network_telemetry",
+            "enable_limited_packet_capture",
+            "scatter_honey_credential",
+            "deploy_decoy_database",
+            "deploy_fake_share",
+            "add_decoy_service",
+            "create_fake_dns_record",
+            "throttle_edge",
+            "create_soc_ticket",
+            "request_analyst_review"
+        ],
+        "prohibited_action_types": [
+            "isolate_database",
+            "disable_privileged_identity",
+            "block_subnet",
+            "modify_critical_database",
+            "block_all_traffic",
+            "change_core_routing",
+            "change_domain_controller_policy"
+        ],
+        "maximum_ttl_seconds": 3600,
+        "maximum_affected_entities": 5,
+        "maximum_concurrent_actions": 1,
+        "pilot_scopes": [],
+        "management_channels": ["soc-control-plane"],
+        "rollback_channels": ["rollback-controller"],
+        "approval_expiry_seconds": 900,
+        "governance_audit_path": "artifacts/governance_audit.jsonl",
+        "health_thresholds": {
+            "availability_min": 0.99,
+            "latency_ms_max": 500.0,
+            "error_rate_max": 0.02,
+            "health_success_min": 0.99
+        }
+    },
+    "drift": {
+        "warning_threshold": 0.35,
+        "critical_threshold": 0.70,
+        "automatic_suspension_enabled": True,
+        "shadow_mode_preserved": True
+    },
     "performance": {
         "synthetic_event_sizes": [1000, 10000],
         "max_fixture_events": 100000
     },
+    "production": default_production_config(),
 }
 
 
@@ -844,6 +927,71 @@ def _validate_config(config: Dict[str, Any]) -> None:
             raise ValueError(f"marl.{key} must be at least 1")
     if not isinstance(marl.get("opponent_profiles", []), list):
         raise ValueError("marl.opponent_profiles must be a list")
+
+    verification = config["verification"]
+    if not bool(verification.get("formal_verification_required", False)):
+        raise ValueError(
+            "Milestone 9 requires verification.formal_verification_required=true"
+        )
+    if int(verification["solver_timeout_ms"]) < 1:
+        raise ValueError("verification.solver_timeout_ms must be at least 1")
+    for key in (
+        "minimum_twin_freshness",
+        "minimum_twin_coverage",
+        "maximum_model_uncertainty",
+    ):
+        value = float(verification[key])
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError(f"verification.{key} must be in [0, 1]")
+
+    governance = config["governance"]
+    if bool(governance.get("training_and_promotion_api_enabled", False)):
+        raise ValueError(
+            "Milestone 9 keeps training and promotion APIs disabled by default"
+        )
+    if int(governance["artifact_review_days"]) < 1:
+        raise ValueError("governance.artifact_review_days must be at least 1")
+    if not isinstance(governance["approval_roles"], list):
+        raise ValueError("governance.approval_roles must be a list")
+
+    pilot = config["pilot"]
+    if str(pilot.get("operating_mode")) != "controlled_pilot":
+        raise ValueError("pilot.operating_mode must be controlled_pilot")
+    if bool(pilot.get("high_risk_automation_enabled", False)):
+        raise ValueError("Milestone 9 requires high_risk_automation_enabled=false")
+    if bool(pilot.get("pilot_execution_enabled", False)):
+        if not bool(verification.get("formal_verification_required", False)):
+            raise ValueError("pilot execution requires formal verification")
+        if not bool(pilot.get("human_approval_required_for_medium_and_high_risk", False)):
+            raise ValueError("pilot execution requires approval configuration")
+        if not str(pilot.get("governance_audit_path", "")):
+            raise ValueError("pilot execution requires governance audit path")
+        if not pilot.get("pilot_scopes"):
+            raise ValueError("pilot execution requires explicit pilot scopes")
+        if not pilot.get("rollback_channels"):
+            raise ValueError("pilot execution requires rollback channels")
+    if int(pilot["pilot_rollout_level"]) > 3 and not bool(pilot.get("level4_enabled", False)):
+        raise ValueError("pilot level 4 is disabled unless explicitly configured")
+    if int(pilot["maximum_ttl_seconds"]) < 1:
+        raise ValueError("pilot.maximum_ttl_seconds must be at least 1")
+    if int(pilot["maximum_affected_entities"]) < 0:
+        raise ValueError("pilot.maximum_affected_entities must be non-negative")
+
+    drift = config["drift"]
+    warning = float(drift["warning_threshold"])
+    critical = float(drift["critical_threshold"])
+    if not 0 <= warning <= critical <= 1:
+        raise ValueError("drift thresholds must satisfy 0 <= warning <= critical <= 1")
+
+    from mirage.production.config import validate_production_config
+
+    production_report = validate_production_config(config)
+    if not production_report.valid:
+        details = "; ".join(
+            f"{finding.code}: {finding.message}"
+            for finding in production_report.findings
+        )
+        raise ValueError(f"Milestone 10 production safety validation failed: {details}")
 
 
 def get_config_path(path: Optional[os.PathLike | str] = None) -> Path:

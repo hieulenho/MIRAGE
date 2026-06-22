@@ -1,0 +1,236 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mirage-production
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mirage-api
+  namespace: mirage-production
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mirage-read-config
+  namespace: mirage-production
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mirage-read-config
+  namespace: mirage-production
+subjects:
+  - kind: ServiceAccount
+    name: mirage-api
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mirage-read-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mirage-config
+  namespace: mirage-production
+data:
+  MIRAGE_CONFIG: /etc/mirage/config.json
+  MIRAGE_PROFILE: production
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mirage-secret-refs
+  namespace: mirage-production
+type: Opaque
+stringData:
+  postgres-dsn: ${MIRAGE_POSTGRES_DSN}
+  broker-url: ${MIRAGE_EVENT_BROKER_URL}
+  oidc-client-secret: ${MIRAGE_OIDC_CLIENT_SECRET}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mirage-audit-pvc
+  namespace: mirage-production
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mirage-api
+  namespace: mirage-production
+  labels:
+    app.kubernetes.io/name: mirage
+    app.kubernetes.io/component: api-gateway
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mirage
+      app.kubernetes.io/component: api-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mirage
+        app.kubernetes.io/component: api-gateway
+        mirage.io/zone: ingress
+    spec:
+      serviceAccountName: mirage-api
+      automountServiceAccountToken: false
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: mirage
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: ghcr.io/example/mirage:0.10.0
+          imagePullPolicy: IfNotPresent
+          args: ["python", "-m", "mirage.api.server", "--host", "0.0.0.0", "--port", "8000"]
+          envFrom:
+            - configMapRef:
+                name: mirage-config
+          env:
+            - name: MIRAGE_POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: mirage-secret-refs
+                  key: postgres-dsn
+            - name: MIRAGE_EVENT_BROKER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mirage-secret-refs
+                  key: broker-url
+          ports:
+            - containerPort: 8000
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: audit
+              mountPath: /var/lib/mirage/audit
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: audit
+          persistentVolumeClaim:
+            claimName: mirage-audit-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mirage-api
+  namespace: mirage-production
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mirage
+    app.kubernetes.io/component: api-gateway
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mirage-api
+  namespace: mirage-production
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mirage
+      app.kubernetes.io/component: api-gateway
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: mirage-api
+  namespace: mirage-production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mirage-api
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mirage-backup
+  namespace: mirage-production
+spec:
+  schedule: "*/30 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: mirage-api
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: ghcr.io/example/mirage:0.10.0
+              args: ["python", "-m", "mirage", "backup", "create"]
+              envFrom:
+                - configMapRef:
+                    name: mirage-config
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                runAsNonRoot: true
+                runAsUser: 10001
+                capabilities:
+                  drop: ["ALL"]

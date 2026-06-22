@@ -12,7 +12,8 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "Usage: python -m mirage "
             "{replay,detect,analyze-paths,safety-check,execute-plan,"
-            "execution-status,rollback,kill-switch,connectors,casm,shadow,twin,gnn,rl,marl} "
+            "execution-status,rollback,kill-switch,connectors,casm,shadow,twin,gnn,rl,marl,"
+            "verify,governance,pilot,production,storage,backup,restore,audit,operations} "
             "[options]"
         )
         return 0
@@ -55,6 +56,22 @@ def main(argv: list[str] | None = None) -> int:
         from mirage.marl.cli import main as marl_main
 
         return marl_main(args)
+    if command == "verify":
+        from mirage.verification.cli import main as verify_main
+
+        return verify_main(args)
+    if command == "governance":
+        from mirage.governance.cli import main as governance_main
+
+        return governance_main(args)
+    if command == "pilot":
+        from mirage.pilot.cli import main as pilot_main
+
+        return pilot_main(args)
+    if command in {"production", "storage", "backup", "restore", "audit", "operations"}:
+        from mirage.production.cli import main as production_main
+
+        return production_main([command, *args])
     print(f"Unknown MIRAGE command: {command}")
     return 2
 

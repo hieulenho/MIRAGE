@@ -1,0 +1,26 @@
+profile: shadow
+deploymentMode: modular_monolith
+productionExecutionEnabled: false
+highRiskAutomationEnabled: false
+pilotScopes: []
+image:
+  repository: ghcr.io/example/mirage
+  tag: "0.10.0"
+replicaCount: 1
+auth:
+  enabled: false
+tls:
+  enabled: false
+storage:
+  backend: sqlite
+  existingSecret: ""
+eventTransport:
+  backend: local_durable
+  existingSecret: ""
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

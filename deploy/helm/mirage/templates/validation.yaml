@@ -1,0 +1,13 @@
+{{- if and (eq .Values.profile "production") .Values.productionExecutionEnabled (not .Values.pilotScopes) -}}
+{{- fail "production + execution enabled requires at least one approved pilot scope" -}}
+{{- end -}}
+{{- if and (eq .Values.profile "production") .Values.highRiskAutomationEnabled -}}
+{{- fail "high-risk automation is prohibited in production" -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Chart.Name }}-validation
+data:
+  profile: {{ .Values.profile | quote }}
+  productionExecutionEnabled: {{ .Values.productionExecutionEnabled | quote }}

@@ -1,5 +1,8 @@
 # MIRAGE — Multi-stage Intelligent Robust Adaptive Graph-based Engagement
 
+**Project Drive & Dataset:** [Link Google Drive](https://drive.google.com/drive/folders/1kx6gTTwtkcqMryqnqhO1ph2iiQI_Kw5J?usp=drive_link)
+
+
 <div align="center">
 
 ```
@@ -762,10 +765,9 @@ Dự án này được phát hành theo giấy phép **MIT License**.
 > *"The best defense is a good deception."*
 ---
 
-## Milestone 1: Digital Twin V1 and Canonical Events
+## Feature Update: Digital Twin V1 and Canonical Events
 
-MIRAGE now includes the first production-oriented event foundation while
-preserving the original static research simulator. The new flow is:
+MIRAGE includes a production-oriented event foundation, with the following flow:
 
 ```text
 Telemetry JSONL
@@ -778,7 +780,7 @@ Telemetry JSONL
   -> deterministic replay
 ```
 
-### What Digital Twin V1 Does
+### Digital Twin V1 Features
 
 - Defines canonical Pydantic schemas for `SecurityEvent`, `Asset`,
   `Identity`, `Relationship`, and `TwinSnapshot`.
@@ -793,12 +795,12 @@ Telemetry JSONL
 - Adds FastAPI endpoints under `/api/v1/*` for canonical event ingestion,
   twin status, snapshots, assets, subgraphs, and replay.
 
-### What It Does Not Do Yet
+### Future Work
 
 - No Kafka, SIEM, EDR, cloud, Neo4j, Redis, or Kubernetes connectors.
 - No production authentication/RBAC for the new twin API beyond any existing
   deployment wrapper. Put the API behind trusted controls before real use.
-- No LLM, GNN, contextual-AI upgrade, or MARL implementation in this milestone.
+- No LLM, GNN, contextual-AI upgrade, or MARL implementation .
 - The twin is in-memory by design; snapshots are JSON files.
 - The twin may be incomplete or stale because it only knows what ingested
   events say.
@@ -918,7 +920,7 @@ Known limitations:
 - Persistent storage, real connectors, stronger auth/RBAC, GNN, contextual AI,
   and MARL are planned for later milestones.
 
-## Milestone 2: Contextual Detection V1
+## Feature Update: Contextual Detection V1
 
 MIRAGE now includes a deterministic, explainable detection and belief layer on
 top of canonical `SecurityEvent` ingestion and Digital Twin V1:
@@ -1074,7 +1076,7 @@ caps non-deception compromise below the configured suspicious threshold.
 
 - This is an explainable baseline, not a trained AI model.
 - No zero-day detection, LLM, Transformer, GNN, deep RL, or MARL is claimed in
-  this milestone.
+  .
 - Probabilities depend on configured priors, evidence quality, and incomplete
   Digital Twin data.
 - Timeline, evidence, and belief state are in memory; use snapshots for replay
@@ -1091,7 +1093,7 @@ Dynamic Local Subgraph Retrieval
 + Candidate Defense Action Generation
 ```
 
-## Milestone 3: Attack-Path Analysis and Candidate Actions
+## Feature Update: Attack-Path Analysis and Candidate Actions
 
 Milestone 3 turns Digital Twin and belief snapshots into bounded local attack
 paths and non-executing candidate defense actions:
@@ -1292,7 +1294,7 @@ average path/action counts, and blocked-action explanation coverage.
 - Candidate actions are recommendations only and do not execute firewall, EDR,
   IAM, Kubernetes, or host changes.
 - Action masks are preliminary constraints, not the full Safety Gate.
-- No GNN, LLM, RL training, MARL, or real enforcement exists in this milestone.
+- No GNN, LLM, RL training, MARL, or real enforcement exists .
 - Stale or incomplete Twin data reduces confidence and blocks disruptive
   recommendations.
 
@@ -1307,7 +1309,7 @@ Safety Gate V1
 + Rollback and Audit
 ```
 
-## Milestone 4: Safety Gate V1 and Lab Execution
+## Feature Update: Safety Gate V1 and Lab Execution
 
 Milestone 4 converts a ranked `CandidateDefenseAction` and its `ActionMask`
 into a safe, auditable, reversible lab execution workflow:
@@ -1443,7 +1445,7 @@ canary failure, adapter failure, rollback failure, TTL expiry, kill switch,
 approval expiry, API, CLI, audit sanitization, and Digital Twin execution
 updates.
 
-## Milestone 5: Real-time Digital Twin, CASM, and Shadow Mode
+## Feature Update: Real-time Digital Twin, CASM, and Shadow Mode
 
 Milestone 5 moves MIRAGE from file replay and lab-only execution toward
 continuous read-only visibility. The enforced operating mode is `shadow` and
@@ -1623,7 +1625,7 @@ Durable storage and multi-worker state
 + optional GNN/MARL research tracks
 ```
 
-## Milestone 6: Hierarchical Graph Representation and GNN Encoder V1
+## Feature Update: Hierarchical Graph Representation and GNN Encoder V1
 
 Milestone 6 adds an optional learned graph representation for MIRAGE local
 attack subgraphs. The GNN pipeline is additive: it produces embeddings and
@@ -1702,7 +1704,7 @@ feature definitions, hierarchy design, dataset strategy, baselines, model
 architecture, uncertainty/OOD behavior, integration rules, limitations, and
 recommended Milestone 7.
 
-## Milestone 7: Offline RL and Hierarchical Blue-Team Policy V1
+## Feature Update: Offline RL and Hierarchical Blue-Team Policy V1
 
 Milestone 7 adds a conservative offline-learning policy track for MIRAGE
 defense recommendations. It is additive and shadow-first: the learned policy
@@ -1788,7 +1790,7 @@ state/action definitions, trajectory design, reward model, baselines, offline
 RL architecture, fallback behavior, evaluation strategy, API details, and
 limitations.
 
-## Milestone 8: Adversarial Red-Blue Self-Play and MARL Cyber Range V1
+## Feature Update: Adversarial Red-Blue Self-Play and MARL Cyber Range V1
 
 Milestone 8 adds an isolated synthetic red-blue cyber range for adversarial
 self-play and robustness evaluation. Red actions are abstract graph-simulator
@@ -1863,3 +1865,128 @@ training, automatic policy promotion, or Milestone 9.
 
 See [docs/milestone8_marl.md](docs/milestone8_marl.md) for the full safety
 contract, component layout, CLI/API details, and limitations.
+
+## Feature Update: Formal Safety Verification, Governance, and Controlled Pilot V1
+
+Milestone 9 adds formal safety verification, policy governance, and a
+controlled-pilot workflow between MIRAGE recommendations and any limited pilot
+action. Pilot execution remains disabled by default, high-risk automation is
+disabled, and masks, Safety Gate, formal verification, approval, kill switch,
+and rollback remain non-bypassable.
+
+Key modules:
+
+- `mirage.verification`: invariant catalog, bounded solver facade,
+  reachability, blast-radius, rollback, temporal lifecycle, and aggregate
+  formal-verification reports.
+- `mirage.governance`: artifact registry, model cards, policy cards,
+  policy-as-code, release gate, integrity hashes, and governance audit chain.
+- `mirage.pilot`: pilot scopes, controlled-pilot controller, canary decisions,
+  runtime safety monitoring, rollout levels, and deterministic scenarios.
+- `mirage.drift`: data/model/policy drift reports that suspend pilot execution
+  on critical drift while preserving Shadow Mode.
+
+CLI:
+
+```bash
+python -m mirage verify invariants
+python -m mirage verify audit-chain --audit artifacts/governance_audit.jsonl
+python -m mirage governance artifacts
+python -m mirage governance release-check --artifact-id POLICY_ID --target-status PILOT_CANDIDATE
+python -m mirage pilot scopes
+python -m mirage pilot canary --execution-id EXEC_ID
+python -m mirage pilot monitor --execution-id EXEC_ID
+```
+
+API:
+
+```text
+GET  /api/v1/governance/artifacts
+POST /api/v1/governance/artifacts/{id}/release-check
+POST /api/v1/verification/plans
+GET  /api/v1/verification/invariants
+GET  /api/v1/pilot/scopes
+POST /api/v1/pilot/prepare
+POST /api/v1/pilot/executions/{id}/canary
+POST /api/v1/pilot/executions/{id}/monitor
+GET  /api/v1/drift/status
+GET  /api/v1/governance/audit/verify
+```
+
+Formal verification covers bounded, explicitly modeled properties. Incomplete
+Twin or dependency data can produce inconclusive results, and absence of a
+discovered violation is not automatically proof of complete safety. MARL
+policies remain governed and cannot override safety controls.
+
+See [docs/milestone9_formal_governance_pilot.md](docs/milestone9_formal_governance_pilot.md)
+for invariant catalog, solver design, pilot rollout levels, governance
+workflow, CLI/API examples, limitations, and recommended Milestone 10.
+
+## Feature Update: Production Hardening, HA, SOC Integration, and Limited Deployment V1
+
+Milestone 10 adds a production-hardening architecture around MIRAGE while
+preserving all research simulator, Shadow Mode, Cyber Range, and controlled
+pilot behavior. It does not enable unrestricted autonomous production defense.
+Defaults remain:
+
+```yaml
+production:
+  operating_mode: shadow
+  production_execution_enabled: false
+  high_risk_automation_enabled: false
+  formal_verification_required: true
+  governance_gate_required: true
+  action_mask_required: true
+  safety_gate_required: true
+```
+
+Key additions:
+
+- `mirage.production.storage`, `migrations`, `events`, and `ha` provide scoped
+  persistent repositories, schema migrations, durable at-least-once transport,
+  idempotency, leases, and leader election.
+- `mirage.production.security`, `secrets`, and `deployment` provide RBAC,
+  service identity, redaction, and governed deployment levels:
+  `SHADOW_ONLY`, `READ_ONLY_PRODUCTION`, `LOW_RISK_PILOT`, and
+  `LIMITED_REVERSIBLE_CONTROL`.
+- `mirage.production.execution` persists execution intent before adapter calls
+  and supports only narrow, reversible, allowlisted pilot actions.
+- `mirage.production.health`, `observability`, `backup`, and `soc` add
+  readiness, metrics, structured logs, trace/correlation IDs, backup/restore,
+  and vendor-neutral SOC adapters.
+- `deploy/kubernetes`, `deploy/helm/mirage`, `deploy/iac`, and
+  `deploy/container` contain production-oriented manifests and examples.
+
+CLI:
+
+```bash
+python -m mirage production validate-config
+python -m mirage production readiness
+python -m mirage production deployment-level
+python -m mirage storage migrate --dry-run
+python -m mirage backup create
+python -m mirage backup verify --backup-id BACKUP_ID
+python -m mirage restore validate --backup-id BACKUP_ID
+python -m mirage audit verify
+python -m mirage operations pause-automation --reason "operator requested"
+```
+
+API:
+
+```text
+GET /health/live
+GET /health/ready
+GET /health/dependencies
+GET /health/security
+GET /metrics
+```
+
+High-risk actions remain recommendation-only or prohibited. No policy, model,
+administrator approval, or governance status may override a false Action Mask,
+Safety Gate denial, formal-verification violation, missing rollback, audit
+failure, or out-of-scope pilot request.
+
+See [docs/milestone10_production_hardening.md](docs/milestone10_production_hardening.md)
+for production architecture, deployment profiles, SOC integration, network
+segmentation, runbooks, Kubernetes/Helm guidance, limitations, and recommended
+Milestone 11.

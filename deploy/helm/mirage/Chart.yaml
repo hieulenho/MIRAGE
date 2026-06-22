@@ -1,0 +1,6 @@
+apiVersion: v2
+name: mirage
+description: MIRAGE production-hardening chart
+type: application
+version: 0.10.0
+appVersion: "0.10.0"
