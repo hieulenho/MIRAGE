@@ -13,7 +13,8 @@ def main(argv: list[str] | None = None) -> int:
             "Usage: python -m mirage "
             "{replay,detect,analyze-paths,safety-check,execute-plan,"
             "execution-status,rollback,kill-switch,connectors,casm,shadow,twin,gnn,rl,marl,"
-            "verify,governance,pilot,production,storage,backup,restore,audit,operations} "
+            "verify,governance,pilot,production,storage,backup,restore,audit,operations,"
+            "inventory,sites,federation,assurance,validation,slo,capacity,maturity,readiness} "
             "[options]"
         )
         return 0
@@ -72,6 +73,20 @@ def main(argv: list[str] | None = None) -> int:
         from mirage.production.cli import main as production_main
 
         return production_main([command, *args])
+    if command in {
+        "inventory",
+        "sites",
+        "federation",
+        "assurance",
+        "validation",
+        "slo",
+        "capacity",
+        "maturity",
+        "readiness",
+    }:
+        from mirage.milestone11.cli import main as milestone11_main
+
+        return milestone11_main([command, *args])
     print(f"Unknown MIRAGE command: {command}")
     return 2
 

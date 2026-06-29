@@ -98,6 +98,16 @@ from mirage.streaming.coordinator import ConnectorManager
 from mirage.streaming.state import JSONStateStore
 from mirage.ingestion.normalizer import EventNormalizer
 from mirage.layer6_twin.digital_twin import DigitalTwin
+from mirage.milestone11.federation import FederationService
+from mirage.milestone11.inventory import InventoryScanner
+from mirage.milestone11.readiness import OperationalMaturityService
+from mirage.milestone11.schema import (
+    ChaosValidationRequest,
+    FederationPolicyValidationRequest,
+    FederationRouteValidationRequest,
+    ReadinessEvaluationRequest,
+    SoakValidationRequest,
+)
 from mirage import __version__
 
 LOGGER = logging.getLogger(__name__)
@@ -638,6 +648,7 @@ class MIRAGEStateManager:
         self.marl_replays: Dict[str, Any] = {}
         self._init_marl_state()
         self._init_m9_state()
+        self._init_m11_state()
 
         # Metrics
         self.total_events_processed = 0
@@ -648,6 +659,12 @@ class MIRAGEStateManager:
         self._ws_broadcast_lock = asyncio.Lock()
 
         print("[MIRAGE API] Engine ready.")
+
+    def _init_m11_state(self) -> None:
+        """Initialize Milestone 11 inventory and operational services."""
+        self.inventory_scanner = InventoryScanner(config=self.config)
+        self.federation_service = FederationService(self.config)
+        self.operational_maturity_service = OperationalMaturityService(self.config)
 
     def _init_gnn_state(self) -> None:
         """Initialize optional Milestone 6 GNN services without training."""
@@ -2404,6 +2421,53 @@ class MIRAGEStateManager:
                 "timestamp": datetime.now().isoformat(),
             }
 
+    def m11_inventory(self, *, refresh: bool = False) -> Dict:
+        """Return or regenerate the Milestone 11 inventory."""
+        with self._lock:
+            inventory = (
+                self.inventory_scanner.write_artifacts()
+                if refresh
+                else self.inventory_scanner.scan()
+            )
+            return inventory.model_dump(mode="json")
+
+    def m11_inventory_capabilities(self) -> Dict:
+        """Return inventory capabilities."""
+        inventory = self.m11_inventory()
+        return {"capabilities": inventory["capabilities"]}
+
+    def m11_inventory_capability(self, capability_id: str) -> Dict:
+        """Return one inventory capability."""
+        inventory = self.inventory_scanner.scan()
+        return inventory.capability(capability_id).model_dump(mode="json")
+
+    def m11_inventory_gaps(self) -> Dict:
+        """Return known gaps."""
+        inventory = self.inventory_scanner.scan()
+        return {"gaps": inventory.known_gaps}
+
+    def m11_assurance_run(self) -> Dict:
+        """Run continuous assurance."""
+        return self.operational_maturity_service.assurance.run().model_dump(mode="json")
+
+    def m11_validation_soak(self, request: SoakValidationRequest) -> Dict:
+        """Run bounded soak validation."""
+        return self.operational_maturity_service.validation.run_soak(
+            duration=request.duration,
+            profile=request.profile,
+        ).model_dump(mode="json")
+
+    def m11_validation_chaos(self, request: ChaosValidationRequest) -> Dict:
+        """Run deterministic chaos validation."""
+        return self.operational_maturity_service.validation.run_chaos(
+            experiment=request.experiment,
+            environment=request.environment,
+        ).model_dump(mode="json")
+
+    def m11_validation_job(self, job_id: str) -> Dict:
+        """Return one validation job."""
+        return self.operational_maturity_service.validation.get_job(job_id).model_dump(mode="json")
+
     async def broadcast_ws(self, message: Dict):
         """Broadcast a message to all connected WebSocket clients."""
         text = json.dumps(message)
@@ -2635,6 +2699,18 @@ def create_app() -> Any:
                 "POST /api/v1/pilot/executions/{id}/rollback",
                 "GET  /api/v1/drift/status",
                 "GET  /api/v1/governance/audit/verify",
+                "GET  /api/v1/inventory",
+                "GET  /api/v1/inventory/capabilities",
+                "GET  /api/v1/inventory/capabilities/{id}",
+                "POST /api/v1/inventory/refresh",
+                "GET  /api/v1/inventory/gaps",
+                "GET  /api/v1/sites",
+                "GET  /api/v1/federation/status",
+                "POST /api/v1/assurance/run",
+                "POST /api/v1/validation/soak",
+                "GET  /api/v1/slo/reports",
+                "GET  /api/v1/maturity/report",
+                "POST /api/v1/readiness/evaluate",
                 "WS   /ws",
             ],
         }
@@ -2679,6 +2755,171 @@ def create_app() -> Any:
             production_metrics.render_prometheus(),
             media_type="text/plain; version=0.0.4",
         )
+
+    @app.get("/api/v1/inventory")
+    async def m11_get_inventory():
+        return await asyncio.to_thread(state.m11_inventory)
+
+    @app.get("/api/v1/inventory/capabilities")
+    async def m11_get_inventory_capabilities(
+        limit: Annotated[int, Query(ge=1, le=1000)] = 1000,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        data = await asyncio.to_thread(state.m11_inventory_capabilities)
+        items = data["capabilities"]
+        return {
+            "capabilities": items[offset: offset + limit],
+            "total": len(items),
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @app.get("/api/v1/inventory/capabilities/{capability_id}")
+    async def m11_get_inventory_capability(capability_id: str):
+        try:
+            return await asyncio.to_thread(
+                state.m11_inventory_capability,
+                capability_id,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Capability not found") from exc
+
+    @app.post("/api/v1/inventory/refresh")
+    async def m11_refresh_inventory():
+        return await asyncio.to_thread(state.m11_inventory, refresh=True)
+
+    @app.get("/api/v1/inventory/gaps")
+    async def m11_inventory_gaps():
+        return await asyncio.to_thread(state.m11_inventory_gaps)
+
+    @app.get("/api/v1/sites")
+    async def m11_sites():
+        return state.federation_service.list_sites()
+
+    @app.get("/api/v1/sites/{site_id}")
+    async def m11_site(site_id: str):
+        try:
+            return state.federation_service.get_site(site_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Site not found") from exc
+
+    @app.post("/api/v1/sites/{site_id}/validate")
+    async def m11_validate_site(site_id: str):
+        try:
+            return state.federation_service.validate_site(site_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Site not found") from exc
+
+    @app.get("/api/v1/sites/{site_id}/health")
+    async def m11_site_health(site_id: str):
+        try:
+            return state.federation_service.site_health(site_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Site not found") from exc
+
+    @app.get("/api/v1/sites/{site_id}/slo")
+    async def m11_site_slo(site_id: str):
+        try:
+            return state.federation_service.site_slo(site_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Site not found") from exc
+
+    @app.get("/api/v1/federation/status")
+    async def m11_federation_status():
+        return state.federation_service.federation_status()
+
+    @app.get("/api/v1/federation/policies")
+    async def m11_federation_policies():
+        return state.federation_service.policies()
+
+    @app.post("/api/v1/federation/policies/validate")
+    async def m11_validate_federation_policy(request: FederationPolicyValidationRequest):
+        return state.federation_service.validate_policy(request)
+
+    @app.post("/api/v1/federation/route/validate")
+    async def m11_validate_federation_route(request: FederationRouteValidationRequest):
+        return state.federation_service.validate_route(request)
+
+    @app.get("/api/v1/federation/correlations")
+    async def m11_federation_correlations():
+        return state.federation_service.correlations()
+
+    @app.post("/api/v1/assurance/run")
+    async def m11_assurance_run():
+        return await asyncio.to_thread(state.m11_assurance_run)
+
+    @app.get("/api/v1/assurance/bundles")
+    async def m11_assurance_bundles():
+        return {"bundles": state.operational_maturity_service.assurance.list_bundles()}
+
+    @app.get("/api/v1/assurance/bundles/{bundle_id}")
+    async def m11_assurance_bundle(bundle_id: str):
+        try:
+            bundle = state.operational_maturity_service.assurance.get_bundle(bundle_id)
+            return bundle.model_dump(mode="json")
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Assurance bundle not found") from exc
+
+    @app.get("/api/v1/assurance/checks")
+    async def m11_assurance_checks():
+        return {"checks": state.operational_maturity_service.assurance.checks()}
+
+    @app.get("/api/v1/assurance/status")
+    async def m11_assurance_status():
+        return state.operational_maturity_service.assurance.status()
+
+    @app.post("/api/v1/validation/soak")
+    async def m11_validation_soak(request: SoakValidationRequest):
+        return await asyncio.to_thread(state.m11_validation_soak, request)
+
+    @app.post("/api/v1/validation/chaos")
+    async def m11_validation_chaos(request: ChaosValidationRequest):
+        return await asyncio.to_thread(state.m11_validation_chaos, request)
+
+    @app.get("/api/v1/validation/jobs/{job_id}")
+    async def m11_validation_job(job_id: str):
+        try:
+            return state.m11_validation_job(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Validation job not found") from exc
+
+    @app.get("/api/v1/validation/results")
+    async def m11_validation_results():
+        return state.operational_maturity_service.validation.results()
+
+    @app.get("/api/v1/slo/reports")
+    async def m11_slo_reports():
+        state.operational_maturity_service.slo.report()
+        return state.operational_maturity_service.slo.reports()
+
+    @app.get("/api/v1/slo/error-budgets")
+    async def m11_slo_error_budgets():
+        state.operational_maturity_service.slo.report()
+        return state.operational_maturity_service.slo.error_budgets()
+
+    @app.get("/api/v1/capacity/report")
+    async def m11_capacity_report():
+        return state.operational_maturity_service.capacity.report().model_dump(mode="json")
+
+    @app.get("/api/v1/maturity/report")
+    async def m11_maturity_report():
+        return await asyncio.to_thread(
+            lambda: state.operational_maturity_service.maturity.assess().model_dump(mode="json")
+        )
+
+    @app.post("/api/v1/readiness/evaluate")
+    async def m11_readiness_evaluate(request: ReadinessEvaluationRequest):
+        try:
+            return await asyncio.to_thread(
+                lambda: state.operational_maturity_service.readiness.evaluate(request).model_dump(mode="json")
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/readiness/latest")
+    async def m11_readiness_latest():
+        latest = state.operational_maturity_service.readiness.latest()
+        return latest.model_dump(mode="json") if latest else {"latest": None}
 
     @app.post("/api/telemetry")
     async def ingest_telemetry(payload: TelemetryEventPayload):

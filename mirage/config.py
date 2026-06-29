@@ -572,6 +572,121 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "synthetic_event_sizes": [1000, 10000],
         "max_fixture_events": 100000
     },
+    "milestone11": {
+        "inventory": {
+            "deterministic_generated_at": "1970-01-01T00:00:00Z",
+            "artifact_path": "artifacts/inventory/system_inventory.json",
+            "yaml_artifact_path": "artifacts/inventory/system_inventory.yaml",
+        }
+    },
+    "sites": {
+        "local": {
+            "site_id": "site-local",
+            "tenant_id": "default",
+            "display_name": "Local MIRAGE Site",
+            "data_residency_zone": "local",
+            "policy_version": "federation-policy-v1",
+            "endpoint": "",
+            "public_identity": "local-site-identity",
+            "allow_central_governance": False,
+        },
+        "registered": [],
+    },
+    "federation": {
+        "mode": "disabled",
+        "allowed_data_classes": [
+            "SUMMARY_INCIDENT",
+            "PSEUDONYMIZED_ENTITY_DATA",
+            "ASSURANCE_EVIDENCE_METADATA",
+            "SLO_STATUS",
+            "CAPACITY_SUMMARY",
+            "READINESS_SUMMARY",
+        ],
+        "denied_field_markers": [
+            "password",
+            "passwd",
+            "secret",
+            "token",
+            "api_key",
+            "apikey",
+            "credential",
+            "private_key",
+            "raw_event",
+            "raw_payload",
+            "command_line",
+            "cookie",
+            "authorization",
+        ],
+        "residency_routes": {"local": ["local"]},
+        "encrypted_transport_required": True,
+        "pseudonymization_required": True,
+        "max_queue_messages": 1000,
+        "retry": {"max_attempts": 3, "backoff_seconds": 1.0},
+        "central_governance_unavailable_behavior": "fail_closed_for_expansion",
+        "site_disconnection_behavior": "local_shadow_only",
+    },
+    "assurance": {
+        "bundle_path": "artifacts/assurance/bundles",
+        "backup_rehearsal_path": "artifacts/assurance/backups",
+        "evidence_retention_days": 90,
+        "schedules": {"quick_minutes": 60, "full_hours": 24},
+        "checks": [
+            "safety_defaults",
+            "verified_inventory",
+            "production_config",
+            "governance_audit_chain",
+            "backup_restore_rehearsal",
+            "model_policy_cards",
+            "cyber_range_isolation",
+            "federation_default_deny",
+        ],
+    },
+    "validation": {
+        "default_soak_duration": "6h",
+        "ci_max_soak_seconds": 60,
+        "synthetic_event_rate": 100,
+        "max_memory_growth_mb": 64.0,
+        "max_queue_depth": 1000,
+        "chaos_enabled": True,
+        "production_chaos_approved": False,
+        "allowed_chaos_environments": ["dev", "test", "staging", "lab", "cyber_range"],
+    },
+    "slo": {
+        "targets": {
+            "api_availability": 0.99,
+            "event_ingestion_success": 0.995,
+            "audit_write_success": 0.999,
+            "rollback_success": 0.99,
+            "twin_freshness": 0.95,
+        },
+        "error_budget_policy": {
+            "release_block_on_exhaustion": True,
+            "safety_budget_exhaustion_behavior": "force_shadow",
+        },
+    },
+    "capacity": {
+        "thresholds": {
+            "event_rate_eps": 1000.0,
+            "broker_lag_messages": 10000.0,
+            "worker_saturation": 0.85,
+            "storage_growth_mb_per_day": 10240.0,
+            "database_load": 0.80,
+        }
+    },
+    "maturity": {
+        "minimum_category_score": 0.70,
+        "block_on_documented_only_safety_claims": True,
+        "block_on_failed_restore": True,
+    },
+    "readiness": {
+        "maturity_threshold": 0.80,
+        "deployment_level_reduction_rules": {
+            "critical_assurance_failure": "SHADOW_ONLY",
+            "slo_exhausted": "SHADOW_ONLY",
+            "critical_drift": "SHADOW_ONLY",
+        },
+        "auto_promote_deployment_level": False,
+    },
     "production": default_production_config(),
 }
 
@@ -982,6 +1097,69 @@ def _validate_config(config: Dict[str, Any]) -> None:
     critical = float(drift["critical_threshold"])
     if not 0 <= warning <= critical <= 1:
         raise ValueError("drift thresholds must satisfy 0 <= warning <= critical <= 1")
+
+    sites = config["sites"]
+    local_site = sites.get("local", {})
+    if not str(local_site.get("site_id", "")):
+        raise ValueError("sites.local.site_id is required")
+    if str(local_site.get("endpoint", "")).startswith("http://"):
+        raise ValueError("sites.local.endpoint must use encrypted transport")
+
+    federation = config["federation"]
+    if str(federation.get("mode", "disabled")) not in {"disabled", "local_only", "enabled"}:
+        raise ValueError("federation.mode must be disabled, local_only, or enabled")
+    if not bool(federation.get("encrypted_transport_required", True)):
+        raise ValueError("federation.encrypted_transport_required must be true")
+    if not bool(federation.get("pseudonymization_required", True)):
+        raise ValueError("federation.pseudonymization_required must be true")
+    denied_markers = {
+        str(item).lower()
+        for item in federation.get("denied_field_markers", [])
+    }
+    for marker in ("credential", "secret", "token", "password", "raw_payload"):
+        if marker not in denied_markers:
+            raise ValueError(
+                f"federation.denied_field_markers must include {marker}"
+            )
+    prohibited_classes = {"RAW_CREDENTIALS", "SECRETS", "RAW_EVENT_PAYLOAD"}
+    allowed_classes = {str(item).upper() for item in federation.get("allowed_data_classes", [])}
+    if prohibited_classes.intersection(allowed_classes):
+        raise ValueError("federation cannot allow raw credentials, secrets, or raw event payloads")
+    if int(federation.get("max_queue_messages", 0)) < 1:
+        raise ValueError("federation.max_queue_messages must be at least 1")
+
+    assurance = config["assurance"]
+    if int(assurance["evidence_retention_days"]) < 1:
+        raise ValueError("assurance.evidence_retention_days must be at least 1")
+    if not isinstance(assurance.get("checks", []), list) or not assurance["checks"]:
+        raise ValueError("assurance.checks must be a non-empty list")
+
+    validation = config["validation"]
+    if int(validation["ci_max_soak_seconds"]) < 1:
+        raise ValueError("validation.ci_max_soak_seconds must be at least 1")
+    if int(validation["synthetic_event_rate"]) < 1:
+        raise ValueError("validation.synthetic_event_rate must be at least 1")
+    if "production" in validation.get("allowed_chaos_environments", []) and not bool(validation.get("production_chaos_approved", False)):
+        raise ValueError("production chaos testing requires explicit approval")
+
+    slo = config["slo"]
+    for key, value in slo.get("targets", {}).items():
+        numeric = float(value)
+        if not math.isfinite(numeric) or not 0 < numeric <= 1:
+            raise ValueError(f"slo.targets.{key} must be in (0, 1]")
+
+    capacity = config["capacity"]
+    for key, value in capacity.get("thresholds", {}).items():
+        numeric = float(value)
+        if not math.isfinite(numeric) or numeric < 0:
+            raise ValueError(f"capacity.thresholds.{key} must be non-negative")
+
+    readiness = config["readiness"]
+    if bool(readiness.get("auto_promote_deployment_level", False)):
+        raise ValueError("readiness.auto_promote_deployment_level must remain false")
+    threshold = float(readiness["maturity_threshold"])
+    if not math.isfinite(threshold) or not 0 <= threshold <= 1:
+        raise ValueError("readiness.maturity_threshold must be in [0, 1]")
 
     from mirage.production.config import validate_production_config
 
